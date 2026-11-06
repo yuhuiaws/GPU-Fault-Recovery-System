@@ -15,7 +15,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Upgrade all managed clusters | `gpu-fault-admin deploy --state-dir ...` (one parameter; ARNs, email and Grafana are all restored from the state-dir) | REG-8.1.3/8.1.4, §4 |
 | Resume after an interruption | Rerun the same `deploy --state-dir ...` as is; there is no separate `resume` | REG-8.1.4, §4 |
 | Roll back to the previous committed release | `gpu-fault-admin deploy --state-dir ... --rollback` | REG-8.1.4, REG-8.2, §4 |
-| Adjust administrator configuration | `gpu-fault-admin config --state-dir ... [--file F] [--dry-run] --reference ...` | [Administrator Capacity Configuration](administrator-capacity-configuration.md) |
+| Adjust administrator configuration | `gpu-fault-admin config --state-dir ... [--file F] [--dry-run] [--reference ...]` | [Administrator Capacity Configuration](administrator-capacity-configuration.md) |
 | Declare/release a warm-spare GPU node (the failover target of `REPLACE_NODE`) | `gpu-fault-admin config spare --state-dir ... --node <node>` for the read-only check; add `--declare --reference ... --confirm DECLARE_WARM_SPARE_CORDON` to declare (label + cordon), `--release --reference ... --confirm RELEASE_WARM_SPARE_UNCORDON` to restore per the baseline (for a node a spot reclaim or the like took out of the cluster: proves the departure, then releases only the record and acknowledges it to the control plane, §10.1.1); recorded in `<state-dir>/warm-spares/<node>.json` | Manual, "Adding an independently repaired and re-accepted node to the spare pool" |
 | Approve a pending Profile plan | The same `deploy --state-dir ... --approve-profile-plan <plan_sha256> --reference ...`; there is no separate approval verb | [Runtime Profile Change Approval](administrator-profile-change-approval.md) |
 | The registration cluster left the site and deploy refuses with `registration cluster ... is not among the managed GPU clusters` | Run the refusal's `deploy --state-dir ... --registration-cluster <remaining cluster of that provider> --reference ...` (moves the anchor, then continues the same deploy) | §5.0.4 |
@@ -23,7 +23,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Join a GPU cluster | `deploy --state-dir ... --gpu-cluster-arn <all managed ARNs> --gpu-cluster-arn <new ARN>` (the given set must be the managed set or a superset of it; the extra ARNs are the joins; giving fewer is refused with `site manages GPU clusters the command omits ... use remove-cluster`; when there are code changes release first, then join), or the join-only `gpu-fault-admin join-cluster --state-dir ... --gpu-cluster-arn <new ARN>` (does not trigger a site release; already managed ARNs return `ALREADY_MANAGED`) | REG-8.1.5, §5 |
 | Remove a GPU cluster | `gpu-fault-admin remove-cluster --state-dir ... --gpu-cluster-arn <ARN> --confirm REMOVE_GPU_CLUSTER` | REG-8.1.6, REG-12, §5 |
 | Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`, for the CPU control-plane cluster's groups too, where one window takes the whole control plane down for minutes) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only (the CPU control-plane cluster's ARN selects every group of it; `--rolling --rollback-alarm <alarm>` keeps the schedule and makes it roll one instance at a time, rolled back on CloudWatch alarms -- printed as ordered steps, because the service deletes and re-creates a schedule rather than changing it) and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
-| The CPU control plane's rolling update did not apply (`status --full` fails `cpu_rolling_update`, or the deploy prints `release-deploy: warning: CPU rolling update: ...`) | once the cause is gone (an AMI update finished, the window passed), `gpu-fault-admin cpu-rolling-update --state-dir ...` runs the deploy's last step again; `spec.cpuControlPlane` in `admin-config.yaml` (`mode: rolling`, the default, or `unchanged`) is changed with `gpu-fault-admin config` | §5.0.5 |
+| The CPU control plane's rolling update did not apply (`status --full` fails `cpu_rolling_update`, or the deploy prints `release-deploy: warning: CPU rolling update: ...`) | once the cause is gone (an AMI update finished, the window passed), `gpu-fault-admin cpu-rolling-update --state-dir ...` runs the deploy's last step again; `spec.cpuControlPlane` in `admin-config.yaml` (`rollingUpdate.mode`: `rolling`, the default, or `unchanged`) is changed with `gpu-fault-admin config` | §5.0.5 |
 | A control-plane Deployment cannot create its Pods (`status` reports `replica failure: <Deployment> ... FailedCreate: ...`, for example while Kueue's `mpod.kb.io` webhook is not serving) | once the cause is gone, run the `kubectl -n gpu-fault-system annotate replicaset ... --overwrite` the line prints: a metadata-only update, so the ReplicaSet controller retries at once instead of waiting out its backoff of up to ~16 min | §5.0.5 |
 | An EKS cluster's version near or past the end of its support (`status --full` reports `advisory: EKS cluster ... whose support ends ...`) | before the date, in a maintenance window, upgrade it yourself: the control plane first (`aws eks update-cluster-version`), then nodes and add-ons (HyperPod nodes with `update-cluster-software`); after the date AWS upgrades the control plane without notice, and that upgrade cannot be rolled back | §5.0.5 |
 | Reinstall while keeping the CPU/GPU EKS | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT` followed by a fresh `deploy`; keep preserves Aurora by default (historical incidents/workflows are not lost), and only an explicit `--reset-database` wipes the database | §3 |
@@ -31,13 +31,13 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Troubleshoot PENDING/LEASED commands, Pods not Ready, certificate/Agent version drift | `gpu-fault-admin status --full` (the former `doctor` idea has been folded into status), then follow the symptom table | §7, REG-14.2/14.3 |
 | Rotate the cluster token | `gpu-fault-admin rotate-token --state-dir ... --gpu-cluster-arn <ARN>` (one command completes the registry overlap window, GPU Secret, data-plane rollout, node Agent switch, registry Secret rewrite and CPU control-plane roll) | §6.1, REG-9 |
 | Explicitly register Node key custody | `gpu-fault-admin node-key-custody configure --state-dir ... --file ... --trust-sha256 ...`; after registration the original `deploy` / `join-cluster` still perform the authorised preparation and resume; Secrets are not rotated directly | [§6.2](#62-node-key-custody) |
-| Submit an explicit remediation after CHECK_MECHANICALS; trigger a validated restore after a QUARANTINED node (or the still-isolated node of an ESCALATED incident whose ladder is exhausted and every workflow ended) is repaired; manually confirm a node action with unknown outcome | `gpu-fault-admin submit-remediation --state-dir ... --incident-id ... --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action} [--node <node>] [--plan]` (`restore` see §9.2, `confirm-node-action --node` see §9.4) | §9, §9.2, §9.4, REG 8.3 |
+| Submit an explicit remediation after CHECK_MECHANICALS; trigger a validated restore after a QUARANTINED node (or the still-isolated node of an ESCALATED incident whose ladder is exhausted and every workflow ended) is repaired; manually confirm a node action with unknown outcome | `gpu-fault-admin submit-remediation --state-dir ... --incident-id ... --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action} [--node <node>] [--plan]` (`restore` see §9.2, `confirm-node-action --node` see §9.4) | §9, §9.2, §9.4, Deployment and Operations Manual §8.3 |
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
 | Reclaim PostgreSQL hot-table bloat (after a campaign day, before a formal perf or acceptance round) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
 | A failover left the Aurora writer outside the zone with the most control-plane Pods (`status` reports `finding: Aurora writer ... runs in ...`) | `gpu-fault-admin aurora-failback --state-dir ... --reference CHG-... [--confirm AURORA_FAILBACK]` (without `--confirm` it only prints the placement and the target member; with the token it executes under the site operation lock, refuses while work is in flight, waits for the cluster to be `available` and the control plane ready, journal under `$STATE_DIR/aurora-failback/`; never run automatically) | [§4.9](#49-aurora-writer-beside-the-control-plane-the-status-finding-and-aurora-failback) |
 | AWS published a new RDS global CA bundle (`status` reports `finding: RDS CA bundle drift: ...`), or `deploy`/`config` of an older release fails with `RDS CA bundle digest does not match the pinned SHA-256; refusing` | A current release only reports, it never blocks: roll the vendored copy and its pin in the source with the steps the finding gives, then `deploy`; on an older release, rerun the same command with `GPU_FAULT_RDS_CA_BUNDLE_SOURCE` set to a bundle byte-identical to the old pin | [§6.3](#63-rds-ca-bundle-vendored-in-the-release-aws-rotations-reported-by-status) |
 | The installation registry sync fails because it "would change recorded identities" and that key's physical resource really was replaced (a recreated subnet, a re-subscribed SNS e-mail) | `gpu-fault-admin replace-resource --state-dir ... --resource-key <key> --reference ...` for the read-only plan; add `--confirm REPLACE_RESOURCE` to execute | §4 |
-| Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
+| Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | [Deployment and Operations Manual](deployment-and-operations-manual.md) §9 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | The residue a node leaves after a spot reclaim, a scale-in or a provider replacement (Agent record still ACTIVE, workflows that never changed the node, ESCALATED incidents) | No command: the control plane's departed-node cleanup ends it once the node is proven gone (switch `spec.workflow.departedNodeCleanup`, on by default); the `departed nodes:` lines of `gpu-fault-admin status` list the nodes cleaned, pending and left to the operator, with the exact commands | [§10.1.1](#1011-what-a-departed-gpu-node-leaves-behind-spot-reclaim-scale-in-provider-replacement) |
 | A GPU cluster's remediation storm breaker is open (alert `GpuFaultRemediationStormBreakerOpen`, a `remediation storm breaker` line in status): once the common cause is understood, resume automatic remediation, or hand the held workflows to people | `gpu-fault-admin remediation-storm release --state-dir ... --cluster-id <c> --reason ... --reference ...`; `abort` hands them over; both take `--dry-run` first | §8 `GpuFaultRemediationStormBreakerOpen` |
@@ -83,8 +83,10 @@ Misusing the unbound CLI from a checkout is blocked: when the target state-dir a
 ordinary source deploy (which prepares and re-enters the bound CLI itself) and genuinely read-only query paths; the other verbs are refused with
 exit code 2 before the command log is opened, printing the bound CLI path to use instead, and the refused call leaves no log under any state-dir.
 `deploy --rollback`, explicit site files and the internal prepared-source form do not enjoy the ordinary source deploy exemption.
-Read-only includes status/preflight/verify, `config --dry-run`, the warm-spare check without declare/release,
-`workflow-reconcile --dry-run` and `submit-remediation --plan`.
+Read-only includes status/preflight/verify, `site-id`, `hyperpod-scheduled-update`, `node-scope` without `--converge` (or
+with `--dry-run`), `config --dry-run`, the warm-spare check without declare/release, `workflow-reconcile --dry-run`,
+`remediation-storm --dry-run`, `submit-remediation --plan`, `store-maintenance`/`aurora-failback`/`replace-resource`
+without `--confirm`, `failure-domain-map` without `--output`, and `prepare-eks-nodegroup` without `--apply`.
 Remote outbox stats/list create control records and are not part of the read-only exemption. A permitted checkout is usually ahead of the site's deployed
 release, and the image locked by its `dist/current-release.json` is no longer the one the site deployed: modes that apply or validate the image
 (deploy, upgrade, plan, verify, remove-cluster, etc.) refuse accordingly and print both image references; drain-cluster, which only publishes the
@@ -145,8 +147,10 @@ templates, first deployment and rollback semantics are in
 ### 2.2 Same-Site Concurrency and Recovery
 
 deploy, configuration/Profile approval, Node key custody registration, join/remove, uninstall, token rotation,
-warm-spare declaration/release, manual
-remediation writes, workflow convergence and explicit rollback share one mutation lock on the canonical `state-dir`.
+warm-spare declaration/release, manual remediation writes, workflow convergence, remote outbox operations, the
+remediation storm breaker's release/abort, store-maintenance, aurora-failback, replace-resource, cpu-rolling-update,
+`node-scope --converge`, `prepare-eks-nodegroup --apply` with a `--state-dir`, and explicit rollback share one mutation
+lock on the canonical `state-dir`.
 When the CLI finds it held it reports the holding process immediately and does not queue silently. After taking the lock it re-reads the internal site and checks the CPU stable identity;
 it must not continue with the stale membership or Aurora target from command start. Remote outbox `stats/list`, although not modifying the node
 outbox, also creates a maintenance workflow and therefore holds the lock as well.
@@ -6661,13 +6665,13 @@ release, for the reasons in "Scope of impact" below.
 - All inputs start from the **tail** (`READ_FROM_HEAD=Off`, `READ_FROM_TAIL=On`); logs written before
   installation are never backfilled.
 - For billing, know that kubelet's journal is collected **twice**: `dataplane` collects by
-  `_SYSTEMD_UNIT=kubelet.service`, and `host`'s `PRIORITY=0-6` collects it again (verified on
-  2026-09-04 with the same `SyncLoop ADD` line hitting once in each of the two groups). This is a property of the upstream Container
+  `_SYSTEMD_UNIT=kubelet.service`, and `host`'s `PRIORITY=0-6` collects it again (the same
+  kubelet `SyncLoop ADD` line appears once in each of the two groups). This is a property of the upstream Container
   Insights configuration itself, not introduced by this script; count the duplication when estimating ingestion volume.
 - Three extra consequences on GPU clusters, hence refused by default: `application` ships every training job's entire stdout
   into CloudWatch; `host` ships another copy of the kernel XID lines and the `gpu-fault-*` unit journals,
   both of which the node side already collects; and the agent's bundled dcgm-exporter contends for host port 9400, which
-  is already taken by `gpu-fault-dcgm-exporter.service`. Release requires explicitly setting
+  is already taken by the solution's `gpu-fault-dcgm-exporter` (a hostNetwork DaemonSet). Release requires explicitly setting
   `GPU_FAULT_CLOUDWATCH_ALLOW_GPU_CLUSTER=true` while keeping
   `GPU_FAULT_CLOUDWATCH_ACCELERATED_METRICS=false`; without the release switch the script refuses clusters with GPU nodes
   with exit 2 and lists the three consequences.
@@ -6744,16 +6748,27 @@ All verbs delivered by `gpu-fault-admin` (consistent with the parser; there is n
 ```text
 deploy               first/upgrade/resume/rollback/join/approve Profile plan/cross-schema release, all the same verb plus parameters
 status [--full]      read-only health; --full is the complete standalone acceptance (the former verify and the former doctor idea both folded in here)
-config               administrator capacity configuration (plan and execution in the same command, --dry-run shows only the plan)
+site-id              read-only: prints the site id a CPU cluster derives and the ownership label to put on the GPU node groups (§5.0.0)
+node-scope           read-only: each GPU cluster's recorded node selector, its source and what the ownership labels select today;
+                     --converge rewrites one legacy cluster's entry to the label selector (§5.0.0)
+prepare-eks-nodegroup
+                     plans (default) or, with --apply, performs the preparation of a plain EKS GPU managed node group (§5.0.1a)
+hyperpod-scheduled-update
+                     read-only: prints the aws commands that remove a HyperPod instance group's automatic update schedule, or with
+                     --rolling make it roll one instance at a time (§5.0.5)
+cpu-rolling-update   reruns the deploy's last step now: the CPU rollback alarms and the spec.cpuControlPlane rolling schedule (§5.0.5)
+config               administrator capacity configuration (plan and execution in the same command, --dry-run shows only the plan);
+                     config spare declares/releases a warm spare
 join-cluster         joins only the given GPU clusters without triggering a site release (to upgrade at the same time use the deploy superset path)
 remove-cluster       removes one GPU cluster by --gpu-cluster-arn
 uninstall            uninstall; --cpu-cluster keep|delete, only --reset-database wipes the database
 workflow-reconcile   converges historical workflows that recovered but stay BLOCKED, and never-dispatched
-                     PENDING workflows whose node left Kubernetes and HyperPod (--dry-run / execute);
+                     PENDING workflows whose node left Kubernetes and its provider (the HyperPod node list or EC2)
+                     (--dry-run / execute);
                      --close-incident <id> / --close-escalated close ESCALATED incidents,
                      --close-quarantined closes QUARANTINED incidents whose isolation is no longer on the node (§9.1);
                      --retire-departed-agents [--node ID] retires the fleet Agent record, still ACTIVE, of a
-                     node that left Kubernetes and HyperPod; with --accept-unknown-provider-identity --reason
+                     node that left Kubernetes and its provider; with --accept-unknown-provider-identity --reason
                      it accepts the departure of a named node whose provider identity is unknown (§10.2)
 rotate-token         one command completes the cluster token overlap-window rotation
 node-key-custody     configure explicitly registers forward-looking custody; authorised delivery is still performed by deploy/join (§6.2)
@@ -6775,8 +6790,8 @@ The following verbs once listed as "roadmap" **will not** appear, each for its o
 | `renew-certificate` | Not done. The NLB certificate is an 825-day server certificate issued by bootstrap with a private root CA (3650 days) and imported into ACM; ACM does not renew imported certificates; before expiry re-issue, import and go through a node rollout per the §6 table |
 | `rotate-node-key` | There is no rotation verb that changes the Secret directly. Existing legitimate v2 keys are kept; a custody rotation first gets independent authorisation and registers the request, then goes through the original deploy/join and witness. A node reinstall constitutes neither a rotation nor historical proof (§6.2) |
 | `refresh-aurora-credential` | Not done. Aurora credential refresh is already automatic: the hourly CronJob plus one synchronous run before every deploy/rollback (§4) |
-| `approve-gpu-change` | Not done. GPU count change approval is one `kubectl annotate` (REG 8.1); wrapping it in a verb gains nothing |
-| `reserve-spare` | Not a verb but a product automation gap: degraded recovery after insufficient spares is currently still performed manually per REG 8.2 |
+| `approve-gpu-change` | Not done. GPU count change approval is one `kubectl annotate` (`gpu-fault.io/approve-gpu-count-change`, Deployment and Operations Manual §8.1); wrapping it in a verb gains nothing |
+| `reserve-spare` | Not a verb but a product automation gap: degraded recovery after insufficient spares is currently still performed manually per Deployment and Operations Manual §8.2 |
 
 Other current gaps: automatic evidence bundles and admission policy are not yet productised (the operations dashboards are provisioned automatically by deploy, see §8.0).
 
