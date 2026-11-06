@@ -4209,8 +4209,6 @@ globalThis["mermaid"] = globalThis.__esbuild_esm_mermaid_nm["mermaid"].default;
 <body>
 <header id="title-block-header">
 <h1 class="title">GPU 故障处理系统概要设计（v2 闭环视角）</h1>
-<p class="subtitle">gpu-fault-control-plane 0.10.0 · 发现 → 判定 → 隔离
-→ 迁移负载 → 修复 → 验证 → 重新纳管</p>
 </header>
 <nav id="TOC" role="doc-toc">
 <ul>
@@ -4310,12 +4308,13 @@ globalThis["mermaid"] = globalThis.__esbuild_esm_mermaid_nm["mermaid"].default;
 <p><a href="#overview-design">概要设计</a>（下称 v1）按&quot;约束 → 架构 →
 流程 → 部署 → 安全&quot;组织，
 回答的是&quot;这套系统的生产边界在哪里&quot;。本文按<strong>故障闭环</strong>组织：</p>
-<pre class="text"><code>发现 → 判定 → 隔离 → 迁移负载 → 修复 → 验证 → 重新纳管 / 人工处理</code></pre>
+<pre class="text"><code>发现 → 判定 → 隔离 → 停止负载 → 修复 → 验证 → 重新纳管 / 人工处理</code></pre>
 <p>回答的是&quot;一个故障从出现到消失，每一环由谁做、做到什么程度、做不到时停在哪里&quot;。</p>
 <p>两份文档的事实基线是同一份代码（0.10.0），不存在&quot;v2
 描述了新功能&quot;的情况。
 写这一版的动因是：只按模块讲，读者容易把&quot;能采到指标&quot;当成&quot;能修好机器&quot;；
-按闭环讲，每一环缺什么会直接暴露出来。</p>
+按闭环讲，每一环缺什么会直接暴露出来。
+本文按发布源码、生成清单和测试契约逐项核对；文档与代码不一致时以代码为准。</p>
 <p><strong>分工与优先级：</strong></p>
 <table>
 <thead>
@@ -4358,9 +4357,9 @@ globalThis["mermaid"] = globalThis.__esbuild_esm_mermaid_nm["mermaid"].default;
 <pre class="mermaid">flowchart LR
     D[&quot;① 发现&lt;br/&gt;kernel · DCGM · FM&lt;br/&gt;主机 · EFA · 训练&quot;]
     J[&quot;② 判定&lt;br/&gt;归一化 → 关联&lt;br/&gt;→ 版本化策略&quot;]
-    I[&quot;③ 隔离&lt;br/&gt;cordon + taint&lt;br/&gt;+ 停止 attempt&quot;]
-    M[&quot;④ 迁移负载&lt;br/&gt;停整个分布式 attempt&lt;br/&gt;warm spare 可选&quot;]
-    R[&quot;⑤ 修复&lt;br/&gt;reset / reboot&lt;br/&gt;/ 驱动 / 插件&quot;]
+    I[&quot;③ 隔离&lt;br/&gt;cordon + NoSchedule taint&lt;br/&gt;阻止新负载调度&quot;]
+    M[&quot;④ 停止负载&lt;br/&gt;停止整个分布式 attempt&quot;]
+    R[&quot;⑤ 修复&lt;br/&gt;reset / reboot&lt;br/&gt;驱动 / 插件&lt;br/&gt;健康 warm-spare 切换&quot;]
     V[&quot;⑥ 验证&lt;br/&gt;只认动作后的新样本&quot;]
     B[&quot;⑦ 重新纳管&lt;br/&gt;解除隔离 + 恢复训练&quot;]
     H[&quot;⑦&#39; 人工处理&lt;br/&gt;ESCALATED&lt;br/&gt;+ 保持隔离&quot;]
@@ -4370,13 +4369,42 @@ globalThis["mermaid"] = globalThis.__esbuild_esm_mermaid_nm["mermaid"].default;
     B -. &quot;证据 · 结论 · 回执写回状态库&quot; .-&gt; D
     H -. &quot;同上&quot; .-&gt; D</pre>
 <p>与 v1 §2 的五阶段是同一条链的不同切分：v1 的&quot;④ 受控执行&quot;在本文拆成 ③
-隔离、④ 迁移负载、⑤
-修复三环，因为这三环的<strong>能力成熟度差异很大</strong>——
-隔离几乎全部已实现，修复只有一部分能真实执行，迁移负载依赖客户是否备了
-warm spare。</p>
+隔离、④ 停止负载、⑤ 修复三环，按动作目标区分职责：</p>
+<ul>
+<li><strong>③ 隔离</strong>：<code>MARK_UNSCHEDULABLE</code> /
+<code>QUARANTINE</code> 设置 cordon 与自有 <code>NoSchedule</code>
+污点，阻止新负载调度，不负责停止已经运行的训练。</li>
+<li><strong>④ 停止负载</strong>：<code>STOP_WORKLOADS</code>
+停止受影响的整个分布式 attempt，
+为后续修复腾出执行条件；这一步不依赖是否有 warm
+spare，也不是在线迁移训练。</li>
+<li><strong>⑤ 修复</strong>：执行 reset、reboot、驱动/插件修复，或通过
+<code>REPLACE_NODE</code> 切换到已纳管的健康 warm
+spare。热备切换恢复的是计算容量，不代表原故障节点
+已修复；原节点保持隔离，后续验证和重新纳管面向实际恢复目标。</li>
+</ul>
+<p>代码依据为
+<code>src/gpu_fault/orchestration/workflow_builder.py::WorkflowBuilder.catalog_operations</code>
+和
+<code>src/gpu_fault/adapters/kubernetes/adapter.py::KubernetesWorkflowAdapter.execute</code>。
+对需要节点修复且仍有活跃训练的路径，先隔离，再停止负载，再执行修复；
+没有活跃负载时不额外增加停止步骤。图展示主线职责，具体步骤仍由策略、证据和
+Runtime Profile
+决定，不能把七阶段理解为每个事件都必须完整执行的固定模板。</p>
 <p><strong>闭环的两个入口。</strong> 常态入口是
-①（信号先到）；另一个入口是训练进程先死、 再回查原因（v1 §5.2
-被动终态流程），它从 ② 进入闭环，缺少 allocation 时 直接跳到 ⑦&#39;。</p>
+①（信号先到）；另一个入口是训练进程先死、 再回查原因，见<a href="#passive-terminal-overview">被动训练终态总图</a>。 Watcher
+发现失败后异步触发“取证 + 停整个
+attempt”，终态上报和决策不等待遏制完成； 需要新恢复 workflow
+时，由前驱依赖安排先停后启。</p>
+<p>被动入口从 ②
+分流，<strong>不要求每个终态都经过上图的节点修复主链</strong>：
+正常成功、用户停止或其他 incident
+发起终止时不新建恢复；本系统被动遏制造成的 <code>STOPPED</code>
+则继续判定。有可用 marker 时关联已有处置，已有 workflow
+负责重启则不重复； 无 marker 但 allocation 非空且 Profile
+允许重启时，不做硬件定因，直接规划预算内 单次重启。无 marker 路径缺少
+allocation 或无可执行重启能力时，只取证并转 ⑦&#39;，
+不猜测节点，也不凭空生成节点隔离。细分条件见 <a href="#passive-terminal-decision">终态决策与恢复</a>，各角色调用见 <a href="详细设计-v2.md#passive-terminal-sequence">被动终态时序</a>。</p>
 <h3 data-number="1.2.2" id="12-环境范围"><span class="header-section-number">1.2.2</span> 环境范围</h3>
 <table>
 <thead>
@@ -4388,32 +4416,41 @@ warm spare。</p>
 </thead>
 <tbody>
 <tr class="odd">
-<td>SageMaker HyperPod EKS</td>
-<td><strong>唯一生产交付形态</strong></td>
-<td>区域级多集群分离部署，见 v1 §7.1</td>
+<td>SageMaker HyperPod EKS GPU
+集群（<code>provider: hyperpod</code>）</td>
+<td><strong>生产交付形态</strong>（完整验收）</td>
+<td>区域级多集群分离部署，见 v1
+§7.1；<code>NodeRecovery=None</code></td>
 </tr>
 <tr class="even">
+<td>普通 Amazon EKS 托管节点组 GPU
+集群（<code>provider: eks-managed</code>）</td>
+<td><strong>生产交付形态</strong>（新增、验证较少）</td>
+<td>与 HyperPod 集群同属区域部署，可混合纳管；节点组须关闭 node auto
+repair，reboot 经 EC2 <code>RebootInstances</code>，见 v1 §2.4</td>
+</tr>
+<tr class="odd">
 <td>单集群一体化 EKS</td>
 <td>历史过渡</td>
 <td>迁移起点与有限 Canary，未经同等级验收</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>通用 Kubernetes</td>
 <td><strong>未实现</strong></td>
 <td>清单已从公开树移除；枚举值与占位 manifest 不表示支持</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>HyperPod Slurm</td>
 <td><strong>不支持</strong></td>
 <td>无 scheduler adapter、无隔离证据回读、无 workload
 stop/restart；纳管前置检查应拒绝</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>EC2 裸集群</td>
 <td>未实现</td>
 <td>核心领域模型不依赖 Kubernetes，但没有对应执行路径</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>开发与仿真</td>
 <td>已实现</td>
 <td>内存存储 +
@@ -4458,8 +4495,9 @@ NVML 温度与降频原因、<code>nvidia-smi</code> UUID 枚举）与所有设�
 <tr class="even">
 <td>MIG 实例（GI/CI）</td>
 <td><strong>未实现</strong></td>
-<td>只在解析 Pod 可见 UUID 时接受 <code>MIG-</code> 前缀的取值；没有 MIG
-级故障类型、没有 GI/CI 字段、没有 MIG 爆炸半径计算</td>
+<td>只在解析 Pod 可见 UUID 与主机 GPU 清单时接受 <code>MIG-</code>
+前缀的取值；没有 MIG 级故障类型、没有 GI/CI 字段、没有 MIG
+爆炸半径计算</td>
 </tr>
 </tbody>
 </table>
@@ -4479,13 +4517,20 @@ NVML 温度与降频原因、<code>nvidia-smi</code> UUID 枚举）与所有设�
 <tbody>
 <tr class="odd">
 <td>只告警</td>
-<td>AdvisoryNotification + SES 邮件</td>
-<td>已实现，是所有级别的公共底座</td>
+<td>AdvisoryNotification +
+站点通知通道（<code>GPU_FAULT_NOTIFICATION_CHANNEL</code>，由
+<code>spec.notifications.channel</code> 渲染：新站点默认
+<code>sns</code> 发布到站点 SNS topic；<code>ses</code> 邮件为
+opt-in，已有 SES sender 的旧站点保留
+SES；<code>spec.notifications.allowEmail: false</code> 时只落
+outbox，运行时变量另接受 <code>disabled</code>）</td>
+<td>已实现，是所有级别的公共底座；通知落库不代表已外发</td>
 </tr>
 <tr class="even">
 <td>证据保全</td>
-<td><code>FREEZE_EVIDENCE</code>、<code>COLLECT_DIAGNOSTIC_BUNDLE</code>、<code>COLLECT_HUNG_TRIAGE</code>、<code>RUN_DCGM_DIAGNOSTIC</code></td>
-<td>已实现</td>
+<td><code>FREEZE_EVIDENCE</code>、<code>COLLECT_HUNG_SUMMARY</code>、<code>COLLECT_DIAGNOSTIC_BUNDLE</code>、<code>COLLECT_HUNG_TRIAGE</code>、<code>RUN_DCGM_DIAGNOSTIC</code>、<code>TRIGGER_HEALTH_SNAPSHOT</code></td>
+<td>已实现；全任务低成本摘要与有界主动诊断分层；<code>TRIGGER_HEALTH_SNAPSHOT</code>
+让节点立即重采一份新快照，供验证与采集器静默刷新使用</td>
 </tr>
 <tr class="odd">
 <td>隔离</td>
@@ -4499,28 +4544,38 @@ NVML 温度与降频原因、<code>nvidia-smi</code> UUID 枚举）与所有设�
 </tr>
 <tr class="odd">
 <td>设备级修复</td>
-<td><code>RESET_GPU</code>、<code>RESET_ALL_GPUS_NVSWITCHES</code>、<code>QUIESCE_GPU_SERVICES</code>、<code>RESTORE_GPU_SERVICES</code>、<code>VERIFY_NO_GPU_CLIENTS</code></td>
-<td>已实现，签名下发；安装器裸默认关闭 reset，当前 HyperPod
-生产安装显式开启</td>
+<td><code>RESET_GPU</code>、<code>RECOVER_DRAIN_P2P</code>、<code>RESET_ALL_GPUS_NVSWITCHES</code>、<code>QUIESCE_GPU_SERVICES</code>、<code>RESTORE_GPU_SERVICES</code>、<code>VERIFY_NO_GPU_CLIENTS</code></td>
+<td>已实现，签名下发；安装器裸默认关闭 reset，当前区域生产安装（两种
+provider 共用的安装 Job）显式开启；eks-managed 的静默窗口另给节点打
+<code>gpu-fault.io/quiesce</code> NoExecute 污点</td>
 </tr>
 <tr class="even">
 <td>Fabric Manager 修复</td>
 <td><code>RESTART_FABRIC_MANAGER</code></td>
-<td>已实现；节点侧有独立开关，当前 HyperPod
-生产安装显式开启，并在执行前验证无 compute client、执行后验证服务
-active</td>
+<td>已实现；节点侧有独立开关，当前区域生产安装显式开启，并在执行前验证无
+compute client、执行后验证服务 active。受分级的 NVSwitch 节点（Hopper
+SXM、HGX B200/B300）上单独重启会丢失 fabric 状态：solo XID 45
+默认只观测（NVIDIA GPU debug guidelines 判其为信息性，A100 除外；记录
+incident
+与调查通知，不动节点、不隔离），<code>GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true</code>
+时其 <code>RESTART_FM</code> 编译为完整 GPU + NVSwitch reset
+链；未分级节点（含 A100）仍是 Fabric Manager 重启；单 GPU reset 的
+quiesce 窗口保留 Fabric Manager 运行</td>
 </tr>
 <tr class="odd">
 <td>节点级修复</td>
 <td><code>RESTART_NODE</code>（HyperPod
-<code>BatchRebootClusterNodes</code>）</td>
-<td>已实现，受 <code>ALLOW_HYPERPOD_REBOOT</code>
+<code>BatchRebootClusterNodes</code>；eks-managed 为对绑定实例的 EC2
+<code>RebootInstances</code>）</td>
+<td>已实现，两种 provider 都受 <code>ALLOW_HYPERPOD_REBOOT</code>
 控制；当前区域数据面生产清单为 true</td>
 </tr>
 <tr class="even">
 <td>软件面修复</td>
 <td><code>REMEDIATE_EFA_DRIVER</code>、<code>RESTART_EFA_DEVICE_PLUGIN</code>、<code>RESTART_GPU_DEVICE_PLUGIN</code></td>
-<td>已实现</td>
+<td>已实现；Node installer 默认允许 EFA driver remediation，显式
+<code>--disable-efa-driver-remediation</code> 同时关闭权限并移除其
+operation；不绕过 Profile、签名和 workload-stop 门禁</td>
 </tr>
 <tr class="odd">
 <td>站点脚本修复</td>
@@ -4532,32 +4587,47 @@ SXID、目标版本、绝对路径命令与 SHA-256</td>
 <td>人工步骤</td>
 <td><code>CHECK_MECHANICALS</code>、<code>ESCALATE_SUPPORT</code></td>
 <td>已实现；前者等待精确 annotation，后者生成合成 ticket
-ID、持久通知并可发 SES；没有外部工单系统</td>
+ID、持久通知并经站点 SNS/SES 通道发出；没有外部工单系统</td>
 </tr>
 <tr class="odd">
-<td>节点替换</td>
-<td><code>REPLACE_NODE</code></td>
-<td><strong>只走 warm spare</strong>；永不调用
-<code>BatchReplaceClusterNodes</code>（v1 §2.1 约束 2）</td>
+<td>运维维护</td>
+<td><code>COLLECTOR_OUTBOX_MAINTENANCE</code></td>
+<td>已实现；<code>gpu-fault-admin collector-outbox</code> 把节点本地
+<code>gpu-fault-collector outbox {stats,list,requeue-dead}</code>
+作为单步 NODE_ACTION
+工作流送到节点，只回传元数据，严格拿锁、<code>requeue-dead</code> 需
+<code>--yes</code>、无远程 <code>--force</code></td>
 </tr>
 <tr class="even">
+<td>节点替换</td>
+<td><code>REPLACE_NODE</code></td>
+<td><strong>只走 warm spare</strong>，两种 provider 相同；永不调用
+<code>BatchReplaceClusterNodes</code>（v1 §2.1 约束 2），也不替换任何
+EC2 实例；没有足够健康热备时 fail-closed</td>
+</tr>
+<tr class="odd">
 <td>规划占位</td>
 <td><code>RESTART_VM</code></td>
-<td>不在生产 allowlist；HyperPod EKS 只在受控映射成立时把 NVIDIA
-<code>RESTART_VM</code> 转为 <code>RESTART_NODE</code></td>
+<td>不在生产 allowlist；NVIDIA 官方动作为 <code>RESTART_VM</code>
+时，按事件所属 Runtime Profile 的环境映射为
+<code>RESTART_NODE</code>：HyperPod 经
+<code>BatchRebootClusterNodes</code>、eks-managed 经 EC2
+<code>RebootInstances</code>（<code>node_provider.restart_vm_effective_action</code>，二者都不是
+EC2 stop/start）；裸 Kubernetes profile 不映射，保持 BLOCKED</td>
 </tr>
 </tbody>
 </table>
 <p><code>src/gpu_fault/models.py</code> 的
-<code>WorkflowOperation</code> 共 32 个取值；生产控制面
-<code>GPU_FAULT_ALLOWED_OPERATIONS</code> 白名单收了 31 个（见
+<code>WorkflowOperation</code> 共 35 个取值；生产控制面
+<code>GPU_FAULT_ALLOWED_OPERATIONS</code> 白名单收了 34 个（见
 <code>deploy/control-plane/regional/generated/</code>），节点侧
 应用裸默认的 <code>GPU_FAULT_NODE_ALLOWED_OPERATIONS</code> 只有
-<code>VERIFY_NO_GPU_CLIENTS</code>； 节点安装脚本在启用 Agent 时写入 10
-项基础 operation，再按 EFA、Field Diagnostic、 驱动和固件能力追加。生产
-HyperPod 安装还显式开启 GPU reset、fabric reset、 服务静默和 Fabric
-Manager restart。 <strong>白名单里有 ≠ 能真实执行</strong>：还要该
-capability 有唯一可执行 owner（§7.1）。</p>
+<code>VERIFY_NO_GPU_CLIENTS</code>； 节点安装脚本在启用 Agent 时写入 13
+项基础 operation，再按 EFA、Field Diagnostic、 驱动和固件能力追加（EFA
+driver remediation 默认追加，因此默认节点清单为 14 项）。 区域生产安装
+Job（两种 provider 共用）还显式开启 GPU reset、fabric reset、 服务静默和
+Fabric Manager restart。 <strong>白名单里有 ≠
+能真实执行</strong>：还要该 capability 有唯一可执行 owner（§7.1）。</p>
 <h3 data-number="1.2.5" id="15-不在范围内"><span class="header-section-number">1.2.5</span> 不在范围内</h3>
 <table>
 <thead>
@@ -4572,13 +4642,20 @@ capability 有唯一可执行 owner（§7.1）。</p>
 <td>日志规则识别 <code>out of memory</code> / <code>oom-kill</code> /
 <code>killed process</code> 并归到 host/系统日志族，不当作 GPU
 硬件故障；warm spare 侧 <code>src/gpu_fault/spare_health.py</code>
-把非硬件原因归类为 <code>CONFIGURATION</code>，只置 <code>SUSPECT</code>
+把占用与配置类原因（活跃 GPU Pod 或 client、spare
+可调度或已被预留等）归为 <code>CONFIGURATION</code>、其余非硬件原因归为
+<code>OBSERVATION</code>，只置 <code>SUSPECT</code>
 并推迟，不触发硬件修复</td>
 </tr>
 <tr class="even">
 <td>模型代码错误、超参问题</td>
-<td>不做因果分析；表现为训练终态失败且 allocation
-完整时发起快速诊断，诊断无硬件结论则不自动重启</td>
+<td>不做因果分析。训练终态 FAILED/TIMED_OUT 且无匹配硬件 marker
+时<strong>不做诊断</strong>，直接在同一 job 的 restart budget
+内重启一次（trigger <code>no-hardware-evidence:RESTART</code>）；profile
+没有可执行的 workload restart
+能力时只取证并升级人工（<code>no-hardware-evidence:ESCALATE</code>）；缺
+allocation 时记
+<code>allocation-missing:INCONCLUSIVE</code>，只升级不重启</td>
 </tr>
 <tr class="odd">
 <td>训练框架性能调优</td>
@@ -4612,18 +4689,18 @@ capability 有唯一可执行 owner（§7.1）。</p>
 </tr>
 <tr class="even">
 <td>P0 API p99</td>
-<td>&lt; 1 s</td>
+<td>必须记录并与本轮批准的延迟预算比较；不设统一固定否决线</td>
 </tr>
 <tr class="odd">
 <td>processor 稳态最老等待时间</td>
 <td>&lt; 5 s</td>
 </tr>
 <tr class="even">
-<td>单节点故障首个隔离 step p99</td>
+<td>未等待 remediation budget 的单节点故障首个隔离 step p99</td>
 <td>&lt; 10 s</td>
 </tr>
 <tr class="odd">
-<td>多节点故障首个隔离 step</td>
+<td>未等待 remediation budget 的多节点故障首个隔离 step</td>
 <td>&lt; 聚合窗口 + 10 s</td>
 </tr>
 <tr class="even">
@@ -4640,8 +4717,8 @@ capability 有唯一可执行 owner（§7.1）。</p>
 的时间常数</strong>（配置默认值，用于判定而非承诺）： Agent 心跳 30
 s、90 s 过期；collector 静默阈值 <code>GPU_INVENTORY</code> 180 s、
 <code>GPU_METRICS</code> 420 s、<code>HOST_TELEMETRY</code> 420
-s；workflow lease 180 s； dispatcher 5 s 一轮、单批 100 个
-workflow。</p>
+s；workflow lease 180 s； dispatcher 5 s 一轮、单批默认 346
+行（由派发线程数与派发租约推导，限 100–400）。</p>
 <p><strong>未定义</strong>（建议提出但代码与文档都没有对应度量）：</p>
 <table>
 <thead>
@@ -4662,11 +4739,12 @@ workflow。</p>
 </tr>
 <tr class="odd">
 <td>自动恢复成功率</td>
-<td>workflow 终态可统计，但没有定义为验收指标</td>
+<td>已导出 workflow 终态、步骤结果和耗时；正式 SLO 分母仍待批准</td>
 </tr>
 <tr class="even">
 <td>重新纳管正确率</td>
-<td>同上</td>
+<td>已导出 readmission/workload-restart milestone；复发窗口 SLO
+仍待批准</td>
 </tr>
 <tr class="odd">
 <td>事件丢失率</td>
@@ -4710,15 +4788,18 @@ workflow。</p>
 <td>温度、功耗与降频</td>
 <td>DCGM / NVML</td>
 <td><code>DcgmMetricsCollector</code></td>
-<td>GPU 85/90 ℃、显存 90/95 ℃ 双阈值；降频原因位掩码；功耗比 0.95</td>
+<td>优先按设备自报的温度限值判定（T.Limit 刻度或绝对 slowdown/shutdown
+限值，见 <code>gpu_temperature_policy.py</code>），设备未报时回退到 GPU
+85/90 ℃、显存 90/95 ℃ 配置阈值；降频原因位掩码；功耗比 0.95</td>
 <td>连续 2 个样本越 critical 线才升级到隔离</td>
 </tr>
 <tr class="even">
 <td>互联与网络（EFA/RDMA）</td>
 <td>主机 sysfs、EFA 流量</td>
 <td><code>HostTelemetryCollector</code></td>
-<td>inventory 数量比对 + 流量状态机（8 态）</td>
-<td>inventory 不符 → 隔离链；流量异常 → 先取证</td>
+<td>inventory 数量比对（按失败模式分层）+ 流量状态机（8 态）</td>
+<td>inventory 不符 → 按失败模式走驱动修复、诊断或节点重启链（v1
+§5.4）；流量异常 → 先取证</td>
 </tr>
 <tr class="odd">
 <td>掉卡（GPU/EFA ACTIVE inventory）</td>
@@ -4736,35 +4817,69 @@ workflow。</p>
 <td>多为告警与取证；MCE 等升级到隔离</td>
 </tr>
 <tr class="odd">
-<td>监控失联（Unknown）</td>
-<td>控制面反向判定</td>
-<td>控制面 60 s 扫描</td>
-<td>ACTIVE 且 heartbeat lease 仍有效的通道超过静默阈值</td>
-<td>AdvisoryNotification + 邮件；<strong>不视为健康</strong></td>
+<td>采集器静默（健康不可确认）</td>
+<td>控制面读取已持久化的采集状态</td>
+<td><code>collector-silence</code>，默认扫描间隔 60 s，非失联阈值</td>
+<td>活跃集群中，ACTIVE 且 heartbeat lease 有效的 Agent
+所需通道无成功记录，或距最近成功上报超过通道阈值（§2.5）</td>
+<td>AdvisoryNotification + 站点通知通道；静默通道记为观测
+<code>UNKNOWN</code>，每节点每小时最多一次
+<code>TRIGGER_HEALTH_SNAPSHOT → VALIDATE_HOST</code>
+有界刷新；不创建恢复
+workflow，<strong>不将监控缺失视为健康</strong></td>
 </tr>
 <tr class="even">
 <td>训练侧（终态与 hang）</td>
 <td>Kubernetes watch、EFA 零流量</td>
 <td><code>CompletionWatcher</code>、EFA 流量状态机</td>
-<td>唯一 TerminalEvent；<code>HUNG_SUSPECTED</code></td>
-<td>终态走 containment；hang 走<strong>只读取证链</strong></td>
+<td>唯一 TerminalEvent；<code>HUNG_SUSPECTED</code>；空闲 pass（完整
+list 后零个在跑 managed Pod、零个活跃 attempt）另发覆盖心跳
+<code>POST /v1/attempts/coverage</code>（内置最多每 120 s
+一条），让空闲集群判为 IDLE 而不是 UNKNOWN；忙集群由观测流本身证明
+watcher 活着</td>
+<td>终态按<a href="#passive-terminal-overview">被动流程总图</a>分流：失败时异步遏制，决策不等待停训练完成；有可用
+marker 时复用/编排处置，已有 workflow 负责重启则不重复恢复；无 marker 且
+allocation 非空、Profile
+可重启时才走预算内单次重启，否则取证并升级。hang
+走<strong>只读取证链</strong></td>
 </tr>
 </tbody>
 </table>
-<p>PCIe 只覆盖到 <code>pcie_replay_total</code> /
-<code>DCGM_FI_DEV_PCIE_REPLAY_COUNTER</code> 计数与
-<code>pci_bdfs</code> 证据字段，<strong>没有 AER / PCIe link
-故障判定路径</strong>（§11）。</p>
+<p>训练侧“可用 marker”不包含指向已存 incident 的纯诊断
+marker；跳过后仍需检查 其他修复 marker。<code>after_incident</code>
+重启在执行时等待原 incident <code>RECOVERED</code>，
+并非匹配成功即可重启，完整规则统一见<a href="#passive-terminal-decision">详细决策</a>。</p>
+<p>上表只给每族的起点。每条主机/DCGM 规则的阈值与动作、172 个 XID 和全部
+SXID 码的 NVIDIA 官方建议、本方案判定与编译出的步骤链，逐项列在 <a href="故障类别与处置动作总表.md">故障类别与处置动作总表</a>。</p>
+<p>PCIe 覆盖 <code>pcie_replay_total</code> /
+<code>DCGM_FI_DEV_PCIE_REPLAY_COUNTER</code> 计数（阈值为当前链路的 DCGM
+预期速率）、 负载下链路降速（DCGM 235-238）与 correctable 错误速率（DCGM
+1501），以及 <code>pci_bdfs</code> 证据字段
+（<code>src/gpu_fault/gpu_pcie_link_policy.py</code>）；<strong>仍没有内核
+AER 日志解码与独立的掉链判定路径</strong>，GPU 掉出总线 只能经 XID（如
+79）或 GPU inventory 掉卡路径发现（§11）。</p>
 <h3 data-number="1.3.2" id="22-严重级别与动作阶梯"><span class="header-section-number">1.3.2</span> 严重级别与动作阶梯</h3>
 <p><code>Severity</code> 四级：<code>info</code> / <code>warning</code>
 / <code>critical</code> / <code>fatal</code>。
 严重级别不直接决定动作，动作由<strong>全局唯一的强弱序阶梯</strong>决定：</p>
-<pre class="text"><code>RUN_DIAGNOSTICS &lt; RESTART_WORKLOAD &lt; RESET_GPU &lt; RESET_ALL_GPUS_NVSWITCHES
-&lt; RESTART_NODE &lt; DRAIN/QUARANTINE &lt; REPLACE_NODE
-&lt; CHECK_MECHANICALS/ESCALATE_SUPPORT</code></pre>
+<pre class="text"><code>RUN_DCGM_DIAGNOSTIC / RUN_FIELD_DIAGNOSTIC / RESTART_FABRIC_MANAGER (10)
+&lt; RESTART_GPU_DEVICE_PLUGIN / RESTART_EFA_DEVICE_PLUGIN (15)
+&lt; RESTART_WORKLOAD (20) &lt; RESET_GPU / RECOVER_DRAIN_P2P (30) &lt; REMEDIATE_EFA_DRIVER (35)
+&lt; RESET_ALL_GPUS_NVSWITCHES (40) &lt; RESTART_NODE (50) &lt; QUARANTINE (60)
+&lt; REMEDIATE_DRIVER / UPDATE_SOFTWARE_FIRMWARE (70) &lt; REPLACE_NODE (75)
+&lt; CHECK_MECHANICALS / ESCALATE_SUPPORT (80)</code></pre>
 <p>该阶梯在 <code>src/gpu_fault/operation_registry.py</code> 里以
-<code>recovery_rank</code> 表达， 跨类型仲裁、workflow
-合并、抢占和失败升级都用它比较，不在各模块另写一份。</p>
+<code>recovery_rank</code> 表达 （括号内为 rank
+值；隔离、取证、验证、GPU 服务静默/恢复等 operation 不带 rank，
+不参与排序），跨类型仲裁、workflow 合并、抢占和失败升级都用它比较。
+planner 层的 <code>RecoveryAction</code> 在
+<code>src/gpu_fault/models.py</code> 的
+<code>RECOVERY_ACTION_RANK</code>
+有一张同序的对应表（<code>RUN_DIAGNOSTICS</code> 10、
+<code>MARK_UNSCHEDULABLE</code> / <code>STOP_WORKLOAD</code>
+25、<code>DRAIN</code> / <code>QUARANTINE</code> 60、
+<code>REPLACE_NODE</code> 70、<code>ESCALATE_OPERATOR</code>
+80），用于被动终态路径挑选最强 marker。</p>
 <h3 data-number="1.3.3" id="23-策略是版本化数据不是硬编码"><span class="header-section-number">1.3.3</span>
 策略是版本化数据，不是硬编码</h3>
 <p>这一点与建议一致，且已实现得比建议更严：</p>
@@ -4833,16 +4948,52 @@ catalog 版本</td>
 未知故障、缺少 allocation、能力所有者冲突或证据不足时停止自动动作， 是
 v1 的设计原则之一。</p>
 <h3 data-number="1.3.5" id="25-监控失联必须是-unknown"><span class="header-section-number">1.3.5</span> 监控失联必须是 Unknown</h3>
-<p>建议特别强调&quot;监控失联不能视为健康&quot;，这一条已实现且有一个容易踩的坑：
-控制面只对<strong>ACTIVE 且 heartbeat lease
-仍有效</strong>的通道判静默。历史上仍标 ACTIVE 但 lease
-已过期的节点不参与指标或邮件告警——否则已退役节点会形成永久静默误报。
-同一节点、collector、channel 每小时最多一封邮件。</p>
+<p>这里的 Unknown 表达“监控缺失时不能确认健康”，不是统一的节点状态写入。
+<code>collector-silence</code> 任务检查采集器静默、生成
+<code>AdvisoryNotification</code>，并按节点和通道把 观测有效性记为
+<code>collector_observation_valid</code>（<code>HEALTHY</code>/<code>UNKNOWN</code>）；它不把节点写成
+<code>UNKNOWN</code>，也不创建恢复
+workflow。对确实静默（阈值内没有任何上报）的通道，它每节点
+每小时最多提交一次有界刷新请求：非破坏性的观测类诊断 workflow
+<code>TRIGGER_HEALTH_SNAPSHOT → VALIDATE_HOST</code>，让节点重采一份新快照；仍在上报、只是报告采集
+错误的通道不触发刷新（<code>src/gpu_fault/app/collector_silence.py::notify_silent_collectors</code>）。</p>
+<p>控制面默认以 <strong>60 s
+间隔</strong>调度采集器静默检查，读取已持久化的成功上报时间；
+检查本身不向节点发送探测请求。60 s
+可配置，是本轮结束到下轮调度的默认间隔，
+不是失联判定阈值或告警送达时限；实际执行还取决于 Worker、Store
+和周期任务租约。</p>
+<p>检查范围限于活跃集群中 <strong>ACTIVE 且 heartbeat lease 仍有效的
+Agent</strong> 的所需采集通道； 显式 disabled/masked
+的采集服务不纳入。没有成功记录，或距最近成功上报超过该通道阈值时，
+生成通知。默认阈值为 GPU 库存 180 s、GPU 指标/主机遥测 420 s、日志类 900
+s， 通知按集群、节点和通道的默认 3600 s 时间桶去重。</p>
+<p>Agent
+心跳已过期的节点不参与这条静默扫描及对应指标统计；这不是健康结论，
+应另看 Fleet readiness 和 stale-agent 指标。Executor、Watcher
+等组件的失联也有各自
+判据，不能把本任务描述为覆盖全部数据面组件的统一失联检测。实现边界见详细设计
+v2 §2.3.1。</p>
+<p><code>GET /v1/collector-readiness/{cluster_id}</code>
+用同一条生命周期规则：只有 <code>ACTIVE</code> 的 Agent 进入
+<code>nodes</code> 并决定
+<code>ready</code>；<code>DRAINING</code>/<code>REVOKED</code>
+记录（例如 <code>workflow-reconcile --retire-departed-agents</code>
+退役的已消失 节点）列在 <code>retired_nodes</code> 下，带
+<code>lifecycle_state</code>、<code>last_seen_at</code>
+和各通道最后一次成功时间，但不影响 <code>ready</code>。它们的
+<code>collector_status</code> 行留在 Store 里作为证据——Store
+没有删除路径，读取方按 Agent 生命周期 忽略它们；退役后集群只剩非
+<code>ACTIVE</code> 记录时 <code>nodes</code> 为空、<code>ready</code>
+为 <code>false</code>（fail closed）。<code>ACTIVE</code> 但 lease
+已过期的 Agent 仍进入
+<code>nodes</code>：它的成功记录必然已超阈值，这正是 Agent coverage
+drift 应当让发布校验 失败的形态（管理员日常运维 §10.2 第四种形态）。</p>
 <hr />
 <h2 data-number="1.4" id="3-总体架构闭环视角"><span class="header-section-number">1.4</span> 总体架构（闭环视角）</h2>
 <h3 data-number="1.4.1" id="31-全景数据流"><span class="header-section-number">1.4.1</span> 全景数据流</h3>
 <pre class="mermaid">flowchart LR
-    subgraph DP[&quot;每 GPU 集群数据面（HyperPod EKS）&quot;]
+    subgraph DP[&quot;每 GPU 集群数据面（HyperPod EKS 或普通 EKS）&quot;]
         SRC[&quot;信号源&lt;br/&gt;kmsg · DCGM · FM log&lt;br/&gt;sysfs · nvidia-smi&quot;]
         COL[&quot;4 个节点 collector&lt;br/&gt;+ 1 个集群 collector&quot;]
         WCH[&quot;Completion Watcher&quot;]
@@ -4851,15 +5002,15 @@ v1 的设计原则之一。</p>
         SRC --&gt; COL
     end
 
-    subgraph CP[&quot;区域控制面（独立 CPU EKS）&quot;]
+    subgraph CP[&quot;区域控制面（独立 CPU HyperPod EKS）&quot;]
         ING[&quot;ingress ×3×4&lt;br/&gt;只入队&quot;]
-        AUR[(&quot;Aurora PostgreSQL&lt;br/&gt;14 张 base table&quot;)]
+        AUR[(&quot;Aurora PostgreSQL&lt;br/&gt;21 张 base table&quot;)]
         WRK[&quot;worker ×6×4&quot;]
         NRM[&quot;归一化 + 证据&quot;]
         POL[&quot;策略引擎&lt;br/&gt;catalog 610&quot;]
         ORC[&quot;Incident Orchestrator&lt;br/&gt;+ 仲裁 / 合并 / 抢占&quot;]
         DSP[&quot;Workflow Dispatcher&lt;br/&gt;lease + fencing&quot;]
-        NTF[&quot;Notification outbox → SES&quot;]
+        NTF[&quot;Notification outbox → SNS / SES&quot;]
         ING --&gt; AUR
         AUR --&gt; WRK
         WRK --&gt; NRM --&gt; POL --&gt; ORC --&gt; DSP
@@ -4872,7 +5023,7 @@ v1 的设计原则之一。</p>
     EXE -- &quot;领取命令 / 回执&quot; --&gt; ING
     EXE --&gt; KAPI[&quot;本集群 Kubernetes API&quot;]
     EXE --&gt; AGT
-    EXE --&gt; HPAPI[&quot;SageMaker HyperPod API&quot;]
+    EXE --&gt; HPAPI[&quot;SageMaker HyperPod API / EC2 API&quot;]
     AGT --&gt; GPUDEV[&quot;GPU / 节点&quot;]</pre>
 <p>三条必须记住的边界（详见 v1 §4.1、§4.1.1）：跨边界连接<strong>全部由
 GPU 集群侧发起</strong>； 控制面不持有任何 GPU 集群的
@@ -4917,7 +5068,7 @@ kubeconfig；<code>region + cluster_id</code> 是一切资源、
 <td>数据面（节点）</td>
 <td>node-agent</td>
 <td>每节点 1 个，:9099</td>
-<td><strong>是</strong>（默认关闭 reset）</td>
+<td><strong>是</strong>（安装器裸默认关闭 reset，区域生产安装开启）</td>
 </tr>
 <tr class="even">
 <td>数据面（集群）</td>
@@ -4930,7 +5081,8 @@ kubeconfig；<code>region + cluster_id</code> 是一切资源、
 <td>completion-watcher / node-resource-collector /
 node-installer-reconciler</td>
 <td>各 1</td>
-<td>watcher 仅紧急兜底时改 workload</td>
+<td>watcher 仅紧急兜底时改 workload；reconciler 为缺装节点创建安装 Job
+并回写节点标记</td>
 </tr>
 </tbody>
 </table>
@@ -4943,19 +5095,26 @@ node-installer-reconciler</td>
 <li><strong>修复流程的事实来源是
 Aurora</strong>：incident、workflow、step、回执、fencing token、
 证据引用都在状态库里，重放与审计只依赖它。</li>
-<li><strong>AMP/ADOT 只覆盖控制面自身指标</strong>，且是可选增强。没有
-AMP 的 region 设 <code>GPU_FAULT_ENABLE_AMP=false</code>，安装脚本跳过
-AMP/ADOT 资源。</li>
-<li><strong>业务告警不走 Prometheus</strong>：collector 静默、workflow
-结果和故障通知走 控制面 Aurora outbox + SES
-邮件。ADOT→AMP→Alertmanager→SNS 与 SES 是
-两条独立路径，不互为备份。</li>
+<li><strong>AMP/ADOT 覆盖 CPU 角色与已配置 GPU
+数据面组件的自身指标</strong>，不接管故障判定。 GPU 集群的 ADOT 用本集群
+IRSA 写站点 AMP，不携带 execution token； Amazon Managed Grafana
+查询同一 workspace 的时序，不是另一条告警出口。
+<code>GPU_FAULT_ENABLE_AMP=false</code> 让安装脚本跳过 AMP/ADOT
+资源，但只有 legacy 脚本 路径可达；<code>gpu-fault-admin</code>
+一键部署恒写 <code>true</code>。</li>
+<li><strong>业务通知不走 Prometheus</strong>：workflow 结果与故障通知走
+Aurora outbox，再由站点 SNS/SES 通道发送。collector
+静默有两路：控制面采集器静默检查（默认间隔 60 s， 范围与阈值见 §2.5）→
+outbox 通知（不依赖 AMP），以及 AMP <code>GpuFaultCollectorSilent</code>
+规则；SNS 站点中二者终点是<strong>同一个站点 SNS
+topic</strong>，但事实来源分别是 Aurora 状态 与 <code>/metrics</code>
+时序。不能用指标链存在来掩盖 outbox 未投递。</li>
 <li>因此&quot;时序库丢点&quot;不影响修复决策，&quot;Aurora 不可用&quot;才影响。</li>
 </ul>
 <hr />
 <h2 data-number="1.5" id="4-模块设计建议的九个模块落在哪里"><span class="header-section-number">1.5</span>
 模块设计：建议的九个模块落在哪里</h2>
-<p>建议列了九个模块。逐个映射到真实代码位置，并补上建议没提但实际存在的五个。</p>
+<p>建议列了九个模块。逐个映射到真实代码位置，并补上建议没提但实际存在的七个。</p>
 <table>
 <thead>
 <tr class="header">
@@ -4992,8 +5151,10 @@ NVIDIA</strong>；<code>NvidiaSmiMetricsCollector</code> 是无 DCGM
 <tr class="odd">
 <td>关联分析</td>
 <td><code>src/gpu_fault/policy/</code>（XID companion
-关联）、<code>src/gpu_fault/completion_controller.py</code>（attempt
-关联）</td>
+关联）、<code>src/gpu_fault/completion_controller.py</code> 及其拆出的
+<code>completion_pod_parsing.py</code> /
+<code>completion_delivery.py</code> /
+<code>completion_reconcile_loop.py</code>（attempt 关联）</td>
 <td>已实现</td>
 </tr>
 <tr class="even">
@@ -5004,7 +5165,8 @@ NVIDIA</strong>；<code>NvidiaSmiMetricsCollector</code> 是无 DCGM
 </tr>
 <tr class="odd">
 <td>工作流执行器</td>
-<td><code>src/gpu_fault/orchestration/</code>、<code>src/gpu_fault/execution/</code>、<code>src/gpu_fault/adapters/</code></td>
+<td><code>src/gpu_fault/orchestration/</code>、<code>src/gpu_fault/execution/</code>、<code>src/gpu_fault/adapters/</code>、<code>src/gpu_fault/eks_provider.py</code>（eks-managed
+的节点生命周期 provider）</td>
 <td>已实现</td>
 </tr>
 <tr class="even">
@@ -5020,7 +5182,7 @@ NVIDIA</strong>；<code>NvidiaSmiMetricsCollector</code> 是无 DCGM
 </tr>
 </tbody>
 </table>
-<p>建议没提但闭环缺不了的五个：</p>
+<p>建议没提但闭环或生产生命周期缺不了的七个：</p>
 <table>
 <thead>
 <tr class="header">
@@ -5038,7 +5200,7 @@ NVIDIA</strong>；<code>NvidiaSmiMetricsCollector</code> 是无 DCGM
 </tr>
 <tr class="even">
 <td>Restart Guard</td>
-<td>原子预留重启预算 + 前后 GPU 数量校验</td>
+<td>控制面预检原子预留重启预算，数据面比对授权 + 前后 GPU 数量校验</td>
 <td>抗震荡的主力，见 §6.6</td>
 </tr>
 <tr class="odd">
@@ -5050,12 +5212,32 @@ NVIDIA</strong>；<code>NvidiaSmiMetricsCollector</code> 是无 DCGM
 <tr class="even">
 <td>Notification outbox + Dispatcher</td>
 <td><code>src/gpu_fault/notification_service.py</code>、<code>src/gpu_fault/notifications/</code></td>
-<td>邮件必须与 workflow 结果解耦：SES 故障不能反向改变 step 结果</td>
+<td>通知必须与 workflow 结果解耦：SNS/SES 故障不能反向改变 step
+结果</td>
 </tr>
 <tr class="odd">
 <td>Regional Cluster Registry + Remote Command</td>
-<td><code>src/gpu_fault/regional.py</code>、<code>src/gpu_fault/cluster_executor.py</code></td>
+<td><code>src/gpu_fault/regional.py</code>、包
+<code>src/gpu_fault/cluster_executor/</code>（<code>regional_client</code>
+/ <code>lease</code> / <code>dispatch</code> / <code>executor</code> /
+<code>bootstrap</code> 五层，另有复合命令回放
+<code>batching</code>、节点清单上报 <code>node_inventory</code>、Node
+Action key 同步 <code>node_key_sync</code> 与
+<code>metrics</code>）</td>
 <td>跨信任边界下发协议，是&quot;控制面不持有 kubeconfig&quot;的落地方式</td>
+</tr>
+<tr class="even">
+<td>Installation Resource Registry</td>
+<td><code>src/gpu_fault/installation_resources.py</code>、<code>src/gpu_fault/admin/resource_registry.py</code></td>
+<td>记录 AWS
+资源的稳定身份、归属、删除策略、依赖和状态，使部署、接管、移除集群与全站卸载使用同一事实源</td>
+</tr>
+<tr class="odd">
+<td>Departed-node cleanup</td>
+<td><code>src/gpu_fault/departed_node_cleanup.py</code>、<code>src/gpu_fault/departed_nodes.py</code>、<code>src/gpu_fault/departed_node_provider.py</code></td>
+<td>Spot 回收、缩容或 provider 替换后，在 Kubernetes、provider 与 Agent
+三方证据都证明节点离开时自动退役 Agent、收尾无人能执行的 workflow 与
+incident；不归它处理的只记账并通知（v1 §2.2）</td>
 </tr>
 </tbody>
 </table>
@@ -5186,7 +5368,9 @@ GPU）、<code>node_wide</code>、<code>node_exclusive</code>、<code>merged_gpu
 </tbody>
 </table>
 <h3 data-number="1.6.3" id="53-领域对象与隔离键"><span class="header-section-number">1.6.3</span> 领域对象与隔离键</h3>
-<p>主要领域对象与幂等键见 v1 §6.1（10 个对象）。必须以
+<p>主要领域对象与幂等键见 v1 §6.1（11 个对象，含不带
+<code>cluster_id</code>、按 <code>site_id + resource_key</code> 建键的
+<code>InstallationResource</code>）。必须以
 <code>(region, cluster_id, …)</code> 建键的对象清单见 v1
 §6.2。这里只强调一条<strong>判读规则</strong>： 凡是只用集群内 ID（node
 name / job ID / attempt ID）建键的地方都是缺陷，
@@ -5250,7 +5434,7 @@ name / job ID / attempt ID）建键的地方都是缺陷，
 <pre class="mermaid">stateDiagram-v2
     [*] --&gt; DETECTED: 归一化 + 策略产出 finding
     DETECTED --&gt; ACTION_PENDING: 官方动作可执行
-    DETECTED --&gt; SAFETY_PENDING: 只允许站点安全动作
+    DETECTED --&gt; SAFETY_PENDING: 只允许站点安全动作，或计划只因缺可执行 owner 被拒而含容前缀可编译
     ACTION_PENDING --&gt; QUARANTINED: 隔离步骤完成 / 修复未通过
     SAFETY_PENDING --&gt; QUARANTINED: 安全步骤完成
     ACTION_PENDING --&gt; RECOVERED: 验证通过 + 解除隔离
@@ -5289,10 +5473,10 @@ taint）</td>
 </tr>
 <tr class="even">
 <td>Draining</td>
-<td><strong>无独立状态</strong>。隔离 = cordon + taint +
-<code>STOP_WORKLOADS</code>，不调 Eviction API（§7.4）</td>
-<td>建议的 Draining 在实现里是 <code>ACTION_PENDING</code> 中的一个
-step，不是节点状态</td>
+<td><strong>无独立状态</strong>。先用 cordon + taint 隔离调度，再由
+<code>STOP_WORKLOADS</code> 停止受管训练，不调 Eviction API（§7.4）</td>
+<td>建议的 Draining 在实现里对应 <code>ACTION_PENDING</code>
+中的一组步骤，不是节点状态</td>
 </tr>
 <tr class="odd">
 <td>Repairing</td>
@@ -5319,21 +5503,28 @@ step，不是节点状态</td>
 </tbody>
 </table>
 <h3 data-number="1.7.3" id="63-幂等性与控制器重启恢复"><span class="header-section-number">1.7.3</span> 幂等性与控制器重启恢复</h3>
-<p>建议要求&quot;幂等性与控制器重启后的恢复&quot;。实现的四道机制：</p>
+<p>建议要求&quot;幂等性与控制器重启后的恢复&quot;。实现的五道机制：</p>
 <ol type="1">
 <li><strong>入口幂等</strong>：API、事件与工作流均按稳定 ID
 幂等处理；被动终态路径在同一存储 事务里创建 incident + workflow + event
 索引，PostgreSQL 按 event key 取事务级 advisory
 lock，多副本并发只有一个创建成功，其余返回同一 workflow。</li>
 <li><strong>执行幂等</strong>：远端命令按内容摘要去重，回执用同一幂等键；重复回执不产生第二次
-副作用，<strong>包括不产生第二封邮件</strong>。</li>
+副作用，<strong>包括不产生第二条通知</strong>。</li>
 <li><strong>无 leader</strong>：不选举全局 service leader（这与建议 §9
 的 &quot;Leader Election&quot; 不同）。 每个 worker 进程都跑 dispatcher 和
-correlation finalizer，靠 workflow execution lease / epoch、correlation
-lease、lane lease + fencing 仲裁。 进程崩溃后 lease
+correlation finalizer，靠全站 <code>workflow-dispatch</code>
+派发租约（同一时刻只有持有者扫描派发）、workflow execution lease /
+epoch、 correlation lease、lane lease + fencing 仲裁。 进程崩溃后 lease
 到期由其他进程接管，旧 owner 的提交被拒绝。</li>
 <li><strong>状态只在原子事务里推进</strong>：step、workflow、incident
 一起更新， 不存在&quot;step 成功但 workflow 没动&quot;的中间态。</li>
+<li><strong>Processor 重试持久化调度</strong>：408/425/429/5xx 在 300
+秒年龄内写回 <code>not_before</code> 与递增的
+<code>retry_count</code>，按 1 秒起步、30 秒封顶的指数退避重试。
+<code>STRICT</code> 请求等待时仍阻塞同 lane；只有 latest-wins priority
+100 请求标记为 <code>REORDERABLE</code>，允许后续安全样本越过。停机时已
+claim 但未开始的请求会主动释放。</li>
 </ol>
 <h3 data-number="1.7.4" id="64-互斥合并与并发上限"><span class="header-section-number">1.7.4</span> 互斥、合并与并发上限</h3>
 <table>
@@ -5366,16 +5557,31 @@ lease、lane lease + fencing 仲裁。 进程崩溃后 lease
 </tr>
 <tr class="even">
 <td>多节点同一 attempt 的联动</td>
-<td>聚合窗口内形成<strong>一个</strong> workflow；各节点通过 barrier
-执行 reset，整个训练任务只恢复一次</td>
+<td>聚合窗口内形成<strong>一个</strong> workflow；每个节点是一条 DAG
+分支、各自执行本节点的 reset，单一 <code>join</code>
+步在全部分支完成后只重启一次训练任务</td>
 </tr>
 <tr class="odd">
-<td>集群级并发上限</td>
-<td>executor 侧 <code>max_concurrent_commands</code> 默认 5、允许
-1..25；HyperPod 批量 mutation <code>max_batch_size</code> 上限
-25，超限报 &quot;batch exceeds limit&quot;</td>
+<td>修复并发上限</td>
+<td>workflow lease 同事务领取 node、作业 token 与 fabric
+分区持久预算（一个作业或一台无作业节点是一条
+workflow，内部并行、之间按节点互斥），每个 GPU
+集群一个修复风暴熔断器扣住相关性故障里新的破坏性修复（600 s
+窗口内新进入破坏性修复的节点达到 max(3, 20% GPU 节点) 且跨至少 2 个
+workload 域即跳闸；只由管理员
+<code>gpu-fault-admin remediation-storm</code> 的 release / abort
+解除，<code>src/gpu_fault/remediation_storm.py</code>）；没有固定的
+Region、cluster 或 resource class 上限；executor 侧另有
+<code>max_concurrent_commands=5</code></td>
 </tr>
 <tr class="even">
+<td>Processor completion 数据库并行度</td>
+<td><code>GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY</code>
+只并行不同 cluster 的完成事务，范围为
+<code>1..min(8, PostgreSQL pool max size)</code>；生产为
+1，<strong>不等于修复动作并发上限</strong></td>
+</tr>
+<tr class="odd">
 <td>每项破坏性能力单 writer</td>
 <td>Runtime Profile 编译期拒绝破坏性能力的多 writer 与
 <code>AUGMENT</code></td>
@@ -5411,14 +5617,17 @@ lease、lane lease + fencing 仲裁。 进程崩溃后 lease
 <tr class="even">
 <td>预算侧</td>
 <td>同一 <code>cluster_id/job_id</code> 共享<strong>持久化</strong>
-restart budget；耗尽即升级人工。文档明确写了&quot;不要直接提高 restart budget
-掩盖重复故障&quot;</td>
+restart budget；耗尽时仍完成节点修复（cordon / stop / reset / validate
+照常执行），只扣住 <code>RESTART_WORKLOAD</code>：它预先记 FAILED 并被
+supersede，workflow 以 FAILED
+收尾并发预算耗尽通知，作业需人工重新提交。文档明确写了&quot;不要直接提高
+restart budget 掩盖重复故障&quot;</td>
 </tr>
 <tr class="odd">
 <td>通知侧</td>
 <td>按小时桶去重（<code>GPU_FAULT_HOST_NOTIFICATION_COOLDOWN_SECONDS</code>）；瞬时
 GPU warning 有独立 cooldown；<strong>只有状态转换才生成 finding
-和邮件</strong>，停在同一状态的持续异常不重复上报</td>
+和通知</strong>，停在同一状态的持续异常不重复上报</td>
 </tr>
 </tbody>
 </table>
@@ -5449,21 +5658,28 @@ step， 或管理员显式动作（§8.2）。</p>
     G6 -- 否 --&gt; X
     G6 -- 是 --&gt; G7{&quot;provider 异步动作&lt;br/&gt;已由 observer 确认？&quot;}
     G7 -- 否 --&gt; W[&quot;WAITING，等 observer&quot;]
-    G7 -- 是 --&gt; G8{&quot;RESTART_WORKLOAD 有&lt;br/&gt;job · attempt · 预算 ·&lt;br/&gt;源 GPU 数量上下文？&quot;}
+    G7 -- 是 --&gt; G8{&quot;RESTART_WORKLOAD 有&lt;br/&gt;job · attempt · 预算上下文？&lt;br/&gt;（源 GPU 数量缺失时先用&lt;br/&gt;attempt 观测值回填）&quot;}
     G8 -- 否 --&gt; X
-    G8 -- 是 --&gt; G9{&quot;GPU 数量变化已由&lt;br/&gt;管理员精确 annotation 批准？&quot;}
+    G8 -- 是 --&gt; G9{&quot;GPU 数量一致，或变化已由&lt;br/&gt;管理员精确 annotation 批准？&quot;}
     G9 -- 否 --&gt; P[&quot;等待管理员决策&quot;]
     G9 -- 是 --&gt; E[&quot;执行&quot;]</pre>
+<p>G8 的&quot;源 GPU 数量&quot;不是硬门：<code>source_gpu_count</code>
+缺失时先用该 attempt 的观测 GPU
+数回填（<code>adapters/kubernetes/restart_operations.py</code> 的
+<code>_observed_source_gpu_count</code>），回填不到才进入 G9，按&quot;GPU
+数量变化&quot;处理—— 发出通知并让 step 停在
+<code>WAITING</code>，等管理员的精确 annotation。</p>
 <h3 data-number="1.8.2" id="72-操作前的设备占用检查"><span class="header-section-number">1.8.2</span> 操作前的设备占用检查</h3>
 <p>建议要求&quot;操作前检查活动进程与设备占用&quot;。这是独立的 workflow
 operation， 不是动作内部的一句判断：</p>
 <ul>
 <li><code>VERIFY_NO_GPU_CLIENTS</code>：重新检查 compute client
-与设备文件持有者。 这是节点侧<strong>默认唯一</strong>被允许的
-operation。</li>
+与设备文件持有者。 这是节点侧应用裸默认<strong>唯一</strong>被允许的
+operation（安装器另写入基础清单，见 §1.4）。</li>
 <li><code>QUIESCE_GPU_SERVICES</code> /
-<code>RESTORE_GPU_SERVICES</code>：reset 前后成对停/起本机 GPU
-服务。</li>
+<code>RESTORE_GPU_SERVICES</code>：reset 前后成对停/起本机 GPU 服务；单
+GPU reset 的窗口保留 Fabric Manager 运行（停止它会丢失 NVLink fabric
+状态）。</li>
 <li>GPU reset
 <strong>默认关闭</strong>，且执行前再检查一次占用（提交时检查 +
 执行前复检）。</li>
@@ -5497,8 +5713,8 @@ blocked</strong></td>
 </tr>
 <tr class="even">
 <td>多节点联动</td>
-<td>同一 attempt 的多节点 SXID 在聚合窗口内合成一个 workflow +
-barrier</td>
+<td>同一 attempt 的多节点 SXID 在聚合窗口内合成一个 workflow：每节点一条
+reset 分支，单一 join 重启</td>
 </tr>
 <tr class="odd">
 <td>MIG 爆炸半径</td>
@@ -5513,33 +5729,49 @@ barrier</td>
 </table>
 <h3 data-number="1.8.4" id="74-drain-的真实语义"><span class="header-section-number">1.8.4</span> “Drain” 的真实语义</h3>
 <p>这一条与建议差异最大，必须写清楚，否则会按错误的前提设计后续功能。</p>
-<p><strong>实现的隔离 = cordon（<code>MARK_UNSCHEDULABLE</code>）+ 自有
-taint（<code>QUARANTINE</code>）+
-<code>STOP_WORKLOADS</code>。全库不调用 Kubernetes Eviction API，没有
-<code>kubectl drain</code> 等价物，因此不存在&quot;PodDisruptionBudget 导致
-drain 卡住&quot;这一类问题， 也没有针对关键业务 Pod / 系统 Pod / DaemonSet
-的驱逐策略。</strong></p>
+<p><strong>节点隔离由 <code>MARK_UNSCHEDULABLE</code> /
+<code>QUARANTINE</code> 实现（cordon + 自有 <code>NoSchedule</code>
+taint）；停止负载由独立的 <code>STOP_WORKLOADS</code> 步骤执行。
+全库不调用 Kubernetes Eviction API，没有 <code>kubectl drain</code>
+等价物，因此不存在&quot;PodDisruptionBudget 导致 drain 卡住&quot;这一类问题，
+也没有针对关键业务 Pod / 系统 Pod / DaemonSet 的驱逐策略。</strong></p>
 <p>对应地：</p>
 <ul>
 <li>停止训练是按 workload 对象（Job / PyTorchJob / JobSet）patch +
 标记终止 Pod， 作用域是<strong>受管训练任务</strong>，不是节点上所有
 Pod。</li>
-<li>集群 executor 的 RBAC 是：<code>nodes</code>
-get/list/watch/<strong>patch</strong>（无 delete）； <code>pods</code>
-get/list/watch/patch/<strong>delete</strong>；<code>jobs</code>/<code>pytorchjobs</code>/<code>jobsets</code>
-get/list/watch/patch/create（无 delete）。见
-<code>deploy/dataplane/cluster-action-executor.yaml</code>。 其中 pod
-delete 用于 <code>RESTART_*_DEVICE_PLUGIN</code>（删
-<code>kube-system</code> 下的 DaemonSet Pod
-让它重建）与停止训练时标记终止 Pod。</li>
+<li>集群 executor 的 RBAC 分两层。ClusterRole
+只含集群级只读（<code>pods</code> / <code>jobs</code> /
+<code>pytorchjobs</code> / <code>jobsets</code> get/list/watch，spare
+激活要跨命名空间 证明节点空闲）加 <code>nodes</code>
+get/list/watch/<strong>patch</strong>（无 delete），见
+<code>deploy/dataplane/cluster-action-executor.yaml</code>。写动词——<code>pods</code>
+patch/<strong>delete</strong>、<code>jobs</code>/<code>pytorchjobs</code>/<code>jobsets</code>
+create/patch（无 delete）——由 GPU rollout 按每个受管 workload
+命名空间渲染 Role +
+RoleBinding（<code>src/gpu_fault_release/regional_release_gpu_rollout.py</code>
+的 <code>EXECUTOR_WORKLOAD_RULES</code>），另在 device plugin
+命名空间单独授予 <code>pods delete</code>。因此
+<code>GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES</code> 不再是唯一边界：
+越界命名空间的命令会被 executor 和 API server 同时拒绝。 其中 pod delete
+用于 <code>RESTART_*_DEVICE_PLUGIN</code>（删 <code>kube-system</code>
+下的 DaemonSet Pod 让它重建）与停止训练时标记终止 Pod。Completion
+Watcher 的写动词 （<code>pods</code>
+patch、<code>pods/exec</code>、<code>pods/log</code> 与训练对象
+patch）同样只在受管 workload 命名空间 的 Role
+里；node-installer-reconciler 另只在 <code>gpu-fault-system</code>
+内可删除自己的 installer Job。</li>
 <li>本方案<strong>只写自有</strong> <code>gpu-fault.io/*</code> taint 与
-annotation， 从不删除 provider 自有的 taint，也不写任何
-<code>sagemaker.amazonaws.com/*</code> label 或
+annotation（<code>gpu-fault.io/quarantined</code>
+NoSchedule；eks-managed 的 GPU 服务静默窗口另有
+<code>gpu-fault.io/quiesce</code> NoExecute）， 从不删除 provider 自有的
+taint，也不写任何 <code>sagemaker.amazonaws.com/*</code> label 或
 taint（避免误触发托管恢复）。</li>
 </ul>
 <blockquote>
-<p>v1 §8.3 写的&quot;Kubernetes RBAC 不授予 Node/Pod 删除权限&quot;对 Node 成立，
-对 Pod 不成立。以本节为准，并见 §11 第 12 条。</p>
+<p>v1 §8.3 已与本节一致：只有 Node 没有删除权限，Pod 的
+<code>delete</code> 只在受管 workload 与 device plugin 命名空间内授予
+executor（见 §11 第 12 条）。</p>
 </blockquote>
 <h3 data-number="1.8.5" id="75-白名单与人工审批"><span class="header-section-number">1.8.5</span> 白名单与人工审批</h3>
 <table>
@@ -5552,18 +5784,21 @@ taint（避免误触发托管恢复）。</li>
 <tbody>
 <tr class="odd">
 <td>自动动作白名单</td>
-<td>控制面 <code>GPU_FAULT_ALLOWED_OPERATIONS</code>（生产 31 项）+ 节点
+<td>控制面 <code>GPU_FAULT_ALLOWED_OPERATIONS</code>（生产 34 项）+ 节点
 <code>GPU_FAULT_NODE_ALLOWED_OPERATIONS</code>（应用裸默认 1
-项；安装器写入 10 项基础列表并按能力追加）。两层都不在白名单 →
+项；安装器写入 13 项基础列表并按能力追加）。两层都不在白名单 →
 不执行</td>
 </tr>
 <tr class="even">
 <td>高风险动作</td>
-<td>应用/安装器裸默认关闭 GPU reset 与 HyperPod mutation；当前 HyperPod
-生产安装显式开启 GPU reset、fabric reset、Fabric Manager restart 和
-<code>RESTART_NODE</code>。<code>ALLOW_HYPERPOD_REPLACE</code> 与
-<code>ALLOW_WITH_AUTOMATIC_NODE_RECOVERY</code> <strong>恒为
-false</strong>（不变量，不是默认值）</td>
+<td>应用/安装器裸默认关闭 GPU reset 与 provider 节点
+mutation；当前区域生产安装显式开启 GPU reset、fabric reset、Fabric
+Manager restart，executor 清单开启 <code>RESTART_NODE</code>（HyperPod
+与 eks-managed 共用
+<code>ALLOW_HYPERPOD_REBOOT</code>）。<code>ALLOW_HYPERPOD_REPLACE</code>
+与 <code>ALLOW_WITH_AUTOMATIC_NODE_RECOVERY</code> <strong>恒为
+false</strong>（不变量，不是默认值；设为 true 时 provider adapter
+构造失败）</td>
 </tr>
 <tr class="odd">
 <td>人工审批</td>
@@ -5603,8 +5838,8 @@ adapter。
 &quot;生产环境里预演单个动作&quot;。</li>
 </ul>
 <p>发布侧另有真正的
-dry-run（<code>deploy/control-plane/regional/rollout_regional_release.py</code>
-与训练提交 CLI），但那是运维工具的能力，不在故障修复路径上。</p>
+dry-run（<code>src/gpu_fault_release/rollout.py</code> 与训练提交
+CLI），但那是运维工具的能力，不在故障修复路径上。</p>
 <h3 data-number="1.8.7" id="77-修复后的主动诊断与观察窗口"><span class="header-section-number">1.8.7</span>
 修复后的主动诊断与观察窗口</h3>
 <table>
@@ -5649,13 +5884,20 @@ hang，也可能是正常的数据加载或 checkpoint
 <hr />
 <h2 data-number="1.9" id="8-接口与集成"><span class="header-section-number">1.9</span> 接口与集成</h2>
 <h3 data-number="1.9.1" id="81-api-面"><span class="header-section-number">1.9.1</span> API 面</h3>
-<p>区域形态真实注册 <strong>81 条路由</strong>，按功能分组见 v1
-§6.3；授权是&quot;每条路由显式声明桶&quot; 的默认拒绝模型，五桶
-<code>public</code> / <code>metrics</code> / <code>cluster-token</code>
-/ <code>dual-credential</code> / <code>execution-token</code> 当前分布 1
-/ 1 / 36 / 7 / 36。新增路由未声明桶，
-应用装配期即启动失败；运行期取不到桶一律 403。</p>
-<p>建议关心的三类 API 都有：</p>
+<p><code>create_app()</code> 始终挂载 <strong>93
+条应用路由</strong>；区域生产形态在这组路由上启用
+&quot;每条路由显式声明桶&quot;的默认拒绝模型。五桶 <code>public</code> /
+<code>metrics</code> / <code>cluster-token</code> /
+<code>dual-credential</code> / <code>execution-token</code> 当前分布 2 /
+1 / 37 / 7 / 46（<code>public</code> 是 <code>/healthz</code> 与
+<code>/livez</code>；数字以进程内 <code>create_app()</code> +
+<code>ExplicitAuthorizationRegistry.load()</code>
+枚举为准）。新增路由未声明桶， 应用装配期即启动失败；运行期取不到桶一律
+403——但<strong>没有任何路由匹配的路径答 404</strong>
+（<code>ExplicitAuthorizationRegistry.route_exists</code>）：采集器
+outbox 把 404 判为死信、把 403 当 token
+轮换期间的瞬态而持续重放，所以退役入口必须答 404，记录才会进入死信。</p>
+<p>建议关心的三类 API 都有，生产部署生命周期另有一组管理接口：</p>
 <table>
 <thead>
 <tr class="header">
@@ -5667,7 +5909,7 @@ hang，也可能是正常的数据加载或 checkpoint
 <tr class="odd">
 <td>故障事件上报</td>
 <td><code>/v1/gpu-events/*</code>、<code>/v1/collector-events/*</code>（7
-条采集通道）、<code>/v1/provider-events/*</code></td>
+条采集通道）；四条 HMA provider 入口已删除</td>
 </tr>
 <tr class="even">
 <td>健康状态查询</td>
@@ -5676,6 +5918,11 @@ hang，也可能是正常的数据加载或 checkpoint
 <tr class="odd">
 <td>手工隔离/恢复/终止</td>
 <td>见 §8.2</td>
+</tr>
+<tr class="even">
+<td>AWS 安装资源生命周期</td>
+<td><code>/v1/installation-resources</code>、<code>/sync</code>、<code>/replacements</code>、<code>/{site_id}/{resource_key:path}</code>，全部为
+execution-token</td>
 </tr>
 </tbody>
 </table>
@@ -5691,6 +5938,41 @@ hang，也可能是正常的数据加载或 checkpoint
 <tr class="odd">
 <td>手工推进/执行一条 workflow</td>
 <td><code>POST /v1/workflows/{request_id}/execute</code>（execution-token）</td>
+</tr>
+<tr class="even">
+<td>操作员队列 / 关闭已交人工的 incident</td>
+<td><code>GET /v1/incidents</code>、<code>GET /v1/incidents/{incident_id}</code>、<code>POST /v1/incidents/{incident_id}/close</code>（execution-token；只把
+<strong>ESCALATED</strong> 关为 RECOVERED，仍有 workflow 打开时
+409，重复关闭幂等）</td>
+</tr>
+<tr class="odd">
+<td>从管理员 shell 关闭 incident / 收尾 BLOCKED 记录</td>
+<td><code>gpu-fault-admin workflow-reconcile --close-incident ID</code>
+/ <code>--close-escalated</code> /
+<code>--close-quarantined</code>（后者只对节点已无 cordon、无本 incident
+的 quarantine taint 与隔离 annotation 的 QUARANTINED incident
+收尾，并剥离残留 annotation）；同一 verb 也关闭后续 workflow 已恢复的
+BLOCKED 记录</td>
+</tr>
+<tr class="even">
+<td><code>CHECK_MECHANICALS</code> 处置 / 人工修好的节点回到状态库 /
+确认未知的节点动作结果</td>
+<td><code>gpu-fault-admin submit-remediation --incident-id ID --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action}</code>：确认检查、按记录编译新的
+fenced 硬件处置 workflow；<code>restore</code> 为人工修好、仍被该
+incident 隔离的节点创建 validated restore
+workflow（<code>VALIDATE_GPU → VALIDATE_HOST → VALIDATE_FABRIC → RESTORE_SCHEDULING</code>，同一
+incident 与 fencing token；适用于 QUARANTINED，或全部 workflow 已结束的
+ESCALATED/RECOVERED
+incident）；<code>confirm-node-action --node NODE</code> 凭节点
+Ready、Agent <code>ACTIVE</code> 且 boot id
+已变的证据确认一次结果未知的节点动作（如
+<code>RESTART_NODE</code>），让停住的 BLOCKED 记录得以恢复与收尾</td>
+</tr>
+<tr class="odd">
+<td>声明 / 释放 warm spare</td>
+<td><code>gpu-fault-admin config spare --node NODE --declare</code> /
+<code>--release</code>（label + cordon，带 <code>--confirm</code>
+确认串与 <code>--reference</code>）</td>
 </tr>
 <tr class="even">
 <td>写入可信健康标记</td>
@@ -5719,20 +6001,43 @@ hang，也可能是正常的数据加载或 checkpoint
 <td><code>GET /v1/restart-budgets/{cluster_id}/{job_id}</code></td>
 </tr>
 <tr class="even">
+<td>查询/同步/推进 AWS 安装资源状态，过渡确实被替换的资源</td>
+<td><code>GET /v1/installation-resources</code>、<code>POST /sync</code>、<code>PUT /{site_id}/{resource_key:path}</code>、<code>POST /replacements</code>（<code>gpu-fault-admin replace-resource</code>）</td>
+</tr>
+<tr class="odd">
 <td>批准 GPU 数量变化</td>
 <td>节点 annotation（精确值），不是 API</td>
 </tr>
+<tr class="even">
+<td>区域运维（领取/续租/回执/进度、spare
+健康、证据与通知回写、集群注册表）</td>
+<td><code>/v1/regional/*</code> 共 23 个端点（<code>executors</code>
+17、<code>registry</code> 4、<code>clusters</code>
+1、<code>node-action-keys</code> 1）</td>
+</tr>
 <tr class="odd">
-<td>区域运维（领取/续租/回执、spare 健康、证据与通知回写）</td>
-<td><code>/v1/regional/*</code> 共 14 个端点</td>
+<td>修复风暴熔断器的出口</td>
+<td><code>gpu-fault-admin remediation-storm</code>：<code>release</code>
+关闭并重新武装熔断器、放行被扣住的 workflow；<code>abort</code>
+保持打开并把扣住的 workflow 交给运维</td>
 </tr>
 </tbody>
 </table>
-<p><strong>缺口：没有&quot;手工隔离某节点&quot;的一等
-API</strong>。人工隔离当前靠创建/推进 workflow 或 直接在集群里
-cordon+taint（后者绕过状态库，不推荐）。也没有&quot;终止正在跑的
-workflow&quot;的显式端点——只能等它 fail-closed 或被更强动作
-<code>SUPERSEDED</code>。</p>
+<p><strong>缺口：仍没有&quot;隔离任意节点&quot;与&quot;终止 RUNNING
+workflow&quot;的一等入口</strong>。人工隔离当前靠 创建/推进 workflow
+或直接在集群里 cordon+taint（后者绕过状态库，不推荐）；
+<code>POST /v1/incidents/{id}/close</code> 与
+<code>workflow-reconcile --close-*</code> 都拒绝仍有活 workflow 的
+incident，正在跑的 workflow 只能等它 fail-closed 或被更强动作
+<code>SUPERSEDED</code>。 已经补上的是：ESCALATED incident 可经
+<code>POST /v1/incidents/{id}/close</code> 关闭； 人工修好的隔离节点经
+<code>submit-remediation --disposition restore</code>
+回到状态库，结果未知的节点 动作经
+<code>--disposition confirm-node-action</code> 凭证据确认； 终态
+workflow 遗留的 <code>WAITING</code> 远端命令由 dispatcher 的周期 sweep
+（<code>WorkflowDispatcher.sweep_stuck_records</code>）自动取消，已离开集群的节点留下的
+Agent、 workflow 与 incident 由 departed-node cleanup
+自动收尾，不再需要人工命令。</p>
 <h3 data-number="1.9.3" id="83-与-kubernetes-的集成面"><span class="header-section-number">1.9.3</span> 与 Kubernetes 的集成面</h3>
 <table>
 <thead>
@@ -5744,14 +6049,16 @@ workflow&quot;的显式端点——只能等它 fail-closed 或被更强动作
 <tbody>
 <tr class="odd">
 <td>Node taint</td>
-<td><strong>写</strong>，但只写自有 <code>gpu-fault.io</code>
-QUARANTINE_TAINT；不删 provider 自有 taint</td>
+<td><strong>写</strong>，但只写自有的
+<code>gpu-fault.io/quarantined</code>（NoSchedule）与 eks-managed
+静默窗口的 <code>gpu-fault.io/quiesce</code>（NoExecute）；不删 provider
+自有 taint</td>
 </tr>
 <tr class="even">
 <td>Node label / annotation</td>
-<td>写自有
-annotation（含安装标记）；<code>sagemaker.amazonaws.com/*</code>
-只读</td>
+<td>写自有 label 与 annotation（热备声明
+<code>gpu-fault.io/spare</code>、安装标记、隔离 annotation
+等）；<code>sagemaker.amazonaws.com/*</code> 只读</td>
 </tr>
 <tr class="odd">
 <td>NodeCondition</td>
@@ -5759,7 +6066,7 @@ annotation（含安装标记）；<code>sagemaker.amazonaws.com/*</code>
 </tr>
 <tr class="even">
 <td>Kubernetes Event</td>
-<td><strong>不写</strong>。所有对外可见结论走 API + 邮件，不写 Event
+<td><strong>不写</strong>。故障结论走 API + 站点通知通道，不写 Event
 对象</td>
 </tr>
 <tr class="odd">
@@ -5777,17 +6084,28 @@ Aurora；这是有意选择：状态库要跨集群共享，CRD 只在单集群�
 </table>
 <h3 data-number="1.9.4" id="84-通知与工单"><span class="header-section-number">1.9.4</span> 通知与工单</h3>
 <ul>
-<li><strong>邮件是唯一的业务通知通道</strong>：Aurora outbox +
-Notification Dispatcher + SES。 业务处理只创建幂等
-notification；dispatcher 用 owner/epoch/lease claim 并 指数退避；旧
-epoch 不能完成新 lease，<strong>SES 故障不能反向改变 workflow step
-结果</strong>。</li>
-<li><strong>没有 webhook、Slack、PagerDuty、Jira 集成</strong>。SNS
-只出现在 AMP/Alertmanager
-侧，覆盖控制面自身指标，不是故障通知通道。</li>
+<li><strong>业务通知经站点选择的渠道发送，且这是唯一的业务通知通道</strong>：Aurora
+outbox + Notification Dispatcher +
+<code>spec.notifications.channel</code>（渲染为
+<code>GPU_FAULT_NOTIFICATION_CHANNEL</code>）。新站点默认
+<code>sns</code>，发布到 <code>spec.health.snsTopicArn</code>；
+<code>ses</code>（opt-in）从已验证 sender 发送，未声明 channel 且已有
+<code>emailSender</code> 的旧站点 保持 SES；站点 channel
+只接受这两个值，<code>allowEmail: false</code> 时只落
+outbox（运行时变量另 接受 <code>disabled</code>）。业务处理只创建幂等
+notification；dispatcher 用 owner/epoch/lease claim 并指数退避，旧 epoch
+不能完成新 lease， <strong>SNS/SES 故障不能反向改变 workflow step
+结果</strong>。
+运行时关闭渠道或投递时仍持久化通知；<code>AdvisoryNotificationService.describe_delivery_mode</code>
+说明实际是否外发，不能把持久记录算作收到通知。</li>
+<li><strong>SNS 业务通知与 AMP Alertmanager 共用站点
+topic</strong>（<code>spec.health.snsTopicArn</code>），
+管理员只确认一次订阅。<strong>没有内置 webhook、Slack、PagerDuty、Jira
+集成</strong>——要接它们， 在该 topic 上加订阅，或在 outbox 上加
+channel，不在 workflow 业务路径上加外部调用。</li>
 <li><strong>&quot;工单&quot;目前是本地合成的标识</strong>：<code>src/gpu_fault/adapters/support_escalation.py</code>
 生成 <code>vendor-ticket-&lt;incident_id&gt;</code>
-并写进邮件正文，<strong>不调用任何工单系统 API</strong>。 邮件里出现
+并写进通知正文，<strong>不调用任何工单系统 API</strong>。 通知里出现
 &quot;Ticket ID&quot; 时，它是一个可供人工引用的关联串，不是外部工单号。</li>
 <li>低利用率与同类告警必须按节点/任务聚合，不能按 GPU
 数量线性增长（上线门禁项）。</li>
@@ -5797,14 +6115,26 @@ epoch 不能完成新 lease，<strong>SES 故障不能反向改变 workflow step
 <h3 data-number="1.10.1" id="91-高可用"><span class="header-section-number">1.10.1</span> 高可用</h3>
 <ul>
 <li><strong>无 leader election</strong>（与建议不同）。active-active
-消费 + lane 租约 + fencing， 见 §6.3 第 3 条与 v1 §4.3。</li>
+消费 + lane 租约 + fencing； workflow 派发由可接管的
+<code>workflow-dispatch</code> 租约串行化，见 §6.3 第 3 条与 v1
+§4.3。</li>
 <li>PDB 按角色分设：ingress <code>minAvailable=2</code>（3 副本），
 control-worker 与 spool-worker <code>maxUnavailable=1</code>。</li>
 <li>Aurora 是共享一致性点；控制面不允许每 Pod 独立 SQLite。 Aurora
-failover 期间不得重复执行破坏性 step（上线门禁项）。</li>
+failover 期间不得重复执行破坏性 step（上线门禁项）。failover 后 writer
+不会 自动迁回；<code>gpu-fault-admin aurora-failback</code>
+由运维在确认后把 writer 迁回首选成员
+（有发布事务、在途远端命令或活跃破坏性 workflow
+时拒绝，从不自动运行）。</li>
 <li>单个 GPU
 集群离线、凭证泄露或数据面异常不影响其他集群，也不能让控制面
 对其他集群的处理停滞。</li>
+<li><strong>注册表 head 是运行时事实源</strong>：启动 Secret
+只作首次种子与灾备。所有当前活跃的 CPU
+进程，包括发布后加入者，须用有效持久心跳确认同一 revision。缺失 required
+记录、未来心跳或全体心跳过期均阻塞收敛；readiness
+同时检查刷新与心跳写入新鲜度。 这不是旧 Pod 已退出的证明，详见详细设计
+§2.15.1。</li>
 </ul>
 <h3 data-number="1.10.2" id="92-节点断网与本地保护"><span class="header-section-number">1.10.2</span> 节点断网与本地保护</h3>
 <table>
@@ -5829,7 +6159,12 @@ outbox：瞬时失败自动重放，永久 4xx 进 dead-letter，默认单文件
 <tr class="odd">
 <td>Node Agent 防重放</td>
 <td>HMAC envelope + 命令 TTL + 目标节点校验 + agent generation +
-incident fencing token + 本地 SQLite ledger</td>
+incident fencing token + 本地 SQLite ledger。ledger 以
+<code>(command_id, attempt)</code> 为键做 exactly-once 重放：agent
+重启时仍为 IN_PROGRESS 的行判为
+INTERRUPTED、要求人工确认而不重跑，也不凭该状态推断物理动作已完成；命令体（operation
+/ GPU UUID / 参数摘要）不一致的重用 command_id 被 409
+<code>COMMAND_ID_REUSED</code> 拒绝，该步终态、不重试</td>
 </tr>
 <tr class="even">
 <td>控制面长时不可达</td>
@@ -5860,14 +6195,17 @@ TLS，后端拿不到客户端证书）， 这是已接受的阶段性风险。<
 <li><code>/metrics</code> 只在直连 loopback 免鉴权，因此禁止
 <code>FORWARDED_ALLOW_IPS</code> 和信任代理头——否则任何请求都能自称
 loopback。</li>
-<li>最小权限：<code>ses:SendEmail</code> 只给控制面 SA；GPU
-集群侧不给。</li>
+<li>最小权限：控制面角色只拿站点所用通道的一项权限——<code>sns</code>
+站点仅对站点 topic <code>sns:Publish</code>，<code>ses</code>
+站点仅对已验证 sender <code>ses:SendEmail</code>；GPU
+集群侧两者都不给。</li>
 <li>审计：CloudTrail 出现任何 <code>BatchReplaceClusterNodes</code>
 <strong>一律视为异常</strong> （约束 2
 带来的收益：断言从&quot;要区分调用方&quot;简化为&quot;必须为空&quot;）。</li>
 </ul>
 <h3 data-number="1.10.4" id="94-保留期与容量"><span class="header-section-number">1.10.4</span> 保留期与容量</h3>
-<p><strong>保留期</strong>（默认值，均可用环境变量覆盖，完整表见<a href="#environment-reference">环境变量参考</a>）：</p>
+<p><strong>保留期</strong>（区分站点默认与应用裸默认；配置经受检管理员入口生效，不在线改环境变量。
+完整机器清单见<a href="#environment-reference">环境变量参考</a>）：</p>
 <table>
 <thead>
 <tr class="header">
@@ -5881,45 +6219,69 @@ loopback。</li>
 <td>24 h，且每节点最多 10000 条</td>
 </tr>
 <tr class="even">
-<td>attempt observation / fleet deployment / node action /
-diagnostic</td>
+<td>attempt observation / fleet deployment / diagnostic</td>
 <td>7 天</td>
 </tr>
 <tr class="odd">
+<td>node action ledger（节点侧 SQLite）</td>
+<td>30 天，另受 10000 行上限约束</td>
+</tr>
+<tr class="even">
 <td>GPU finding 历史、热状态 latest/terminal</td>
 <td>30 天</td>
 </tr>
+<tr class="odd">
+<td>核心控制记录（已关闭 incident 及关联 workflow / plan / decision /
+event / notification / marker / remote command）</td>
+<td>站点默认 30 天后 archive-first 到站点 S3 再删除；每 600 s 一批、最多
+200 条候选，完整终态和引用条件不满足则保留；显式
+<code>controlRecordRetentionDays: 0</code> 关闭</td>
+</tr>
 <tr class="even">
-<td>GPU metrics batch / processor lane / remote command</td>
-<td>24 h</td>
+<td>GPU metrics batch / 已终态 remote command</td>
+<td>24 h；仍被 incident 引用的审计记录随 incident 归档</td>
 </tr>
 <tr class="odd">
+<td>processor lane</td>
+<td>1 h</td>
+</tr>
+<tr class="even">
 <td>processor completed</td>
 <td>600 s</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>fault action 最大年龄</td>
 <td>900 s</td>
 </tr>
-<tr class="odd">
+<tr class="even">
 <td>GPU inventory 最大年龄</td>
 <td>180 s</td>
 </tr>
-<tr class="even">
+<tr class="odd">
 <td>SXID inventory / NVSwitch 拓扑</td>
 <td>600 s / 300 s</td>
 </tr>
 </tbody>
 </table>
+<p>控制记录的应用裸默认
+<code>GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS=0</code>，不自动开启归档；
+站点模型默认 30 天，并由受检部署同时渲染归档 URI。两种默认不能互换。</p>
 <p><strong>容量折算规则</strong>（最容易算错的一条）：后台线程和数据库连接是<strong>每
 uvicorn 进程</strong> 各一份，必须按&quot;每进程值 × 每 Pod 进程数 ×
 副本数&quot;折算，不能按 Pod 数折算。 control-worker 的处理槽位是 6 × 4 × 24
-= 576。<code>--limit-max-requests</code> 之类的 每进程限额要用&quot;限额 ÷
-间隔 vs. 产生速率&quot;核对。</p>
+= 576。<code>--limit-max-requests</code> 之类的
+retire-first每进程回收会瞬时移除服务容量，因此生产 ingress/worker
+均禁止使用； 进程生命周期只由受检 rollout、Pod replacement 和 liveness
+管理。</p>
 <p><strong>背压</strong>：区域总未完成队列与单集群未完成队列双限，超限不入库返回
 <code>429 Retry-After</code>；两个上限各预留 40% 给 priority=0
 的故障路径， 普通遥测不能占用该预留。Store I/O 准入超时返回
 <code>503 Retry-After</code>。</p>
+<p><strong>重试与完成阶段容量</strong>：retryable
+回放不是立即重排，而是把下一次可领取时间持久化， 避免热循环占满 lane
+和数据库；严格请求仍保序，latest-wins routine 请求才允许越过。
+completion 按 cluster 分事务，生产默认串行提交；并行度 2/4
+只用于通过真实 PostgreSQL 压力门禁后的灰度，且受连接池大小约束。</p>
 <p><strong>已知瓶颈层</strong>：吞吐天花板落在控制面<strong>进程内 Store
 I/O admission 排队</strong>， 不在数据库
 ACU。容量设计与压测必须分别覆盖准入锁与配额、ordering lane 退化、
@@ -5935,9 +6297,14 @@ ACU。容量设计与压测必须分别覆盖准入锁与配额、ordering lane 
 </thead>
 <tbody>
 <tr class="odd">
-<td>collector 是否还在上报</td>
-<td>控制面 60 s 扫描 + 三档静默阈值 + AdvisoryNotification
-邮件（§2.5），不依赖 AMP</td>
+<td>collector 是否还在成功上报</td>
+<td>两路：控制面默认以 60 s 间隔检查活跃集群中在线 Agent
+的所需通道，按成功记录与三档通道阈值生成 AdvisoryNotification 走
+outbox（范围与边界见 §2.5，不依赖 AMP）；AMP
+<code>GpuFaultCollectorSilent</code>（<code>gpu_fault_collector_silent_nodes &gt; 0</code>
+持续 5 min，critical）与按已配置集群生成的
+<code>GpuFaultDataplaneCollectorMissing</code>
+规则提供指标侧告警。两路终点同为站点 SNS topic</td>
 </tr>
 <tr class="even">
 <td>Agent 是否健康</td>
@@ -5955,9 +6322,9 @@ ACU。容量设计与压测必须分别覆盖准入锁与配额、ordering lane 
 饱和或任何 rejection 告警</td>
 </tr>
 <tr class="odd">
-<td><strong>缺口</strong></td>
-<td><code>/metrics</code>
-<strong>没有通知类指标</strong>（邮件积压、失败、退休数量都看不到），通知链路自身的可观测性是当前最薄的一环</td>
+<td>通知与闭环</td>
+<td><code>/metrics</code> 导出 workflow 终态/步骤/耗时、闭环
+milestone、通知结果/outbox、预算等待和 stale Agent</td>
 </tr>
 </tbody>
 </table>
@@ -5974,12 +6341,10 @@ ACU。容量设计与压测必须分别覆盖准入锁与配额、ordering lane 
 </thead>
 <tbody>
 <tr class="odd">
-<td>Agent / wheel 一致性</td>
-<td><code>src/gpu_fault/fleet_compatibility.py</code> 的
-<code>FleetCompatibilityPolicy</code> +
-<code>rollout_compatibility_reasons()</code> +
-<code>pin_value_is_accepted()</code>；protocol 版本与 artifact digest 双
-pin</td>
+<td>Agent / Executor 制品一致性</td>
+<td><code>src/gpu_fault/fleet_compatibility.py</code> 与
+<code>src/gpu_fault/regional_compatibility.py</code>；Agent/Executor
+均校验 protocol、物理 artifact SHA 和组件 compatibility digest</td>
 </tr>
 <tr class="even">
 <td>pin 不匹配的行为</td>
@@ -5994,8 +6359,20 @@ pin</td>
 </tr>
 <tr class="even">
 <td>回滚</td>
-<td>schema 只向前（无 down migration），靠 <code>dual</code>
-双写模式过渡；新版本上线前必须确认旧版本进程仍能读新 schema</td>
+<td>schema 只向前（无 down
+migration），且<strong>每个进程钉死精确版本</strong>：<code>gpu_fault_schema_version</code>
+必须等于进程自身的 <code>POSTGRES_SCHEMA_VERSION</code>，否则启动即
+<code>RuntimeError</code>，旧进程读不了新 schema。带 schema 变更的
+release 不能自动回滚（engine 在 <code>autoRollback: true</code>
+下直接拒绝），必须用
+<code>gpu-fault-admin deploy --accept-schema-change</code>：先 Aurora
+快照，本事务
+fail-forward，出问题靠快照恢复，不能直接切回旧进程（无人会恢复的 staging
+库可用
+<code>--accept-schema-change-without-snapshot</code>）。<code>dual</code>
+仅指热状态表与 workflow/remote-command 专表的 legacy/dedicated
+双写（数据布局迁移），v23 的 <code>--set-hot-layout detached</code>
+是单向切换，二者都不是通用 DDL 回滚机制</td>
 </tr>
 <tr class="odd">
 <td>GPU 型号</td>
@@ -6016,11 +6393,17 @@ pin</td>
 <h3 data-number="1.11.1" id="101-用例目录"><span class="header-section-number">1.11.1</span> 用例目录</h3>
 <p>机器可读的用例目录是
 <code>testcases/fault-scenarios.yaml</code>，入口是
-<code>tools/run_fault_test_cases.py</code>。当前 <strong>288 条显式用例
+<code>tools/run_fault_test_cases.py</code>。当前 <strong>456 条显式用例
 + 2 个按 XID catalog
 逐码生成的用例族</strong>（<code>xid_catalog_rules</code> 生成器，覆盖
-catalog 里每个 XID， 另有 B200 上下文变体），共 48 个 category。</p>
-<p>风险分级（决定能不能在真机跑）：</p>
+catalog 里每个 XID， 另有 B200 上下文变体，172 × 2 = 344 条），展开后
+800 条，共 53 个 category （51 个显式 + 2 个生成）。数字以加载
+<code>testcases/fault-scenarios.yaml</code> （<code>test_cases</code> +
+展开 <code>generated_test_families</code>）为准；
+<code>--list --include-manual --include-live</code> 只列 764 条，因为 36
+条 <code>automation: command</code> 用例必须用 <code>--case</code>
+显式选中才出现。</p>
+<p>风险分级（下表只统计 456 条显式用例，决定能不能在真机跑）：</p>
 <table>
 <thead>
 <tr class="header">
@@ -6032,58 +6415,58 @@ catalog 里每个 XID， 另有 B200 上下文变体），共 48 个 category。
 <tbody>
 <tr class="odd">
 <td><code>non-destructive</code></td>
-<td style="text-align: right;">173</td>
+<td style="text-align: right;">210</td>
 <td>纯软件链路，可无条件执行</td>
 </tr>
 <tr class="even">
+<td><code>live-non-destructive</code></td>
+<td style="text-align: right;">49</td>
+<td>真机执行但不改变状态</td>
+</tr>
+<tr class="odd">
+<td><code>destructive</code></td>
+<td style="text-align: right;">44</td>
+<td>必须人工批准</td>
+</tr>
+<tr class="even">
 <td><code>read-only-signal-replay</code></td>
-<td style="text-align: right;">34</td>
+<td style="text-align: right;">39</td>
 <td>只重放信号，不动环境</td>
 </tr>
 <tr class="odd">
-<td><code>live-non-destructive</code></td>
-<td style="text-align: right;">29</td>
-<td>真机执行但不改变状态</td>
-</tr>
-<tr class="even">
-<td><code>destructive</code></td>
-<td style="text-align: right;">17</td>
-<td>必须人工批准</td>
-</tr>
-<tr class="odd">
 <td><code>live-service-action</code></td>
-<td style="text-align: right;">15</td>
+<td style="text-align: right;">37</td>
 <td>真机服务级动作</td>
 </tr>
 <tr class="even">
-<td><code>live-kernel-log-injection</code></td>
-<td style="text-align: right;">5</td>
-<td>真机写 kmsg</td>
-</tr>
-<tr class="odd">
 <td><code>live-workload-restart</code></td>
-<td style="text-align: right;">6</td>
+<td style="text-align: right;">26</td>
 <td>真机重启训练</td>
-</tr>
-<tr class="even">
-<td><code>live-isolation</code></td>
-<td style="text-align: right;">3</td>
-<td>真机隔离</td>
 </tr>
 <tr class="odd">
 <td><code>destructive-provider-reboot</code></td>
-<td style="text-align: right;">3</td>
+<td style="text-align: right;">17</td>
 <td>真机 provider reboot</td>
 </tr>
 <tr class="even">
+<td><code>live-node-mutation</code></td>
+<td style="text-align: right;">15</td>
+<td>真机改节点</td>
+</tr>
+<tr class="odd">
+<td><code>live-isolation</code></td>
+<td style="text-align: right;">11</td>
+<td>真机隔离</td>
+</tr>
+<tr class="even">
+<td><code>live-kernel-log-injection</code></td>
+<td style="text-align: right;">6</td>
+<td>真机写 kmsg</td>
+</tr>
+<tr class="odd">
 <td><code>destructive-warm-spare</code></td>
 <td style="text-align: right;">2</td>
 <td>真机 warm spare 替换</td>
-</tr>
-<tr class="odd">
-<td><code>live-node-mutation</code></td>
-<td style="text-align: right;">1</td>
-<td>真机改节点</td>
 </tr>
 </tbody>
 </table>
@@ -6104,14 +6487,16 @@ catalog 里每个 XID， 另有 B200 上下文变体），共 48 个 category。
 </tr>
 <tr class="even">
 <td>模拟温度异常</td>
-<td>已覆盖（<code>gpu-metrics</code> 25 条、<code>host-health</code> 5
+<td>已覆盖（<code>gpu-metrics</code> 25 条、<code>host-health</code> 7
 条）</td>
 </tr>
 <tr class="odd">
 <td>指标失联 / 杀 DCGM / Device Plugin / 驱动进程</td>
-<td><strong>部分覆盖</strong>：<code>regional-collector</code> 17
-条覆盖静默与失联判定；杀 DCGM/device plugin
-进程的注入不在公开目录里</td>
+<td><strong>部分覆盖</strong>：<code>regional-collector</code> 22
+条覆盖静默与失联判定；device plugin
+注册故障的恢复（<code>GF-GENERAL-LIVE-014</code>）与 exporter
+暂停造成的逐 GPU
+采集不完整及新快照验证（<code>GF-GENERAL-LIVE-025</code>、<code>GF-GENERAL-FIX-025</code>）已入目录；直接杀驱动进程的注入不在公开目录里</td>
 </tr>
 <tr class="even">
 <td>掉卡与 PCIe/NVLink 异常</td>
@@ -6127,18 +6512,18 @@ workload 读不到</td>
 </tr>
 <tr class="even">
 <td>控制器修复中重启</td>
-<td>已覆盖（<code>regional-high-availability</code> 6
-条、<code>regional-preemption</code> 31 条含 lease 接管）</td>
+<td>已覆盖（<code>regional-high-availability</code> 9
+条、<code>regional-preemption</code> 38 条含 lease 接管）</td>
 </tr>
 <tr class="odd">
 <td>重复与乱序事件</td>
 <td>已覆盖（幂等、<code>attempt-generation-fence</code> 8
-条、<code>regional-remote-command</code> 16 条含重复回执）</td>
+条、<code>regional-remote-command</code> 18 条含重复回执）</td>
 </tr>
 <tr class="even">
 <td>修复失败人工接管</td>
 <td>已覆盖（<code>destructive-acceptance</code>、<code>regional-destructive-acceptance</code>
-各 6/15 条）</td>
+各 7/31 条）</td>
 </tr>
 <tr class="odd">
 <td>多节点同时故障</td>
@@ -6203,17 +6588,20 @@ plan-preview</td>
 </tr>
 <tr class="odd">
 <td style="text-align: right;">5</td>
-<td>误隔离率、恢复成功率、重新纳管正确率、事件丢失率、端到端发现时延</td>
-<td>均<strong>未定义为可度量指标</strong></td>
-<td>无法证明闭环真的闭合，只能证明每段不超时</td>
-<td>优先补这五个指标的分母定义与 <code>/metrics</code> 埋点</td>
+<td>误隔离率、事件丢失率、端到端发现时延</td>
+<td>workflow/notification/readmission 指标已补；这三项仍缺统一分母或
+signal→finding 时间线</td>
+<td>仍不能完整量化检测质量</td>
+<td>补分母定义和 signal/finding milestone</td>
 </tr>
 <tr class="even">
 <td style="text-align: right;">6</td>
 <td>PCIe（AER / link）故障判定</td>
-<td>只有 <code>pcie_replay_total</code> 计数与 <code>pci_bdfs</code>
+<td><code>pcie_replay_total</code> 计数、负载下链路降速（DCGM
+235-238）与 correctable 错误速率（DCGM 1501）、<code>pci_bdfs</code>
 证据字段</td>
-<td>PCIe 链路降级/掉链无判定路径</td>
+<td>内核 AER 日志与 AER 不可纠正错误仍无判定路径；PCIe 掉链只能经 XID 或
+GPU inventory 掉卡间接发现</td>
 <td>若有真实案例，按&quot;温度/降频&quot;那套阈值+去抖模式补一族</td>
 </tr>
 <tr class="odd">
@@ -6244,7 +6632,8 @@ leader</td>
 <tr class="even">
 <td style="text-align: right;">10</td>
 <td>Drain 策略（关键 Pod / 系统 Pod / DaemonSet）</td>
-<td>不调 Eviction API；隔离 = cordon + taint + 停受管训练任务</td>
+<td>不调 Eviction API；先用 cordon + taint
+隔离调度，再单独停止受管训练任务</td>
 <td>节点上的非受管 Pod 不受影响</td>
 <td>这是刻意收窄的爆炸半径。若要真 drain，需要重新评估 RBAC 与 PDB
 交互</td>
@@ -6253,18 +6642,20 @@ leader</td>
 <td style="text-align: right;">11</td>
 <td>工单系统集成 / Webhook</td>
 <td><code>vendor-ticket-&lt;incident_id&gt;</code>
-是<strong>本地合成串</strong>，只写进邮件；无 webhook</td>
-<td>需要人工把邮件转成工单</td>
-<td>若要集成，在 notification outbox 上加
+是<strong>本地合成串</strong>，只写进 SNS/SES 通知正文；无内置
+webhook</td>
+<td>需要人工把通知转成工单</td>
+<td>若要集成，在站点 SNS topic 上加订阅或在 notification outbox 上加
 channel，而不是在业务路径上加调用</td>
 </tr>
 <tr class="even">
 <td style="text-align: right;">12</td>
 <td>—（v1 自身的表述缺陷）</td>
-<td>v1 §8.3 &quot;RBAC 不授予 Node/Pod 删除权限&quot;对 Node 成立、对 Pod
-不成立（executor 有 <code>pods delete</code>）</td>
-<td>评审时会误判权限面</td>
-<td>按本文 §7.4 修正 v1 §8.3 的措辞</td>
+<td><strong>已修正</strong>：v1 §8.3 现与本文 §7.4 一致，只有 Node
+没有删除权限，executor 在受管 workload 与 device plugin 命名空间内有
+<code>pods delete</code></td>
+<td>无</td>
+<td>保持两处同步</td>
 </tr>
 <tr class="odd">
 <td style="text-align: right;">13</td>
@@ -6279,10 +6670,11 @@ channel，而不是在业务路径上加调用</td>
 <td style="text-align: right;">14</td>
 <td>&quot;手工隔离/恢复/终止工作流&quot; API</td>
 <td>有 marker、agent drain/revoke/reactivate、workflow
-execute；<strong>没有一等的&quot;隔离某节点&quot;与&quot;终止
-workflow&quot;端点</strong></td>
-<td>人工操作要么绕状态库，要么等 fail-closed</td>
-<td>补两个显式端点，比让人 <code>kubectl taint</code> 更安全</td>
+execute、<code>POST /v1/incidents/{id}/close</code>（ESCALATED）、<code>workflow-reconcile --close-*</code>、<code>submit-remediation --disposition restore</code>（人工修复后的隔离节点回库）与
+<code>--disposition confirm-node-action</code>（凭证据确认结果未知的节点动作）；<strong>仍没有一等的&quot;隔离任意节点&quot;与&quot;终止
+RUNNING workflow&quot;端点</strong></td>
+<td>人工隔离要么绕状态库，要么等 fail-closed</td>
+<td>补这两个显式端点，比让人 <code>kubectl taint</code> 更安全</td>
 </tr>
 <tr class="odd">
 <td style="text-align: right;">15</td>
@@ -6298,7 +6690,7 @@ workflow&quot;端点</strong></td>
 <li>策略版本化：建议要求&quot;不硬编码&quot;，实现做到了&quot;生成 + 钉版本 +
 完整性校验 + 畸形即拒绝启动&quot;。</li>
 <li>幂等与恢复：建议要求&quot;控制器重启可恢复&quot;，实现是 lease + epoch +
-fencing + 单事务推进，且重复回执连邮件都不重发。</li>
+fencing + 单事务推进，且重复回执连通知都不重发。</li>
 <li>单
 writer：建议要求&quot;同节点单一互斥修复&quot;，实现把它上升为&quot;每项破坏性能力
 只能有一个 writer&quot;，并在 Runtime Profile 编译期强制。</li>

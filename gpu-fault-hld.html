@@ -4209,8 +4209,6 @@ globalThis["mermaid"] = globalThis.__esbuild_esm_mermaid_nm["mermaid"].default;
 <body>
 <header id="title-block-header">
 <h1 class="title">GPU 故障处理系统概要设计</h1>
-<p class="subtitle">gpu-fault-control-plane 0.10.0 · 区域 CPU 控制面与
-HyperPod EKS GPU 数据面分离</p>
 </header>
 <nav id="TOC" role="doc-toc">
 <ul>
@@ -4231,6 +4229,8 @@ HyperPod EKS GPU 数据面分离</p>
 本约束移除了哪些原有分支</a></li>
 <li><a href="#23-任务恢复归属本方案独占" id="toc-23-任务恢复归属本方案独占"><span class="toc-section-number">1.2.3</span>
 任务恢复归属：本方案独占</a></li>
+<li><a href="#24-两种-gpu-集群-providerhyperpod-与-eks-managed" id="toc-24-两种-gpu-集群-providerhyperpod-与-eks-managed"><span class="toc-section-number">1.2.4</span> 两种 GPU 集群 provider：hyperpod
+与 eks-managed</a></li>
 </ul></li>
 <li><a href="#3-系统上下文" id="toc-3-系统上下文"><span class="toc-section-number">1.3</span> 系统上下文</a></li>
 <li><a href="#4-总体架构" id="toc-4-总体架构"><span class="toc-section-number">1.4</span> 总体架构</a>
@@ -4238,12 +4238,14 @@ HyperPod EKS GPU 数据面分离</p>
 <li><a href="#41-部署边界与信任边界" id="toc-41-部署边界与信任边界"><span class="toc-section-number">1.4.1</span> 部署边界与信任边界</a></li>
 <li><a href="#411-交互拓扑组件与网络路径" id="toc-411-交互拓扑组件与网络路径"><span class="toc-section-number">1.4.2</span>
 交互拓扑（组件与网络路径）</a></li>
-<li><a href="#42-节点数据面" id="toc-42-节点数据面"><span class="toc-section-number">1.4.3</span> 节点数据面</a></li>
-<li><a href="#421-无-amp-区域的-collector-静默告警" id="toc-421-无-amp-区域的-collector-静默告警"><span class="toc-section-number">1.4.4</span> 无 AMP 区域的 collector
+<li><a href="#412-已启用部署架构2026-09-20-核对快照" id="toc-412-已启用部署架构2026-09-20-核对快照"><span class="toc-section-number">1.4.3</span> 已启用部署架构（2026-09-20
+核对快照）</a></li>
+<li><a href="#42-节点数据面" id="toc-42-节点数据面"><span class="toc-section-number">1.4.4</span> 节点数据面</a></li>
+<li><a href="#421-无-amp-区域的-collector-静默告警" id="toc-421-无-amp-区域的-collector-静默告警"><span class="toc-section-number">1.4.5</span> 无 AMP 区域的 collector
 静默告警</a></li>
-<li><a href="#43-控制面服务" id="toc-43-控制面服务"><span class="toc-section-number">1.4.5</span> 控制面服务</a></li>
-<li><a href="#44-状态存储" id="toc-44-状态存储"><span class="toc-section-number">1.4.6</span> 状态存储</a></li>
-<li><a href="#45-runtime-adapter" id="toc-45-runtime-adapter"><span class="toc-section-number">1.4.7</span> Runtime Adapter</a></li>
+<li><a href="#43-控制面服务" id="toc-43-控制面服务"><span class="toc-section-number">1.4.6</span> 控制面服务</a></li>
+<li><a href="#44-状态存储" id="toc-44-状态存储"><span class="toc-section-number">1.4.7</span> 状态存储</a></li>
+<li><a href="#45-runtime-adapter" id="toc-45-runtime-adapter"><span class="toc-section-number">1.4.8</span> Runtime Adapter</a></li>
 </ul></li>
 <li><a href="#5-核心业务流程" id="toc-5-核心业务流程"><span class="toc-section-number">1.5</span> 核心业务流程</a>
 <ul>
@@ -4313,17 +4315,25 @@ Canary（历史设计参考，不可部署）</a></li>
 <td>0.10.0</td>
 </tr>
 <tr class="odd">
+<td>事实核对基线</td>
+<td>以发布源码、生成清单和测试契约为准；§4.1.2
+的已启用部署快照是带日期的现场观察，不随代码更新</td>
+</tr>
+<tr class="even">
 <td>语言与框架</td>
 <td>Python 3.12、FastAPI、Pydantic</td>
 </tr>
-<tr class="even">
-<td>适用环境</td>
-<td>Kubernetes、EKS、SageMaker HyperPod EKS；核心模型可扩展到
-EC2、Slurm</td>
-</tr>
 <tr class="odd">
+<td>适用环境</td>
+<td>区域控制面运行在 SageMaker HyperPod EKS CPU 集群；GPU 集群为
+SageMaker HyperPod EKS（<code>provider: hyperpod</code>）或无 HyperPod
+编排器的普通 Amazon EKS
+托管节点组集群（<code>provider: eks-managed</code>）；核心领域模型不依赖
+Kubernetes，但 EC2 裸机与 HyperPod Slurm 没有执行路径</td>
+</tr>
+<tr class="even">
 <td>文档依据</td>
-<td><code>src/gpu_fault</code>、<code>deploy</code>、<code>config</code>、<code>pyproject.toml</code></td>
+<td><code>src/gpu_fault</code>、<code>src/gpu_fault_release</code>、<code>deploy</code>、<code>config</code>、<code>pyproject.toml</code></td>
 </tr>
 </tbody>
 </table>
@@ -4350,7 +4360,8 @@ EC2、Slurm</td>
 </tr>
 <tr class="odd">
 <td>要部署或接管运维</td>
-<td>§4.1.1 交互拓扑 → §7.1 区域形态 → <a href="#operations-manual">部署和运维手册</a></td>
+<td><a href="#deployment-architecture-snapshot">§4.1.2
+已启用部署架构</a> → §4.1.1 交互拓扑 → §7.1 区域形态 → <a href="#operations-manual">部署和运维手册</a></td>
 </tr>
 <tr class="even">
 <td>要评审安全边界</td>
@@ -4376,8 +4387,12 @@ HyperPod 环境验收。需要区分的地方本文会显式标注成熟度。</
 交付边界（读正文之前必须知道的三件事）</h3>
 <p><strong>第一，当前只交付一种生产部署形态</strong>：区域级多集群分离部署
 （<code>GPU_FAULT_DEPLOYMENT_MODE=regional</code>），即一个 AWS Region
-一套独立 CPU 控制面，纳管该 Region 内一个或多个 HyperPod EKS GPU
-集群。其余形态的定位：</p>
+一套独立 CPU 控制面，纳管该 Region 内一个或多个 GPU 集群。GPU 集群有两种
+provider： SageMaker HyperPod
+EKS（<code>provider: hyperpod</code>，默认、完整验收形态）与没有
+HyperPod 编排器的普通 EKS
+托管节点组集群（<code>provider: eks-managed</code>，新增、验证较少），
+同一站点可以混合纳管两者（§2.4）。其余形态的定位：</p>
 <table>
 <thead>
 <tr class="header">
@@ -4419,8 +4434,12 @@ HyperPod 环境验收。需要区分的地方本文会显式标注成熟度。</
 的<strong>安装方式</strong>，不是独立部署架构。</p>
 <p><strong>第二，能真实执行的动作是有限集合，且&quot;已实现&quot;不等于&quot;无条件启用&quot;</strong>。当前可真实
 执行 Kubernetes 节点隔离、Job/PyTorchJob/JobSet 停止与恢复、签名 GPU
-reset、 全 GPU/NVSwitch reset、Fabric Manager restart、受控 HyperPod
-reboot，以及固定模板 的 support escalation。机械检查已实现为通知 +
+reset、 drain-P2P 恢复、全 GPU/NVSwitch reset、Fabric Manager
+restart、EFA 驱动修复、 GPU/EFA device plugin 重启、受控节点
+reboot（HyperPod <code>BatchRebootClusterNodes</code>； eks-managed
+为对绑定实例的 EC2
+<code>RebootInstances</code>）、只交接到已声明健康热备的 warm-spare
+替换，以及固定模板 的 support escalation。机械检查已实现为通知 +
 incident/fencing annotation 确认的 <code>WAITING</code> step，不会自动
 cordon 或停止健康 workload。驱动与固件修复也有真实执行器，
 但只有站点显式配置适用 SXID、目标版本、绝对路径命令和 SHA-256 后才加入
@@ -4433,7 +4452,7 @@ workflow； 配置或前置条件不满足时才 fail-closed。</p>
 操作变成一条可审计、可幂等重放的自动闭环。闭环分五个阶段，全系统的模块都可以
 归到其中一个阶段里：</p>
 <pre class="mermaid">flowchart LR
-    S1[&quot;① 采集&lt;br/&gt;kernel · DCGM · HMA&lt;br/&gt;主机 · 训练进度&quot;]
+    S1[&quot;① 采集&lt;br/&gt;kernel · DCGM · Fabric Manager&lt;br/&gt;主机 · 训练进度&quot;]
     S2[&quot;② 关联&lt;br/&gt;节点 · GPU UUID&lt;br/&gt;attempt · workload&quot;]
     S3[&quot;③ 决策&lt;br/&gt;XID Catalog&lt;br/&gt;+ 站点安全规则&quot;]
     S4[&quot;④ 受控执行&lt;br/&gt;workflow + 租约&lt;br/&gt;+ fencing token&quot;]
@@ -4442,7 +4461,8 @@ workflow； 配置或前置条件不满足时才 fail-closed。</p>
     S5 -. &quot;证据 · 结论 · 回执写回状态库&quot; .-&gt; S1</pre>
 <p>对应的建设目标：</p>
 <ol type="1">
-<li>从 kernel、DCGM、HMA、主机指标、日志和训练进度发现故障。</li>
+<li>从 kernel、DCGM、Fabric
+Manager、主机指标、日志和训练进度发现故障。</li>
 <li>将 XID/SXID 与节点、GPU UUID、训练 attempt 和 workload 关联。</li>
 <li>按固定版本的 NVIDIA XID Catalog 和站点安全规则形成处置建议。</li>
 <li>在单写者、权限白名单、租约和 fencing token 约束下执行恢复。</li>
@@ -4479,24 +4499,34 @@ kubeconfig；跨集群动作只能由该集群自己的执行器拉取执行。<
 <li><strong>受管 GPU 集群的 <code>NodeRecovery</code> 必须为
 <code>None</code></strong>（即禁用 HyperPod
 节点自动恢复）。<code>NodeRecovery=Automatic</code>
-的集群<strong>不在本方案支持范围内</strong>。</li>
+的集群<strong>不在本方案支持范围内</strong>。 普通 EKS
+集群（<code>eks-managed</code>）没有这个字段，对应约束是承载 GPU 节点的
+托管节点组必须关闭 EKS node auto
+repair（<code>nodeRepairConfig.enabled</code> 不为
+<code>true</code>，§2.4）。</li>
 <li><strong>本方案在任何情况下都不调用 HyperPod 的 replace node 相关
 API</strong>
 （<code>BatchReplaceClusterNodes</code>）。不存在&quot;经批准后可以调&quot;的例外路径。
 节点替换只能走 warm spare：迁移到客户自备的热备 GPU 节点，
-故障实例保持隔离且不被销毁。</li>
+故障实例保持隔离且不被销毁。普通 EKS 集群同样不替换、不终止任何 EC2
+实例。</li>
 <li><strong>HyperPod
 的任务自动恢复必须禁用，任务自动恢复完全由本方案接管。</strong>
 受管训练任务<strong>不得</strong>设置
 <code>sagemaker.amazonaws.com/enable-job-auto-resume=true</code>； Slurm
 侧<strong>不得</strong>使用 <code>srun --auto-resume=1</code>。 即 §2.3
 语义表中只有&quot;本方案是执行者&quot;这一行是合规形态。</li>
-<li><strong>只支持 HyperPod EKS 编排，暂不支持 HyperPod Slurm
-编排。</strong> 受管集群的 <code>DescribeCluster.Orchestrator</code>
-必须是 EKS； Slurm 编排的 HyperPod
-集群<strong>不在当前支持范围内</strong>，纳管前置检查应拒绝。
+<li><strong>HyperPod 只支持 EKS 编排，暂不支持 HyperPod Slurm
+编排。</strong> 受管 HyperPod 集群的
+<code>DescribeCluster.Orchestrator</code> 必须是 EKS； Slurm 编排的
+HyperPod 集群<strong>不在当前支持范围内</strong>：发现阶段对不暴露 EKS
+编排器的 HyperPod
+集群直接拒绝（<code>src/gpu_fault/admin/bootstrap.py::discover_cluster</code>）。
 这是<strong>当前实现边界</strong>，不是永久设计决策——与约束 1~3
-性质不同， 后续补齐 Slurm 侧执行路径后可以放开。</li>
+性质不同， 后续补齐 Slurm 侧执行路径后可以放开。没有 HyperPod
+编排器的普通 EKS 集群是另一种 受支持的 GPU
+集群（<code>eks-managed</code>，§2.4），不属于本条所说的 HyperPod
+编排。</li>
 </ol>
 <h4 data-number="1.2.1.1" id="211-为什么是硬约束"><span class="header-section-number">1.2.1.1</span> 为什么是硬约束</h4>
 <p><strong>约束 1、2（节点替换）</strong>
@@ -4519,20 +4549,28 @@ checkpoint 门禁。让本方案独占任务恢复后，&quot;节点 remediation
 incident 仍为 <code>QUARANTINED</code>
 时就把任务拉起来。该约束由<strong>部署期纳管前置检查</strong>与<strong>运行期
 fail-closed 守卫</strong> 两层落实，落实细节见 §2.3。</p>
-<p><strong>约束 4（只支持 HyperPod EKS）</strong>
+<p><strong>约束 4（HyperPod 只支持 EKS 编排）</strong>
 的理由是实现现状：Slurm 侧的执行路径没有实现。 <code>src/</code> 全库对
-Slurm 的引用只有三处，且都不是执行路径—— <code>models.py:19,21</code> 的
-<code>Environment</code>
-枚举值（<code>hyperpod-slurm</code>、<code>slurm</code>）、
-<code>hyperpod.py:108-125</code> 的
-<code>from_slurm_auto_resume()</code>（归属判断，且未接到运行时）、 以及
-<code>watcher.py:149</code> 一句&quot;Kubernetes/Slurm 通用&quot;的注释。
+Slurm 的引用只有五个文件，且都不是执行路径——
+<code>src/gpu_fault/models.py::Environment</code> 的
+<code>HYPERPOD_SLURM</code>（裸 <code>slurm</code>/<code>ec2</code>
+值不存在，解析期拒绝）、
+<code>src/gpu_fault/hyperpod.py::HyperPodWorkloadRecoveryEvidence.from_slurm_auto_resume</code>（归属判断，
+且没有调用方）与
+<code>src/gpu_fault/hyperpod.py::HyperPodLifecycleAdapter.resolve_recovery_ownership</code>
+里的环境判定、<code>src/gpu_fault/node_provider.py::restart_vm_effective_action</code>
+把 <code>HYPERPOD_SLURM</code> 与 <code>HYPERPOD_EKS</code> 同样映射到
+reboot、<code>src/gpu_fault/watcher.py::CompletionWatcher</code> 一句
+&quot;Kubernetes/Slurm 通用&quot;的 docstring，以及
+<code>src/gpu_fault/admin/ownership_release.py</code> 把
+<code>SlurmConfig</code> 列为 HyperPod 实例组定义里需原样照抄的字段名。
 <strong>没有</strong> Slurm scheduler adapter、没有
 <code>scontrol</code> 隔离证据回读、 没有 Slurm workload stop/restart
-执行器、没有 Slurm 侧的 Node Agent 部署路径。
-因此凡是需要&quot;隔离证据&quot;或&quot;任务停止/恢复&quot;的动作在 Slurm 集群上都会
-fail-closed 停在
-<code>PENDING</code>/<code>BLOCKED</code>——是安全的，但不构成可用的恢复能力。
+执行器、没有 Slurm 侧的 Node Agent 部署路径。 Slurm
+编排的集群在发现阶段即被拒绝，进不了纳管；即使绕过发现，凡是需要&quot;隔离证据&quot;
+或&quot;任务停止/恢复&quot;的动作也都会 fail-closed 停在
+<code>PENDING</code>/<code>BLOCKED</code>——是安全的，
+但不构成可用的恢复能力。
 枚举值存在<strong>不等于</strong>该编排受支持，这是最容易误判的一点。</p>
 <h4 data-number="1.2.1.2" id="212-由约束推出的不变量"><span class="header-section-number">1.2.1.2</span> 由约束推出的不变量</h4>
 <p>以下每一条都必须同时成立，缺一不可。开发时改到相关开关、profile
@@ -4548,55 +4586,69 @@ fail-closed 停在
 <tr class="odd">
 <td><code>GPU_FAULT_ALLOW_HYPERPOD_REPLACE</code></td>
 <td><strong>恒为
-<code>false</code></strong>。它不再是&quot;默认关、按需开&quot;的开关，而是不变量；不存在维护窗口内临时打开的合法场景</td>
+<code>false</code></strong>。它不再是&quot;默认关、按需开&quot;的开关，而是不变量；不存在维护窗口内临时打开的合法场景。设为
+<code>true</code> 时 executor 构造 provider adapter
+即失败（<code>src/gpu_fault/hyperpod.py::HyperPodAdapterConfig.from_environment</code>、<code>src/gpu_fault/eks_provider.py::EksProviderConfig.from_environment</code>）</td>
 </tr>
 <tr class="even">
 <td><code>GPU_FAULT_ALLOW_HYPERPOD_REBOOT</code></td>
-<td>仍可为 <code>true</code>——reboot 不销毁实例，不受本约束影响</td>
+<td>仍可为 <code>true</code>——reboot
+不销毁实例，不受本约束影响；同一开关也控制 eks-managed 的 EC2
+<code>RebootInstances</code>，区域 executor 生产清单为
+<code>true</code></td>
 </tr>
 <tr class="odd">
 <td><code>GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY</code></td>
 <td><strong>恒为 <code>false</code></strong>。它的作用是&quot;在
 <code>NodeRecovery=Automatic</code> 下仍允许提交 batch
-mutation&quot;，而本约束已排除该前提</td>
+mutation&quot;，而本约束已排除该前提；设为 <code>true</code> 同样使 adapter
+构造失败</td>
 </tr>
 <tr class="even">
 <td>Runtime Profile <code>nodeReplace</code> owner</td>
-<td>恒为
-<code>gpu-fault-hyperpod-adapter</code>（<code>OWN</code>），<strong>不得</strong>
+<td>恒为本方案的 provider adapter（<code>OWN</code>，observed
+<code>warm-spare-v1</code>，含义是 warm-spare 交接）：hyperpod 为
+<code>gpu-fault-hyperpod-adapter</code>，eks-managed 为
+<code>gpu-fault-eks-adapter</code>；<strong>不得</strong>
 <code>DELEGATE</code> 给
 <code>hyperpod-managed-node-recovery</code></td>
 </tr>
 <tr class="odd">
 <td>Runtime Profile <code>workloadStop</code> /
 <code>workloadRestart</code> owner</td>
-<td>恒为本方案自建 adapter（<code>OWN</code>），<strong>不得</strong>
+<td>恒为本方案自建 adapter
+<code>gpu-fault-kubernetes-adapter</code>（<code>OWN</code>），<strong>不得</strong>
 <code>DELEGATE</code> 给 <code>hyperpod-managed-job-recovery</code></td>
 </tr>
 <tr class="even">
 <td>纳管前置检查（集群）</td>
-<td><code>DescribeCluster.NodeRecovery == &quot;None&quot;</code>，且
-<code>DescribeCluster.Orchestrator</code> 为 EKS，否则拒绝纳管</td>
+<td>hyperpod：<code>DescribeCluster.NodeRecovery == &quot;None&quot;</code>，且
+<code>DescribeCluster.Orchestrator</code> 为 EKS；eks-managed：EKS
+集群与托管节点组 <code>ACTIVE</code>，承载 GPU 节点的节点组未开启 node
+auto
+repair。否则发现阶段与发布预检拒绝（<code>src/gpu_fault/admin/bootstrap.py::discover_cluster</code>、<code>src/gpu_fault_release/regional_release_preflight.py::validate_eks_managed_cluster</code>）</td>
 </tr>
 <tr class="odd">
 <td>纳管前置检查（任务）</td>
 <td>受管命名空间内训练任务不带
 <code>sagemaker.amazonaws.com/enable-job-auto-resume=true</code>（Slurm
-提交脚本不带 <code>--auto-resume=1</code>），否则拒绝纳管该任务</td>
+提交脚本不带
+<code>--auto-resume=1</code>），否则拒绝纳管该任务；这一条是人工检查，代码里没有对应的纳管期扫描</td>
 </tr>
 <tr class="even">
 <td>CloudTrail 断言</td>
 <td>出现任何 <code>BatchReplaceClusterNodes</code>
-<strong>一律视为异常</strong>，无论调用方是谁</td>
+<strong>一律视为异常</strong>，无论调用方是谁；executor IAM
+不授予该动作</td>
 </tr>
 </tbody>
 </table>
 <p>最后一条是本约束带来的额外收益：审计断言从&quot;要区分调用方&quot;简化为&quot;必须为空&quot;。</p>
 <p>纳管前置检查是<strong>部署期/纳管期</strong>动作；运行期另有一道等效守卫，在
 adapter 写 workload 前重读 annotation 并 fail-closed（见 §2.3）。</p>
-<p><code>Environment</code> 枚举里的 <code>hyperpod-slurm</code> /
-<code>slurm</code> 只是数据模型取值，
-<strong>不表示这两种编排受支持</strong>；本文所有 Slurm 相关描述
+<p><code>Environment</code> 枚举里的 <code>hyperpod-slurm</code>
+只是数据模型取值， <strong>不表示该编排受支持</strong>；本文所有 Slurm
+相关描述
 （<code>srun --auto-resume</code>、<code>scontrol show node</code>
 隔离证据、 <code>State=FAIL Reason=&quot;Action:Reboot|Replace&quot;</code>）
 均为<strong>协议参考与未来扩展说明</strong>，不代表当前可用能力。</p>
@@ -4649,46 +4701,68 @@ HyperPod）<strong>不再是合规形态</strong>，
 </tr>
 <tr class="even">
 <td>HyperPod Slurm</td>
-<td><strong>暂不支持</strong>（实现边界，非设计决策）；纳管前置检查应拒绝</td>
+<td><strong>暂不支持</strong>（实现边界，非设计决策）；发现阶段即拒绝</td>
 </tr>
 </tbody>
 </table>
-<p>因此本方案受支持的运行形态是<strong>唯一的一条</strong>： HyperPod
-EKS 编排 + <code>NodeRecovery=None</code> + 任务恢复由本方案接管，
-节点替换视有无 warm spare 走模式 B 或退化为模式 C。</p>
+<p>因此本方案对 HyperPod
+集群受支持的运行形态是<strong>唯一的一条</strong>： HyperPod EKS 编排 +
+<code>NodeRecovery=None</code> + 任务恢复由本方案接管， 节点替换视有无
+warm spare 走模式 B 或退化为模式 C。普通 EKS 集群的对应形态是： GPU
+节点组关闭 node auto repair + 任务恢复由本方案接管 + 节点替换同样只走
+warm spare （§2.4）。</p>
 <p>被移除的模式 A 与任务级委派对应的代码路径
 （<code>ManagedRecoveryObserverAdapter</code>、<code>HyperPodManagedRecoveryObserver</code>、
 <code>HyperPodIdentityRegistry</code>）<strong>保留在代码中</strong>，但定位已变为
 <strong>fail-closed 兜底</strong>而非运行形态：</p>
 <ul>
 <li><code>ManagedRecoveryObserverAdapter</code> 只在 profile 里出现托管
-owner 时才被命中。 合规部署下 profile 的四项 owner 全是自建
+owner 时才被命中。 合规部署下 profile 的四项
+owner（<code>nodeReboot</code>、<code>nodeReplace</code>、<code>workloadStop</code>、
+<code>workloadRestart</code>）全是自建
 adapter，故它<strong>不应被触发</strong>。 保留它的价值是：若有人误把
 profile 改成 <code>DELEGATE</code>， 结果是&quot;只观测、不动
-Kubernetes&quot;（安全侧失败），而不是&quot;没人处理&quot;。</li>
-<li><code>HyperPodIdentityRegistry</code> 的身份台账在 warm spare
+Kubernetes&quot;（安全侧失败），而不是&quot;没人处理&quot;。
+区域控制面按注册逐集群决定：只为 hyperpod 集群构造
+<code>HyperPodManagedRecoveryObserver</code>， eks-managed 集群没有
+HyperPod 托管恢复可委派。</li>
+<li><code>HyperPodIdentityRegistry</code> 写下的身份台账在 warm spare
 路径同样被使用
-（<code>hyperpod_spares.py:339-352</code>），与本约束无关，必须保留。</li>
+（<code>src/gpu_fault/hyperpod_spares.py::HyperPodSpareCoordinator._resolve_targets</code>
+按 <code>retired_aliases</code>
+解析故障节点），与本约束无关，必须保留。</li>
 </ul>
 <p>模式 A
 被移除也顺带消除了一处已知缺口，记录在此以免日后重新引入该模式时忘记：
 HyperPod <strong>自发</strong>替换节点（本方案没有对应 workflow）时，
 后台身份刷新线程会正确更新 <code>instance_id</code> /
 <code>generation</code> / <code>retired_aliases</code>
-（<code>managed_recovery.py:44-107</code>，默认 20 秒一轮）， 但
-<code>_retire_old_agent()</code> 与 <code>_isolate_replacement()</code>
-<strong>只在 <code>observe()</code>
-内被调用</strong>（<code>managed_recovery.py:283</code>、<code>:291</code>
-是唯一调用点）， 没有 workflow step 就都不会发生。后果是旧 agent 停在
-<code>ACTIVE</code> 不被 fence、
-新节点不经本方案校验直接进调度池；更具体地，若新实例上的 agent 沿用同一
-<code>node_id</code> 注册，<code>fleet.py:392-424</code> 的
+（<code>src/gpu_fault/managed_recovery.py::HyperPodIdentityRegistry.refresh</code>，
+<code>GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS</code> 默认 20
+秒一轮）， 但 <code>_retire_old_agent()</code> 与
+<code>_isolate_replacement()</code> <strong>只在 <code>observe()</code>
+内被调用</strong>（<code>src/gpu_fault/managed_recovery.py::HyperPodManagedRecoveryObserver.observe</code>
+是唯一调用点），没有 workflow step 就都不会发生，新节点不经
+<code>observe()</code> 的隔离校验。 若新实例上的 agent 沿用同一
+<code>node_id</code> 注册，
+<code>src/gpu_fault/fleet.py::FleetRegistry._next_agent_record</code> 的
 <code>same_instance_reboot</code> 因 <code>node_instance_id</code>
 已变而为假，只要旧记录 lease 未过期且仍 <code>ACTIVE</code> 就会抛
 <code>another agent incarnation holds the node lease</code>， <strong>新
 agent 注册被拒直到旧 lease 自然过期</strong>。
 这道检查本身是对的（防脑裂），但它假定替换会经过 <code>observe()</code>
 从而旧 agent 已被 revoke——自发替换恰好绕过该前提。</p>
+<p>旧节点留下的残留现在由 departed-node cleanup 收尾（两种 provider
+通用，覆盖 Spot 回收、 缩容和 provider 替换）：持有
+<code>departed-node-cleanup</code> 周期租约的一个 control-worker 进程 每
+60 秒判定一次，只有 Kubernetes 节点报告、provider（HyperPod
+<code>ListClusterNodes</code> 或 EC2 实例状态）和 Agent
+记录三方都证明节点已离开（Agent 无记录、<code>REVOKED</code>，或 lease
+已过期且最后心跳早于 10 分钟守护期）时，才按
+<code>workflow-reconcile</code> 的同一路径退役其 Agent、收尾没人能执行的
+workflow 与 incident；不归它处理的对象只记账并通知管理员
+（<code>src/gpu_fault/departed_node_cleanup.py</code>，<code>GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED</code>
+默认开启）。</p>
 <h3 data-number="1.2.3" id="23-任务恢复归属本方案独占"><span class="header-section-number">1.2.3</span> 任务恢复归属：本方案独占</h3>
 <p>约束 3
 之后，任务恢复归属不再是&quot;按客户配置决定&quot;的维度，而是固定的：</p>
@@ -4716,28 +4790,34 @@ fail-closed</td>
 </table>
 <p>对应 profile：<code>workloadStop</code> /
 <code>workloadRestart</code> 恒为 <code>OWN</code>， owner 为本方案自建
-adapter。这与部署脚本当前的静态写死值一致
-（<code>deploy/hyperpod/deploy.sh:1527-1530</code>、<code>:1579-1586</code>），
-即<strong>约束 3 把原先的一处实现缺口变成了符合约束的实现</strong>——
-部署脚本无条件填 <code>OWN</code>，而唯一合规形态正是
-<code>OWN</code>。</p>
+adapter <code>gpu-fault-kubernetes-adapter</code>。区域发布使用的两份
+profile
+模板（<code>config/runtime-profile.regional-hyperpod-safe.example.yaml</code>、
+<code>config/runtime-profile.regional-eks-safe.example.yaml</code>）与历史单集群脚本
+<code>deploy/hyperpod/deploy.sh</code> 都静态写死这一值， 即<strong>约束
+3 把原先的一处实现缺口变成了符合约束的实现</strong>—— 部署无条件填
+<code>OWN</code>，而唯一合规形态正是 <code>OWN</code>。</p>
 <p><strong>第一层落实：纳管前置检查。</strong>
 部署期/纳管期遍历受管命名空间拒收违规任务。
 它是人工流程、会漏，所以必须有第二层。</p>
 <p><strong>第二层落实：运行期 fail-closed 守卫。</strong>
 <code>from_eks_annotations()</code> 的判断能力
 已接到执行路径：<code>KubernetesWorkflowAdapter._set_workloads()</code>
+经
+<code>_prepare_workload_mutation()</code>（<code>src/gpu_fault/adapters/kubernetes/workload_operations.py</code>）
 在读到每个 workload 对象之后、在发出任何 patch 或标记终止 Pod 之前，调用
 <code>_managed_job_recovery_conflict()</code> 用
-<code>from_eks_annotations()</code> 复判 annotation； 只要有一个
-workload 判成 <code>ENABLED</code>，该步骤直接
+<code>from_eks_annotations()</code> 复判 annotation；
+<code>RESTART_WORKLOAD</code> 在重读源 workload 之后再判一次。
+只要有一个 workload 判成 <code>ENABLED</code>，该步骤直接
 <code>FAILED</code>，details 带
 <code>managed_job_recovery_workloads</code>、<code>required_annotation</code>、
 <code>required_annotation_value</code> 与可直接执行的
 <code>remediation_commands</code>
 （<code>kubectl annotate … enable-job-auto-resume-</code>）。
 <code>STOP_WORKLOADS</code> 与 <code>RESTART_WORKLOAD</code>
-走同一入口，两者都被覆盖。</p>
+走同一入口，两者都被覆盖；守卫不区分 provider， eks-managed
+集群上同样生效。</p>
 <p>关于这道守卫，三点容易问到：</p>
 <ul>
 <li><strong>为什么放在这里</strong>：该方法本来就要
@@ -4760,22 +4840,22 @@ annotation。</li>
 <code>hyperpod.py</code> 函数级的行为；读不到 workload 在这里表现为
 <code>_read_workload()</code> 抛异常、守卫尚未执行。</li>
 </ul>
-<p>手工 CLI <code>hyperpod_cli.py:67-83</code> 仍是
-<code>resolve_recovery_ownership()</code> 的调用方
-（<code>--workload-recovery</code>
-是人传参数），用于纳管前的一次性核对；运行期守卫不依赖它。
-对应的负向验收用例见 <code>docs/区域模式端到端验收测试用例.md</code>
-§2.0.1 与 <code>GF-REGIONAL-DESTR-012</code>。</p>
+<p>手工 CLI
+<code>gpu-fault-hyperpod ownership</code>（<code>src/gpu_fault/hyperpod_cli.py::main</code>）仍是
+<code>resolve_recovery_ownership()</code>
+的调用方（<code>--workload-recovery</code> 是人传参数），用于纳管前的
+一次性核对；运行期守卫不依赖它。 对应的负向验收用例见
+<code>docs/区域模式端到端验收测试用例.md</code> §2.0.1 与
+<code>GF-REGIONAL-DESTR-012</code>。</p>
 <h4 data-number="1.2.3.1" id="231-为什么必须由平台侧禁用而不能靠本方案抢先一步"><span class="header-section-number">1.2.3.1</span>
 为什么必须由平台侧禁用，而不能靠本方案”抢先一步”</h4>
 <p>被禁用的这个机制不属于本控制面的状态机。本方案只能观察公开的节点和任务契约，
 不能读取托管恢复的中间状态、重试计数或调度顺序：</p>
 <ul>
-<li>HMA 在故障节点写
-<code>sagemaker.amazonaws.com/node-health-status</code> 及
-<code>/fault-types</code>、<code>/fault-reasons</code>、<code>/fault-details</code>，并打
-<code>NoSchedule</code> taint 和
-NodeCondition（<code>src/gpu_fault/hma.py</code>）。</li>
+<li>AWS HMA 维护 <code>sagemaker.amazonaws.com/node-health-status</code>
+等 provider 健康信息。 本方案保留 <code>hyperpod_spares.py</code>
+的健康标签检查，不再采集 HMA Node 或 CloudWatch 故障文本；AWS 自带 HMA
+不因转发链路退役而被卸载。</li>
 <li>节点恢复动作的触发契约是节点 label
 <code>UnschedulablePendingReboot</code> /
 <code>UnschedulablePendingReplacement</code> （EKS 侧），或 Slurm 的
@@ -4787,18 +4867,110 @@ NodeCondition（<code>src/gpu_fault/hma.py</code>）。</li>
 何时重启任务&quot;这一判定发生在托管侧，本方案既不能观测其中间状态，
 也不能与之协商顺序——这正是约束 3 选择在源头禁用而非运行期竞争的依据。
 反过来，本方案<strong>不写</strong>上述任何
-<code>sagemaker.amazonaws.com/*</code> label 或 taint （全库仅
-<code>hyperpod_spares.py:302</code>、<code>node_installer_reconciler.py:120</code>
-以只读方式 用到 instance-group / cluster-name
-选择器），恢复调度时也只删除自有 <code>gpu-fault.io/*</code>
-taint。所以本方案不会意外触发托管恢复。</p>
+<code>sagemaker.amazonaws.com/*</code> label 或 taint
+（全库仅以只读方式用到 instance-group / cluster-name /
+node-health-status 选择器与 job auto-resume
+annotation：<code>cluster_scope.py</code>（集群节点选择器的唯一来源）、
+<code>hyperpod_spares.py</code>、<code>failure_domains.py</code>、<code>node_provider.py</code>、Kubernetes
+adapter 的 workload 守卫，<code>admin/</code>
+下的纳管、热备与故障域模块，以及 <code>src/gpu_fault_release</code> 的
+预检与 GPU rollout；没有任何写入），恢复调度时也只删除自有
+<code>gpu-fault.io/*</code> taint。所以本方案不会意外触发托管恢复。</p>
+<h3 data-number="1.2.4" id="24-两种-gpu-集群-providerhyperpod-与-eks-managed"><span class="header-section-number">1.2.4</span> 两种 GPU 集群
+provider：hyperpod 与 eks-managed</h3>
+<p>GPU 集群的 provider 在发现阶段按 ARN 判定，写入
+<code>site.yaml</code> 集群条目与区域注册表
+（<code>src/gpu_fault/cluster_scope.py::ClusterProvider</code>：空值即
+<code>hyperpod</code>，其他拼写 fail-closed）： HyperPod
+ARN，或恰好被一个 HyperPod 集群编排的 EKS ARN，是
+<code>hyperpod</code>；没有任何 HyperPod 编排器的 EKS ARN 是
+<code>eks-managed</code>（<code>src/gpu_fault/admin/bootstrap.py::discover_cluster</code>）。
+CPU 控制面必须是 HyperPod EKS 集群。首次 <code>deploy</code> 的 GPU
+集群必须属于同一 provider， 另一种 provider 之后经
+<code>join-cluster</code> 加入，站点即为混合
+provider；每个集群运行与自身 provider 匹配的 Runtime Profile 版本。约束
+2、3 与本章其余不变量对两种 provider 同样成立。</p>
+<table>
+<thead>
+<tr class="header">
+<th>维度</th>
+<th><code>hyperpod</code></th>
+<th><code>eks-managed</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>纳管门禁</td>
+<td><code>NodeRecovery=None</code>，EKS 编排器</td>
+<td>EKS 集群与托管节点组 <code>ACTIVE</code>，承载 GPU 节点的节点组关闭
+node auto repair；<code>updateStrategy</code> 不是 <code>MINIMAL</code>
+只提示</td>
+</tr>
+<tr class="even">
+<td>GPU 节点范围</td>
+<td>带 <code>gpu-fault.io/control-plane=&lt;站点 ID&gt;</code>
+的实例组，另以集群名标签交叉核对</td>
+<td>带同一归属标签的托管节点组</td>
+</tr>
+<tr class="odd">
+<td><code>nodeReboot</code></td>
+<td><code>gpu-fault-hyperpod-adapter</code>：<code>BatchRebootClusterNodes</code></td>
+<td><code>gpu-fault-eks-adapter</code>：对 preflight 绑定的实例调用 EC2
+<code>RebootInstances</code>，确认条件为实例 <code>running</code> 加新的
+Agent incarnation/boot_id；节点组开启 node auto repair 时拒绝</td>
+</tr>
+<tr class="even">
+<td><code>nodeReplace</code></td>
+<td>只把工作负载交接到已声明的健康热备，不调用 provider 替换</td>
+<td>同左；adapter 从不接受 provider <code>REPLACE</code></td>
+</tr>
+<tr class="odd">
+<td>Runtime Profile 模板</td>
+<td><code>config/runtime-profile.regional-hyperpod-safe.example.yaml</code></td>
+<td><code>config/runtime-profile.regional-eks-safe.example.yaml</code>；站点
+profile 的 <code>nodeReboot</code> owner 服务不了该 provider 时，join
+为该集群生成自己的 profile 版本并要求审批</td>
+</tr>
+<tr class="even">
+<td>HyperPod 托管能力</td>
+<td>声明 <code>hyperpod-hma</code> 的
+<code>gpuDetection</code>（AUGMENT）与
+<code>providerHealthIsolation</code>（OBSERVE）；身份刷新线程与
+managed-recovery observer</td>
+<td>没有 HMA、托管恢复 observer 或身份刷新</td>
+</tr>
+<tr class="odd">
+<td>GPU 服务静默</td>
+<td>停止节点上的 GPU 主机服务</td>
+<td>另在派发静默前给节点打 <code>gpu-fault.io/quiesce</code> NoExecute
+污点，让 DaemonSet 中的 GPU 客户端离开 reset 窗口，恢复前摘除</td>
+</tr>
+<tr class="even">
+<td>DCGM hostengine</td>
+<td>节点主机服务</td>
+<td>默认由 exporter 容器内嵌；所选节点组全部声明
+<code>gpu-fault.io/dcgm-hostengine=host</code> 时用主机 hostengine</td>
+</tr>
+<tr class="odd">
+<td>Executor IAM</td>
+<td>SageMaker Describe/List 与 <code>BatchRebootClusterNodes</code></td>
+<td><code>ec2:DescribeInstances</code>、按 <code>eks:cluster-name</code>
+标签限定的 <code>ec2:RebootInstances</code>、该集群的 EKS Describe；没有
+<code>sagemaker:*</code>，也没有 stop/terminate/launch</td>
+</tr>
+</tbody>
+</table>
+<p><code>eks-managed</code> 是新增形态，真机验收范围小于
+<code>hyperpod</code>；设计细节、操作员前置和验证 状态见<a href="components/plain-eks-gpu-cluster.md">普通 EKS GPU 集群与混合
+provider 站点</a>。</p>
 <h2 data-number="1.3" id="3-系统上下文"><span class="header-section-number">1.3</span> 系统上下文</h2>
-<p>系统对外只有三类交互对象：产生信号的数据源（kernel/DCGM/HMA/主机/训练）、
-被操作的对象（Kubernetes API、GPU 设备、SageMaker
-API），以及承接结论的外部 系统（状态库、邮件、可选的 S3 与 AMP）。</p>
+<p>系统对外只有三类交互对象：产生信号的数据源（kernel/DCGM/Fabric
+Manager/主机/训练）、 被操作的对象（Kubernetes API、GPU 设备、SageMaker
+/ EC2 API），以及承接结论的外部 系统（状态库、SNS/SES 管理员通知、S3 与
+AMP）。</p>
 <pre class="mermaid">flowchart LR
     subgraph DP[&quot;每 GPU 集群数据面&quot;]
-        K[&quot;Kernel / HMA / DCGM&quot;] --&gt; C[&quot;采集器&quot;]
+        K[&quot;Kernel / Fabric Manager / DCGM&quot;] --&gt; C[&quot;采集器&quot;]
         H[&quot;主机与网络&quot;] --&gt; C
         T[&quot;训练进度&quot;] --&gt; C
         W[&quot;Completion Watcher&quot;]
@@ -4813,7 +4985,7 @@ API），以及承接结论的外部 系统（状态库、邮件、可选的 S3 
         D --&gt; RA[&quot;Regional Remote Adapter&quot;]
         D --&gt; KA[&quot;Kubernetes Adapter&quot;]
         D --&gt; NA[&quot;签名 Node Agent&quot;]
-        D --&gt; HP[&quot;HyperPod Adapter / Observer&quot;]
+        D --&gt; HP[&quot;Provider Adapter（HyperPod / EKS）&quot;]
     end
 
     C -- &quot;出向 TLS&quot; --&gt; API
@@ -4822,15 +4994,22 @@ API），以及承接结论的外部 系统（状态库、邮件、可选的 S3 
     RA -.- EX
     KA --&gt; K8S[&quot;Kubernetes API&quot;]
     NA --&gt; GPU[&quot;GPU / 节点&quot;]
-    HP --&gt; AWS[&quot;SageMaker API&quot;]</pre>
+    HP --&gt; AWS[&quot;SageMaker / EC2 API&quot;]</pre>
 <p>图中 Adapter 一栏在两种形态下的分工不同，这是最容易看错的地方：</p>
 <ul>
 <li><strong>区域形态（生产）</strong>：<code>Regional Remote Adapter</code>
 只把动作写成命令，由目标集群的 Cluster Action Executor
-拉取并用本地权限执行。控制面侧的
-<code>Kubernetes Adapter</code>、HyperPod mutation adapter 和 in-cluster
-quick diagnostics <strong>必须禁用</strong>，启用则启动失败。</li>
-<li><strong>单集群一体化形态（历史）</strong>：这三个 Adapter 直连本地
+拉取并用本地权限执行。控制面侧的 <code>Kubernetes Adapter</code> 与
+provider（HyperPod / EKS）mutation adapter
+<strong>必须禁用</strong>，启用则 启动失败；检查入口为
+<code>ControlPlaneSettings.from_mapping</code>（<code>settings.py</code>：regional
+mode 下 <code>GPU_FAULT_ENABLE_KUBERNETES_ADAPTER</code> 或
+<code>GPU_FAULT_ENABLE_HYPERPOD_ADAPTER</code> 任一为 true 即
+<code>RuntimeError</code>）。两种 provider 的 executor 都用
+<code>GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true</code> 构造 provider
+adapter，<code>GPU_FAULT_CLUSTER_PROVIDER</code> 决定其后端是 SageMaker
+还是 EC2。</li>
+<li><strong>单集群一体化形态（历史）</strong>：这两个 Adapter 直连本地
 API，没有 Executor。</li>
 </ul>
 <h2 data-number="1.4" id="4-总体架构"><span class="header-section-number">1.4</span> 总体架构</h2>
@@ -4850,8 +5029,8 @@ API，没有 Executor。</li>
 <tbody>
 <tr class="odd">
 <td>部署位置</td>
-<td>独立 CPU HyperPod/EKS，与任何 GPU 集群不同 VPC</td>
-<td>每个 GPU HyperPod/EKS 内</td>
+<td>独立 CPU HyperPod EKS 集群，与任何 GPU 集群不同 VPC</td>
+<td>每个 GPU 集群（HyperPod EKS 或普通 EKS）内</td>
 </tr>
 <tr class="even">
 <td>职责</td>
@@ -4860,7 +5039,10 @@ API，没有 Executor。</li>
 </tr>
 <tr class="odd">
 <td>持有的凭证</td>
-<td>每集群 token 的 SHA-256 摘要、Aurora 凭证、SES 权限</td>
+<td>每集群 token 的 SHA-256 摘要（轮换期另有 retiring 摘要）、Aurora
+凭证、站点通知渠道的权限：站点 SNS 主题的
+<code>sns:Publish</code>（默认）或
+<code>ses:SendEmail</code>（<code>channel: ses</code> 站点）</td>
 <td>自己集群的 token、本地 ServiceAccount、Node Action 签名密钥</td>
 </tr>
 <tr class="even">
@@ -4903,7 +5085,7 @@ EKS，上述不变量退化为&quot;控制面不跨集群&quot;， 仍然成立�
 只需记住一件事：所有跨边界连接都由 GPU 集群侧发起， 控制面没有任何指向
 GPU 集群的箭头。</p>
 <pre class="mermaid">flowchart LR
-    subgraph GA[&quot;GPU 集群 A（HyperPod EKS）&quot;]
+    subgraph GA[&quot;GPU 集群 A（HyperPod EKS 或普通 EKS）&quot;]
         AN[&quot;每节点 systemd：采集器 + node-agent&quot;]
         AD[&quot;集群内 Deployment：watcher / collector / executor&quot;]
         AG[&quot;NAT Gateway 固定 EIP&quot;]
@@ -4928,12 +5110,13 @@ GPU 集群的箭头。</p>
     BG == &quot;出向 TLS 443&quot; ==&gt; NLB
     ING -- &quot;入队&quot; --&gt; AUR
     WRK -- &quot;出队 / 状态 / outbox&quot; --&gt; AUR</pre>
-<p><strong>图 4-2 GPU 集群侧组件。</strong> 节点上是 systemd
-单元，集群内是 Deployment； 只有 node-agent 有入向监听，且只被本集群的
-executor 调用。</p>
+<p><strong>图 4-2 GPU 集群侧组件。</strong> Collector/Agent 在节点上以
+systemd 单元运行， dcgm-exporter 由 DaemonSet 提供，集群级组件以
+Deployment 运行； node-agent 的节点动作端口只被本集群的 executor
+调用；数据面另外提供局部指标与健康端口。</p>
 <pre class="mermaid">flowchart LR
-    subgraph NODE[&quot;每 GPU 节点：systemd 单元&quot;]
-        DE[&quot;dcgm-exporter 127.0.0.1:9400&quot;]
+    subgraph NODE[&quot;每 GPU 节点：运行时组件&quot;]
+        DE[&quot;dcgm-exporter DaemonSet&lt;br/&gt;metrics :9400&quot;]
         MC[&quot;metrics-collector&quot;]
         KC[&quot;kernel-collector&quot;]
         HC[&quot;host-collector&quot;]
@@ -4950,15 +5133,15 @@ executor 调用。</p>
         NRC[&quot;kubernetes-node-resource-collector 1&quot;]
         CAE[&quot;cluster-action-executor 2&quot;]
         NIR[&quot;node-installer-reconciler 1&quot;]
-        HMA[&quot;hma-watcher 0 / sqs-hma-consumer 2 可选&quot;]
+        ADP[&quot;adot-dataplane 1（配置后）&quot;]
     end
 
     KAPI[&quot;本集群 Kubernetes API&quot;]
     JOB[&quot;node-installer Job&quot;]
     NATGW[&quot;NAT Gateway → 控制面 NLB&quot;]
     S3[(&quot;S3 训练日志 / 诊断现场，可选&quot;)]
-    HPAPI[&quot;SageMaker HyperPod API&quot;]
-    CWSQS[&quot;CloudWatch 订阅 + SQS bridge&quot;]
+    HPAPI[&quot;SageMaker HyperPod API / EC2 API&quot;]
+    AMPW[(&quot;AMP，与控制面同一工作区&quot;)]
 
     MC --&gt; NATGW
     KC --&gt; NATGW
@@ -4970,7 +5153,6 @@ executor 调用。</p>
     CW --&gt; NATGW
     NRC --&gt; NATGW
     CAE -- &quot;领取动作 / 回执&quot; --&gt; NATGW
-    HMA -.-&gt; NATGW
 
     CW --&gt; KAPI
     NRC --&gt; KAPI
@@ -4978,11 +5160,14 @@ executor 调用。</p>
     NIR --&gt; JOB
     CAE -- &quot;cordon / drain / 删 Pod&quot; --&gt; KAPI
     CAE -- &quot;HMAC 签名动作&quot; --&gt; NA
-    CAE -- &quot;BatchRebootClusterNodes&quot; --&gt; HPAPI
+    CAE -- &quot;BatchRebootClusterNodes / EC2 RebootInstances&quot; --&gt; HPAPI
     CAE -.-&gt; S3
     CW -.-&gt; S3
     NA -.-&gt; S3
-    CWSQS -.-&gt; HMA</pre>
+    ADP -. &quot;抓 :9109 /metrics&quot; .-&gt; CW
+    ADP -. &quot;抓 :9110 /metrics&quot; .-&gt; NIR
+    ADP -. &quot;抓 :9111 /metrics&quot; .-&gt; CAE
+    ADP -- &quot;remote_write&quot; --&gt; AMPW</pre>
 <p><strong>图 4-3 控制面侧组件。</strong> ingress 与 worker 之间没有 Pod
 间连接， 只通过 Aurora 队列交接工作。</p>
 <pre class="mermaid">flowchart LR
@@ -4993,14 +5178,15 @@ executor 调用。</p>
     WRK[&quot;control-worker&lt;br/&gt;6 副本 × 4 进程 :8081&quot;] -- &quot;出队 / 状态 / outbox&quot; --&gt; AUR
     SPL[&quot;spool-worker 0 副本 :8082&quot;] -.-&gt; AUR
 
-    WRK --&gt; SES[&quot;SES 管理员邮件&quot;]
+    WRK --&gt; NOTIFY[&quot;站点 SNS 主题（默认，与 AMP 告警共用）/ SES 邮件（channel: ses）&quot;]
     WRK -- &quot;只读 Describe / List&quot; --&gt; HPAPI[&quot;SageMaker HyperPod API&quot;]
     CRON[&quot;aurora-credential-refresh CronJob&quot;] --&gt; SMGR[&quot;Secrets Manager&quot;]
 
     ADOT[&quot;ADOT Collector&quot;] -. &quot;抓 Pod IP /metrics&quot; .-&gt; ING
     ADOT -.-&gt; WRK
     ADOT -.-&gt; SPL
-    ADOT -- &quot;remote_write&quot; --&gt; AMP[&quot;AMP 规则 + Alertmanager + SNS&quot;]</pre>
+    ADOT -- &quot;remote_write&quot; --&gt; AMP[&quot;AMP 规则 + Alertmanager + SNS&quot;]
+    GRF[&quot;Amazon Managed Grafana（deploy 导入仪表盘）&quot;] -- &quot;查询（SigV4）&quot; --&gt; AMP</pre>
 <p>各组件的连接方向、监听面和身份：</p>
 <table>
 <thead>
@@ -5022,17 +5208,20 @@ executor 调用。</p>
 </tr>
 <tr class="even">
 <td>dcgm-exporter</td>
-<td>每 GPU 节点 systemd，生产用
-<code>--dcgm-exporter existing</code></td>
+<td>GPU 集群 DaemonSet（hostNetwork）；hyperpod 节点连主机
+hostengine，eks-managed 默认在容器内嵌 hostengine；节点安装器用
+<code>--dcgm-exporter existing</code> 复用，不另启动同功能 systemd
+服务</td>
 <td>无</td>
-<td><code>127.0.0.1:9400</code>，仅本机 metrics-collector 抓取</td>
+<td><code>127.0.0.1:9400</code>，供同节点 metrics-collector 抓取</td>
 <td>无</td>
 </tr>
 <tr class="odd">
 <td>node-agent</td>
 <td>每 GPU 节点 systemd</td>
-<td>控制面注册与心跳（经 NAT）；配了 <code>--diagnostic-s3-uri</code>
-时另上传诊断包到 S3</td>
+<td>控制面注册与心跳（经 NAT）；配了
+<code>--diagnostic-s3-uri</code>（受管站点：<code>site.yaml</code> 的
+<code>spec.diagnosticS3Uri</code>）时另上传诊断包到 S3</td>
 <td>节点私网 IP <code>:9099</code></td>
 <td>出向用 collector token；入向校验 HMAC 签名、命令
 TTL、目标节点、Agent generation 与 incident fencing token</td>
@@ -5056,7 +5245,7 @@ TTL、目标节点、Agent generation 与 incident fencing token</td>
 <td>GPU 集群 Deployment 1 副本</td>
 <td>本集群 Kubernetes API + 控制面（经 NAT）；配了训练日志 S3 URI
 时上传终态日志</td>
-<td>无</td>
+<td><code>:9109</code> 指标/健康</td>
 <td>本地 ServiceAccount + 该集群 token</td>
 </tr>
 <tr class="odd">
@@ -5070,24 +5259,28 @@ TTL、目标节点、Agent generation 与 incident fencing token</td>
 <td>cluster-action-executor</td>
 <td>GPU 集群 Deployment 2 副本</td>
 <td>控制面领取/回执、本集群 Kubernetes API、node-agent
-<code>:9099</code>、SageMaker、S3</td>
-<td>无</td>
-<td>该集群 token + 本地 ServiceAccount + Pod Identity role + Node Action
-签名密钥</td>
+<code>:9099</code>、provider API（hyperpod：SageMaker；eks-managed：EC2
+与 EKS Describe）、S3</td>
+<td><code>:9111</code> 指标/健康</td>
+<td>该集群 token + 本地 ServiceAccount + IRSA role（本集群 OIDC 信任）+
+Node Action 签名密钥</td>
 </tr>
 <tr class="odd">
 <td>node-installer-reconciler</td>
 <td>GPU 集群 Deployment 1 副本</td>
 <td><strong>只连本集群 Kubernetes API</strong>，不连控制面</td>
-<td>无</td>
+<td><code>:9110</code> 指标/健康</td>
 <td>本地 ServiceAccount</td>
 </tr>
 <tr class="even">
-<td>hma-watcher / sqs-hma-consumer</td>
-<td>GPU 集群 Deployment，可选</td>
-<td>Kubernetes API 或 SQS + 控制面</td>
-<td>无</td>
-<td>该集群 token</td>
+<td>adot-dataplane</td>
+<td>已配置的 GPU 集群 Deployment 1 副本</td>
+<td>抓本 namespace 中声明的指标端口（completion-watcher
+<code>:9109</code>、reconciler <code>:9110</code>、executor
+<code>:9111</code>），remote_write 到站点 AMP（与控制面同一工作区）</td>
+<td><code>:8090</code> 健康探针</td>
+<td>本集群 IRSA role，仅对站点 workspace 授
+<code>aps:RemoteWrite</code></td>
 </tr>
 <tr class="odd">
 <td>NAT Gateway</td>
@@ -5107,29 +5300,33 @@ TTL、目标节点、Agent generation 与 incident fencing token</td>
 <td>ingress</td>
 <td>控制面 Deployment 3 副本 × 4 进程</td>
 <td>Aurora writer 端点</td>
-<td><code>:8080</code>，NLB 唯一 target</td>
+<td><code>:8080</code>，NLB 唯一 target；存活/就绪探针走专用 liveness
+端口 <code>:8090</code></td>
 <td>Pod Identity role + Aurora 凭证</td>
 </tr>
 <tr class="even">
 <td>control-worker</td>
 <td>控制面 Deployment 6 副本 × 4 进程</td>
-<td>Aurora、SES、SageMaker 只读</td>
-<td><code>:8081</code>，不在 NLB target 中，只被探针与 ADOT 访问</td>
-<td>同上 + <code>ses:SendEmail</code></td>
+<td>Aurora、SNS 或 SES、SageMaker 只读</td>
+<td><code>:8081</code>，不在 NLB target 中，只被 ADOT 抓取；探针走
+<code>:8091</code></td>
+<td>同上 + 站点渠道的
+<code>sns:Publish</code>（<code>channel: ses</code> 时为
+<code>ses:SendEmail</code>）</td>
 </tr>
 <tr class="odd">
 <td>spool-worker</td>
 <td>控制面 Deployment 0 副本（按需扩）</td>
 <td>Aurora</td>
-<td><code>:8082</code>，同上</td>
+<td><code>:8082</code>，同上；探针走 <code>:8092</code></td>
 <td>同上</td>
 </tr>
 <tr class="even">
-<td>ADOT Collector</td>
+<td>ADOT Collector（控制面）</td>
 <td>控制面 EKS</td>
 <td>抓三类角色 Pod IP <code>/metrics</code>，remote_write 到 AMP</td>
 <td>无</td>
-<td>execution token（Bearer）</td>
+<td>execution token（仅 CPU 抓取）+ 写 AMP 的 Pod Identity role</td>
 </tr>
 <tr class="odd">
 <td>aurora-credential-refresh</td>
@@ -5137,6 +5334,14 @@ TTL、目标节点、Agent generation 与 incident fencing token</td>
 <td>Secrets Manager</td>
 <td>无</td>
 <td>Pod Identity role</td>
+</tr>
+<tr class="even">
+<td>Amazon Managed Grafana</td>
+<td>区域托管服务，deploy 创建或复用</td>
+<td>工作区 IAM role 通过 SigV4 查询 AMP</td>
+<td>托管工作区入口</td>
+<td>IAM Identity Center 用户（管理员邮箱对应用户由 deploy 自动授
+ADMIN）</td>
 </tr>
 </tbody>
 </table>
@@ -5146,25 +5351,134 @@ TTL、目标节点、Agent generation 与 incident fencing token</td>
 自己的注册心跳）都经该 VPC 的 NAT Gateway 出向到 NLB 的 443；NLB
 Security Group 只放行各 GPU VPC 的 NAT EIP <code>/32</code>。CIDR
 不冲突时也可换成内部 NLB/PrivateLink，组件关系不变。</li>
-<li><strong>node-agent 是唯一有入向监听的数据面组件</strong>，且只在 GPU
-VPC 内被本集群的 cluster-action-executor 调用；控制面不认识、也不连接
-<code>:9099</code>。控制面只把动作写成 命令，由 executor
-领取后再本地调用（见 §5.5）。</li>
+<li><strong>node-agent 是节点动作的唯一入向端口</strong>，且只在 GPU VPC
+内被本集群的 cluster-action-executor 调用；其他组件的 metrics/health
+监听不是节点动作入口。 控制面不认识、也不直连
+<code>:9099</code>，只把动作写成 命令，由 executor 领取后再本地调用（见
+§5.5）。</li>
 <li><strong>ingress 与 worker 之间没有 Pod 间连接</strong>，两者只通过
 Aurora 的队列交接工作， 因此 ingress Ready 不代表队列有人消费（见
 §4.3）。</li>
 <li><strong>node-installer-reconciler
 不参与控制面协议</strong>：它只在本集群内比对期望的安装版本/
 配置摘要，给缺失节点创建 installer Job 并回写节点标记。</li>
-<li><strong>AMP/ADOT 与 SES
-是两条独立告警路径</strong>：ADOT→AMP→Alertmanager→SNS 只覆盖控制面
-自身指标，collector 静默、workflow 与故障通知走控制面 Aurora outbox +
-SES（见 §4.2.1）。无 AMP 的 region 关掉前者，后者仍然生效。</li>
+<li><strong>指标告警与业务通知是两条独立路径，SNS
+站点共用一个主题</strong>： ADOT→AMP→Alertmanager→SNS
+覆盖控制面三类角色与已配置 GPU 集群数据面组件的自身 指标；collector
+静默、workflow 与故障通知走控制面 Aurora outbox，再按
+<code>spec.notifications.channel</code> 发往同一站点 SNS
+主题（新站点默认）或 SES （<code>channel: ses</code>）。未声明 channel
+且已有 <code>emailSender</code> 的旧站点保留 SES； 内置静默通知不依赖
+AMP，无 AMP 的 region 关掉前者，后者仍然生效（见 §4.2.1）。</li>
 </ol>
-<h3 data-number="1.4.3" id="42-节点数据面"><span class="header-section-number">1.4.3</span> 节点数据面</h3>
+<h3 data-number="1.4.3" id="412-已启用部署架构2026-09-20-核对快照"><span class="header-section-number">1.4.3</span> 已启用部署架构（2026-09-20
+核对快照）</h3>
+<p><a id="deployment-architecture-snapshot"></a></p>
+<p>下图记录 <strong>2026-09-20 UTC、us-west-2</strong>
+的已启用部署：一个独立 CPU HyperPod/EKS 控制面和一个受管 GPU
+HyperPod/EKS 集群。它由 Kubernetes 清单、非敏感配置、Fleet、
+安装资源注册表和 AWS
+元数据的只读核对形成，节点内部职责再与当前实现对照。
+<strong>节点数、副本数、ACU 和 Ready
+数是该时点的观察值，不是所有站点必须使用的固定配置，
+也不代表已通过故障切换、压测或全部上线门禁。</strong></p>
+<p><img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyMjYwIDE3NjAiIHdpZHRoPSIyMjYwIiBoZWlnaHQ9IjE3NjAiIHJvbGU9ImltZyIgYXJpYS1sYWJlbGxlZGJ5PSJkaWFncmFtLXRpdGxlIGRpYWdyYW0tZGVzYyI+Cjx0aXRsZSBpZD0iZGlhZ3JhbS10aXRsZSI+R1BVIOaVhemanOezu+e7n+mDqOe9suaetuaehO+8muW9k+WJjeWQr+eUqOe7hOS7tuS4jiBBV1Mg5pyN5YqhPC90aXRsZT4KPGRlc2MgaWQ9ImRpYWdyYW0tZGVzYyI+MjAyNi0wOS0yMCDlj6ror7vmoLjlr7njgIJDUFUgRUtTIOS4juS4gOS4qiBIeXBlclBvZCBHUFUgRUtTIOmbhue+pOWIhuemu++8jOmAmui/hyBOQVQg5ZKM5YWs572RIFRMUyBOTEIg6YCa5L+h44CC5YyF5ZCrIEF1cm9yYeOAgUFNUOOAgUdyYWZhbmHjgIFTTlPjgIFTM+OAgUVDUuOAgVNlY3JldHMgTWFuYWdlcuOAgUtNU+OAgUlBTeOAgVNUU+OAgUlkZW50aXR5IENlbnRlcuOAgVJvdXRlIDUz44CBQUNN44CBQ2xvdWRXYXRjaOOAgVZQQ+OAgUVDMiDkuI4gRUJT44CCPC9kZXNjPgo8ZGVmcz48bWFya2VyIGlkPSJhcnJvdy1tYWluIiB2aWV3Qm94PSIwIDAgMTAgMTAiIHJlZlg9IjkiIHJlZlk9IjUiIG1hcmtlcldpZHRoPSI3IiBtYXJrZXJIZWlnaHQ9IjciIG9yaWVudD0iYXV0by1zdGFydC1yZXZlcnNlIj48cGF0aCBkPSJNIDAgMCBMIDEwIDUgTCAwIDEwIHoiIGZpbGw9IiMzNzRjNTkiLz48L21hcmtlcj48bWFya2VyIGlkPSJhcnJvdy1tZXRyaWMiIHZpZXdCb3g9IjAgMCAxMCAxMCIgcmVmWD0iOSIgcmVmWT0iNSIgbWFya2VyV2lkdGg9IjciIG1hcmtlckhlaWdodD0iNyIgb3JpZW50PSJhdXRvLXN0YXJ0LXJldmVyc2UiPjxwYXRoIGQ9Ik0gMCAwIEwgMTAgNSBMIDAgMTAgeiIgZmlsbD0iIzI1N2Q4MyIvPjwvbWFya2VyPjxtYXJrZXIgaWQ9ImFycm93LW5vdGlmeSIgdmlld0JveD0iMCAwIDEwIDEwIiByZWZYPSI5IiByZWZZPSI1IiBtYXJrZXJXaWR0aD0iNyIgbWFya2VySGVpZ2h0PSI3IiBvcmllbnQ9ImF1dG8tc3RhcnQtcmV2ZXJzZSI+PHBhdGggZD0iTSAwIDAgTCAxMCA1IEwgMCAxMCB6IiBmaWxsPSIjOTg2ZDI3Ii8+PC9tYXJrZXI+PG1hcmtlciBpZD0iYXJyb3ctYWN0aW9uIiB2aWV3Qm94PSIwIDAgMTAgMTAiIHJlZlg9IjkiIHJlZlk9IjUiIG1hcmtlcldpZHRoPSI3IiBtYXJrZXJIZWlnaHQ9IjciIG9yaWVudD0iYXV0by1zdGFydC1yZXZlcnNlIj48cGF0aCBkPSJNIDAgMCBMIDEwIDUgTCAwIDEwIHoiIGZpbGw9IiM0NzZmYWEiLz48L21hcmtlcj48bWFya2VyIGlkPSJhcnJvdy1zdXBwb3J0IiB2aWV3Qm94PSIwIDAgMTAgMTAiIHJlZlg9IjkiIHJlZlk9IjUiIG1hcmtlcldpZHRoPSI3IiBtYXJrZXJIZWlnaHQ9IjciIG9yaWVudD0iYXV0by1zdGFydC1yZXZlcnNlIj48cGF0aCBkPSJNIDAgMCBMIDEwIDUgTCAwIDEwIHoiIGZpbGw9IiM4OTcwOGYiLz48L21hcmtlcj48L2RlZnM+CjxzdHlsZT50ZXh0e2ZvbnQtZmFtaWx5OiJOb3RvIFNhbnMgQ0pLIFNDIiwiTWljcm9zb2Z0IFlhSGVpIixBcmlhbCxzYW5zLXNlcmlmO2xldHRlci1zcGFjaW5nOjB9IC5jb21wb25lbnQ6aG92ZXIgcmVjdDpmaXJzdC1vZi10eXBle3N0cm9rZS13aWR0aDoyLjV9PC9zdHlsZT4KPHJlY3Qgd2lkdGg9IjIyNjAiIGhlaWdodD0iMTc2MCIgZmlsbD0iI2ZmZmZmZiIvPgo8dGV4dCB4PSIzNSIgeT0iNDMiIGZvbnQtc2l6ZT0iMzIiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+R1BVIOaVhemanOezu+e7nyDCtyDpg6jnvbLmnrbmnoQ8L3RleHQ+Cjx0ZXh0IHg9IjM1IiB5PSI4MCIgZm9udC1zaXplPSIxOSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzUzNjQ2ZSIgdGV4dC1hbmNob3I9InN0YXJ0Ij7nur/kuIrlj6ror7vmoLjlr7kgMjAyNi0wOS0yMCDCtyBBV1MgdXMtd2VzdC0yIMK3IDEg5LiqIENQVSDpm4bnvqQgLyAxIOS4qiBHUFUg6ZuG576kPC90ZXh0Pgo8dGV4dCB4PSIxMzkwIiB5PSIxNTEiIGZvbnQtc2l6ZT0iMjMiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+5Li75Zu+5LuF5YiX5pys5pa55qGI5ZCv55So57uE5Lu25Y+K5YW2IEFXUyDkvp3otZY8L3RleHQ+Cjx0ZXh0IHg9IjEzOTAiIHk9IjE4NCIgZm9udC1zaXplPSIxOCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzUzNjQ2ZSIgdGV4dC1hbmNob3I9InN0YXJ0Ij7lia/mnKzmlbDmnaXoh6rnjrDnvZHvvJvoioLngrnlhoXpg6jogYzotKPmjInmupDnoIHkuI4gRmxlZXQg5a6J6KOF5riF5Y2V5qC45a+5PC90ZXh0Pgo8ZyBpZD0iY3B1LXZwYyIgY2xhc3M9Imdyb3VwIj48cmVjdCB4PSIzMCIgeT0iMjg1IiB3aWR0aD0iNzQwIiBoZWlnaHQ9IjEwMjUiIHJ4PSI1IiBmaWxsPSIjZjdmYmZhIiBzdHJva2U9IiMzMzdjNzUiIHN0cm9rZS13aWR0aD0iMS42Ii8+CiAgICA8dGV4dCB4PSI1MCIgeT0iMzE2IiBmb250LXNpemU9IjIyIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkNQVSBWUEM8L3RleHQ+PHRleHQgeD0iNTAiIHk9IjM0NCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzUzNjQ2ZSIgdGV4dC1hbmNob3I9InN0YXJ0Ij5DUFUgSHlwZXJQb2Q6IDMgeCBtbC5jNS40eGxhcmdlIMK3IEVLUyDmib/ovb3mjqfliLbpnaI8L3RleHQ+PC9nPjxnIGlkPSJjcHUtZWtzIiBjbGFzcz0iZ3JvdXAiPjxyZWN0IHg9IjYwIiB5PSI0OTAiIHdpZHRoPSI2ODAiIGhlaWdodD0iNTUwIiByeD0iNSIgZmlsbD0iI2ZmZmZmZiIgc3Ryb2tlPSIjNmU5ZTk4IiBzdHJva2Utd2lkdGg9IjEuNiIvPgogICAgPHRleHQgeD0iODAiIHk9IjUyMSIgZm9udC1zaXplPSIyMiIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij5DUFUgQW1hem9uIEVLUzwvdGV4dD48dGV4dCB4PSI4MCIgeT0iNTQ5IiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNTM2NDZlIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuS4muWKoSBuYW1lc3BhY2U6IGdwdS1mYXVsdC1zeXN0ZW3vvJvlubPlj7DmjqfliLblmajlj6blkb3lkI3nqbrpl7Q8L3RleHQ+PC9nPjxnIGlkPSJncHUtdnBjIiBjbGFzcz0iZ3JvdXAiPjxyZWN0IHg9IjEzMjAiIHk9IjI4NSIgd2lkdGg9IjkxMCIgaGVpZ2h0PSIxMDI1IiByeD0iNSIgZmlsbD0iI2Y3ZmFmZiIgc3Ryb2tlPSIjNDc3NWE0IiBzdHJva2Utd2lkdGg9IjEuNiIvPgogICAgPHRleHQgeD0iMTM0MCIgeT0iMzE2IiBmb250LXNpemU9IjIyIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkdQVSBWUEMgwrcg5b2T5YmNIDEg5Liq5Y+X566h6ZuG576kPC90ZXh0Pjx0ZXh0IHg9IjEzNDAiIHk9IjM0NCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzUzNjQ2ZSIgdGV4dC1hbmNob3I9InN0YXJ0Ij5BbWF6b24gRUtTICsgU2FnZU1ha2VyIEh5cGVyUG9k77yb5Y+X566h6K6t57uDIFBvZCDmjInpnIDvvIjlvZPliY3ov5DooYwgMO+8iTwvdGV4dD48L2c+PGcgaWQ9ImdwdS1la3MiIGNsYXNzPSJncm91cCI+PHJlY3QgeD0iMTM1MCIgeT0iNDkwIiB3aWR0aD0iODUwIiBoZWlnaHQ9IjQzNSIgcng9IjUiIGZpbGw9IiNmZmZmZmYiIHN0cm9rZT0iIzc3OTViNyIgc3Ryb2tlLXdpZHRoPSIxLjYiLz4KICAgIDx0ZXh0IHg9IjEzNzAiIHk9IjUyMSIgZm9udC1zaXplPSIyMiIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij5HUFUgRUtTIMK3IOmbhue+pOe6p+e7hOS7tjwvdGV4dD48dGV4dCB4PSIxMzcwIiB5PSI1NDkiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM1MzY0NmUiIHRleHQtYW5jaG9yPSJzdGFydCI+5q+P6ZuG576k5LiA57uE77yb5rKh5pyJ5oqK6IqC54K56YeH6ZuG5Zmo5YaN6YOo572y5oiQ6YeN5aSNIERhZW1vblNldDwvdGV4dD48L2c+PGcgaWQ9ImdwdS1ub2RlcyIgY2xhc3M9Imdyb3VwIj48cmVjdCB4PSIxMzUwIiB5PSI5NjAiIHdpZHRoPSI4NTAiIGhlaWdodD0iMzI1IiByeD0iNSIgZmlsbD0iI2ZmZmZmZiIgc3Ryb2tlPSIjNzc5NWI3IiBzdHJva2Utd2lkdGg9IjEuNiIvPgogICAgPHRleHQgeD0iMTM3MCIgeT0iOTkxIiBmb250LXNpemU9IjIyIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkh5cGVyUG9kIEdQVSDoioLngrkgeDQ8L3RleHQ+PC9nPjxnIGlkPSJyZWdpb25hbC1zZXJ2aWNlcyIgY2xhc3M9Imdyb3VwIj48cmVjdCB4PSI4MTAiIHk9IjQ1MCIgd2lkdGg9IjQ2NSIgaGVpZ2h0PSI4NjAiIHJ4PSI1IiBmaWxsPSIjZmZmZGY4IiBzdHJva2U9IiNhNjhlNjciIHN0cm9rZS13aWR0aD0iMS42Ii8+CiAgICA8dGV4dCB4PSI4MzAiIHk9IjQ4MSIgZm9udC1zaXplPSIyMiIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij7ljLrln58gQVdTIOacjeWKoTwvdGV4dD48L2c+PGcgaWQ9InNlY3VyaXR5LXNlcnZpY2VzIiBjbGFzcz0iZ3JvdXAiPjxyZWN0IHg9IjMwIiB5PSIxMzUwIiB3aWR0aD0iMjIwMCIgaGVpZ2h0PSIxNzgiIHJ4PSI1IiBmaWxsPSIjZmNmYmZkIiBzdHJva2U9IiM5Mzg0OWQiIHN0cm9rZS13aWR0aD0iMS42Ii8+CiAgICA8dGV4dCB4PSI1MCIgeT0iMTM4MSIgZm9udC1zaXplPSIyMiIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij7ouqvku73jgIHor4HkuabkuI7liqDlr4bkvp3otZY8L3RleHQ+PC9nPjxwYXRoIGlkPSJncHUtdG8tY3B1IiBjbGFzcz0iZWRnZSIgZGF0YS1raW5kPSJtYWluIiBkPSJNIDEzOTAgMzgwIEwgMTMxMCAzODAgTCAxMzEwIDI2MCBMIDczNSAyNjAgTCA3MzUgNDA1IEwgNjkwIDQwNSIKICAgIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzM3NGM1OSIgc3Ryb2tlLXdpZHRoPSIyLjUiCiAgICBtYXJrZXItZW5kPSJ1cmwoI2Fycm93LW1haW4pIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PHBhdGggaWQ9ImdwdS1wb2RzLWVncmVzcyIgY2xhc3M9ImVkZ2UiIGRhdGEta2luZD0ibWFpbiIgZD0iTSAxOTg1IDQ5MCBMIDE5ODUgNDUwIgogICAgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMzc0YzU5IiBzdHJva2Utd2lkdGg9IjIuNSIKICAgIG1hcmtlci1lbmQ9InVybCgjYXJyb3ctbWFpbikiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBpZD0iY29sbGVjdG9yLWVncmVzcyIgY2xhc3M9ImVkZ2UiIGRhdGEta2luZD0ibWFpbiIgZD0iTSAxMzgwIDExMDAgTCAxMzQwIDExMDAgTCAxMzQwIDQwNSBMIDEzOTAgNDA1IgogICAgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMzc0YzU5IiBzdHJva2Utd2lkdGg9IjIuNSIKICAgIG1hcmtlci1lbmQ9InVybCgjYXJyb3ctbWFpbikiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBpZD0iYWdlbnQtaGVhcnRiZWF0IiBjbGFzcz0iZWRnZSIgZGF0YS1raW5kPSJtYWluIiBkPSJNIDIxNzAgMTA2NSBMIDIyMTUgMTA2NSBMIDIyMTUgNDA1IEwgMjE2MCA0MDUiCiAgICBmaWxsPSJub25lIiBzdHJva2U9IiMzNzRjNTkiIHN0cm9rZS13aWR0aD0iMi41IgogICAgbWFya2VyLWVuZD0idXJsKCNhcnJvdy1tYWluKSIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGlkPSJubGItaW5ncmVzcyIgY2xhc3M9ImVkZ2UiIGRhdGEta2luZD0ibWFpbiIgZD0iTSAxMDAgNDA1IEwgNzUgNDA1IEwgNzUgNjA4IEwgOTAgNjA4IgogICAgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMzc0YzU5IiBzdHJva2Utd2lkdGg9IjIuNSIKICAgIG1hcmtlci1lbmQ9InVybCgjYXJyb3ctbWFpbikiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBpZD0iaW5ncmVzcy1zcWwiIGNsYXNzPSJlZGdlIiBkYXRhLWtpbmQ9Im1haW4iIGQ9Ik0gOTAgNjQwIEwgNjUgNjQwIEwgNjUgMTE4NSBMIDkwIDExODUiCiAgICBmaWxsPSJub25lIiBzdHJva2U9IiMzNzRjNTkiIHN0cm9rZS13aWR0aD0iMi41IgogICAgbWFya2VyLWVuZD0idXJsKCNhcnJvdy1tYWluKSIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGlkPSJ3b3JrZXItc3FsIiBjbGFzcz0iZWRnZSIgZGF0YS1raW5kPSJtYWluIiBkPSJNIDU1NSA2NjMgTCA1NTUgNjc1IEwgNzMwIDY3NSBMIDczMCAxMTg1IEwgNzA1IDExODUiCiAgICBmaWxsPSJub25lIiBzdHJva2U9IiMzNzRjNTkiIHN0cm9rZS13aWR0aD0iMi41IgogICAgbWFya2VyLWVuZD0idXJsKCNhcnJvdy1tYWluKSIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGlkPSJvdXRib3gtc25zIiBjbGFzcz0iZWRnZSIgZGF0YS1raW5kPSJub3RpZnkiIGQ9Ik0gNzA1IDYwOCBMIDc5NSA2MDggTCA3OTUgNzkyIEwgODQwIDc5MiIKICAgIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzk4NmQyNyIgc3Ryb2tlLXdpZHRoPSIyLjUiCiAgICBtYXJrZXItZW5kPSJ1cmwoI2Fycm93LW5vdGlmeSkiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBpZD0iY3B1LW1ldHJpY3MiIGNsYXNzPSJlZGdlIiBkYXRhLWtpbmQ9Im1ldHJpYyIgZD0iTSA3MDUgOTMwIEwgNzgwIDkzMCBMIDc4MCA1NzUgTCA4NDAgNTc1IgogICAgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMjU3ZDgzIiBzdHJva2Utd2lkdGg9IjIuNSIKICAgIG1hcmtlci1lbmQ9InVybCgjYXJyb3ctbWV0cmljKSIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGlkPSJncHUtbWV0cmljcyIgY2xhc3M9ImVkZ2UiIGRhdGEta2luZD0ibWV0cmljIiBkPSJNIDEzODAgODU3IEwgMTI5MCA4NTcgTCAxMjkwIDU1NyBMIDEyNDUgNTU3IgogICAgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMjU3ZDgzIiBzdHJva2Utd2lkdGg9IjIuNSIKICAgIG1hcmtlci1lbmQ9InVybCgjYXJyb3ctbWV0cmljKSIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGlkPSJncmFmYW5hLXF1ZXJ5IiBjbGFzcz0iZWRnZSIgZGF0YS1raW5kPSJtZXRyaWMiIGQ9Ik0gMTA0MiA2MzUgTCAxMDQyIDYwNSIKICAgIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzI1N2Q4MyIgc3Ryb2tlLXdpZHRoPSIyLjUiCiAgICBtYXJrZXItZW5kPSJ1cmwoI2Fycm93LW1ldHJpYykiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBpZD0iYW1wLWFsZXJ0cyIgY2xhc3M9ImVkZ2UiIGRhdGEta2luZD0ibm90aWZ5IiBkPSJNIDg0MCA1MzggTCA4MjAgNTM4IEwgODIwIDgyMCBMIDg0MCA4MjAiCiAgICBmaWxsPSJub25lIiBzdHJva2U9IiM5ODZkMjciIHN0cm9rZS13aWR0aD0iMi41IgogICAgbWFya2VyLWVuZD0idXJsKCNhcnJvdy1ub3RpZnkpIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PHBhdGggaWQ9ImFyY2hpdmUiIGNsYXNzPSJlZGdlIiBkYXRhLWtpbmQ9Im5vdGlmeSIgZD0iTSA3MDUgNjQ1IEwgNzU1IDY0NSBMIDc1NSAxMDYwIEwgODQwIDEwNjAiCiAgICBmaWxsPSJub25lIiBzdHJva2U9IiM5ODZkMjciIHN0cm9rZS13aWR0aD0iMi41IgogICAgbWFya2VyLWVuZD0idXJsKCNhcnJvdy1ub3RpZnkpIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PHBhdGggaWQ9ImV4ZWN1dG9yLWFnZW50IiBjbGFzcz0iZWRnZSIgZGF0YS1raW5kPSJhY3Rpb24iIGQ9Ik0gMTc3MCA2MDggTCAxNzg1IDYwOCBMIDE3ODUgMTA2NSBMIDE4MDAgMTA2NSIKICAgIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzQ3NmZhYSIgc3Ryb2tlLXdpZHRoPSIyLjUiCiAgICBtYXJrZXItZW5kPSJ1cmwoI2Fycm93LWFjdGlvbikiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48cGF0aCBpZD0iZXhlY3V0b3ItazhzIiBjbGFzcz0iZWRnZSIgZGF0YS1raW5kPSJhY3Rpb24iIGQ9Ik0gMTc4NSA3OTAgTCAxNzg1IDg1NyBMIDE4MDAgODU3IgogICAgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNDc2ZmFhIiBzdHJva2Utd2lkdGg9IjIuNSIKICAgIG1hcmtlci1lbmQ9InVybCgjYXJyb3ctYWN0aW9uKSIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGlkPSJ3YXRjaGVyLWs4cyIgY2xhc3M9ImVkZ2UiIGRhdGEta2luZD0iYWN0aW9uIiBkPSJNIDIxNzAgNjA4IEwgMjE5MCA2MDggTCAyMTkwIDg1NyBMIDIxNzAgODU3IgogICAgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjNDc2ZmFhIiBzdHJva2Utd2lkdGg9IjIuNSIKICAgIG1hcmtlci1lbmQ9InVybCgjYXJyb3ctYWN0aW9uKSIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPjxwYXRoIGlkPSJzZWNyZXQtcmVmcmVzaCIgY2xhc3M9ImVkZ2UiIGRhdGEta2luZD0ic3VwcG9ydCIgZD0iTSA2MCAxNDU3IEwgNDUgMTQ1NyBMIDQ1IDc4NSBMIDkwIDc4NSIKICAgIGZpbGw9Im5vbmUiIHN0cm9rZT0iIzg5NzA4ZiIgc3Ryb2tlLXdpZHRoPSIyLjUiIHN0cm9rZS1kYXNoYXJyYXk9IjcgNSIKICAgIG1hcmtlci1lbmQ9InVybCgjYXJyb3ctc3VwcG9ydCkiIHN0cm9rZS1saW5lam9pbj0icm91bmQiLz48ZyBpZD0iYWNtIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+QVdTIENlcnRpZmljYXRlIE1hbmFnZXIgLyDlt7Llr7zlhaXnmoTljLrln58gVExTIOivgeS5pu+8jOS+myBOTEIg57uI5q2iIFRMUzwvdGl0bGU+CiAgICA8cmVjdCB4PSIxNDAiIHk9IjEyMCIgd2lkdGg9IjU0MCIgaGVpZ2h0PSI5NCIgcng9IjQiIGZpbGw9IiNmZmY4ZWQiIHN0cm9rZT0iI2E4NzgzMiIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9IjE0MCIgeT0iMTIwIiB3aWR0aD0iNSIgaGVpZ2h0PSI5NCIgcng9IjIiIGZpbGw9IiNhODc4MzIiLz4KICAgIDx0ZXh0IHg9IjE1OCIgeT0iMTUxIiBmb250LXNpemU9IjIwIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkFXUyBDZXJ0aWZpY2F0ZSBNYW5hZ2VyPC90ZXh0PgogICAgPHRleHQgeD0iMTU4IiB5PSIxODAiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+5bey5a+85YWl55qE5Yy65Z+fIFRMUyDor4HkuabvvIzkvpsgTkxCIOe7iOatoiBUTFM8L3RleHQ+PC9nPjxnIGlkPSJyb3V0ZTUzIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+QW1hem9uIFJvdXRlIDUzIMK3IOengeacieWfnyAvIOWFs+iBlOS4pOS+pyBWUEPvvJtDTkFNRSDmjIflkJHlhaznvZEgTkxCPC90aXRsZT4KICAgIDxyZWN0IHg9Ijg2MCIgeT0iMTIwIiB3aWR0aD0iNDMwIiBoZWlnaHQ9Ijk0IiByeD0iNCIgZmlsbD0iI2ZmZjhlZCIgc3Ryb2tlPSIjYTg3ODMyIiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iODYwIiB5PSIxMjAiIHdpZHRoPSI1IiBoZWlnaHQ9Ijk0IiByeD0iMiIgZmlsbD0iI2E4NzgzMiIvPgogICAgPHRleHQgeD0iODc4IiB5PSIxNTEiIGZvbnQtc2l6ZT0iMjAiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QW1hem9uIFJvdXRlIDUzIMK3IOengeacieWfnzwvdGV4dD4KICAgIDx0ZXh0IHg9Ijg3OCIgeT0iMTgwIiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuWFs+iBlOS4pOS+pyBWUEPvvJtDTkFNRSDmjIflkJHlhaznvZEgTkxCPC90ZXh0PjwvZz48ZyBpZD0ibmxiIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+RWxhc3RpYyBMb2FkIEJhbGFuY2luZyDCtyBOTEIgLyDlhaznvZHjgIHlj4wgQVrvvJtUTFMgOjQ0MyDihpIgaW5ncmVzcyBUQ1AgOjgwODA8L3RpdGxlPgogICAgPHJlY3QgeD0iMTAwIiB5PSIzNjAiIHdpZHRoPSI1OTAiIGhlaWdodD0iOTAiIHJ4PSI0IiBmaWxsPSIjZmZmOGVkIiBzdHJva2U9IiNhODc4MzIiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSIxMDAiIHk9IjM2MCIgd2lkdGg9IjUiIGhlaWdodD0iOTAiIHJ4PSIyIiBmaWxsPSIjYTg3ODMyIi8+CiAgICA8dGV4dCB4PSIxMTgiIHk9IjM5MSIgZm9udC1zaXplPSIyMCIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij5FbGFzdGljIExvYWQgQmFsYW5jaW5nIMK3IE5MQjwvdGV4dD4KICAgIDx0ZXh0IHg9IjExOCIgeT0iNDIwIiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuWFrOe9keOAgeWPjCBBWu+8m1RMUyA6NDQzIOKGkiBpbmdyZXNzIFRDUCA6ODA4MDwvdGV4dD48L2c+PGcgaWQ9ImdwdS1lZ3Jlc3MiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5HUFUgVlBDIOWHuuermSDCtyBOQVQgR2F0ZXdheSAvIEVJUCAvIEludGVybmV0IEdhdGV3YXkgLyDlt7LlrZjlnKggTkFUIHgy77yb57uP5YWs572RIE5MQiDov5vlhaUgQ1BVIFZQQ++8jFNHIOmZkOWumuadpea6kDwvdGl0bGU+CiAgICA8cmVjdCB4PSIxMzkwIiB5PSIzNjAiIHdpZHRoPSI3NzAiIGhlaWdodD0iOTAiIHJ4PSI0IiBmaWxsPSIjZmZmOGVkIiBzdHJva2U9IiNhODc4MzIiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSIxMzkwIiB5PSIzNjAiIHdpZHRoPSI1IiBoZWlnaHQ9IjkwIiByeD0iMiIgZmlsbD0iI2E4NzgzMiIvPgogICAgPHRleHQgeD0iMTQwOCIgeT0iMzkxIiBmb250LXNpemU9IjIwIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkdQVSBWUEMg5Ye656uZIMK3IE5BVCBHYXRld2F5IC8gRUlQIC8gSW50ZXJuZXQgR2F0ZXdheTwvdGV4dD4KICAgIDx0ZXh0IHg9IjE0MDgiIHk9IjQyMCIgZm9udC1zaXplPSIxOCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij7lt7LlrZjlnKggTkFUIHgy77yb57uP5YWs572RIE5MQiDov5vlhaUgQ1BVIFZQQ++8jFNHIOmZkOWumuadpea6kDwvdGV4dD48L2c+PGcgaWQ9ImluZ3Jlc3MiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5BUEkgLyBJbmdyZXNzIHgzIC8gZ3B1LWZhdWx0LWFwaS1oYSAvIOmJtOadg+OAgeWFpemYn+OAgeWRveS7pCBBUEk8L3RpdGxlPgogICAgPHJlY3QgeD0iOTAiIHk9IjU1NSIgd2lkdGg9IjI4NSIgaGVpZ2h0PSIxMDgiIHJ4PSI0IiBmaWxsPSIjZWVmN2Y2IiBzdHJva2U9IiMzMzdjNzUiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSI5MCIgeT0iNTU1IiB3aWR0aD0iNSIgaGVpZ2h0PSIxMDgiIHJ4PSIyIiBmaWxsPSIjMzM3Yzc1Ii8+CiAgICA8dGV4dCB4PSIxMDgiIHk9IjU4NiIgZm9udC1zaXplPSIxOSIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij5BUEkgLyBJbmdyZXNzIHgzPC90ZXh0PgogICAgPHRleHQgeD0iMTA4IiB5PSI2MTUiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+Z3B1LWZhdWx0LWFwaS1oYTwvdGV4dD48dGV4dCB4PSIxMDgiIHk9IjY0MCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij7pibTmnYPjgIHlhaXpmJ/jgIHlkb3ku6QgQVBJPC90ZXh0PjwvZz48ZyBpZD0id29ya2VyIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+Q29udHJvbCBXb3JrZXIgeDYgLyDop4TliJkgLyDnvJbmjpIgLyDlt6XkvZzmtYHosIPluqYgLyDlkajmnJ/mo4Dmn6UgLyDpgJrnn6UgLyDlvZLmoaM8L3RpdGxlPgogICAgPHJlY3QgeD0iNDA1IiB5PSI1NTUiIHdpZHRoPSIzMDAiIGhlaWdodD0iMTA4IiByeD0iNCIgZmlsbD0iI2VlZjdmNiIgc3Ryb2tlPSIjMzM3Yzc1IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iNDA1IiB5PSI1NTUiIHdpZHRoPSI1IiBoZWlnaHQ9IjEwOCIgcng9IjIiIGZpbGw9IiMzMzdjNzUiLz4KICAgIDx0ZXh0IHg9IjQyMyIgeT0iNTg2IiBmb250LXNpemU9IjE5IiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkNvbnRyb2wgV29ya2VyIHg2PC90ZXh0PgogICAgPHRleHQgeD0iNDIzIiB5PSI2MTUiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+6KeE5YiZIC8g57yW5o6SIC8g5bel5L2c5rWB6LCD5bqmPC90ZXh0Pjx0ZXh0IHg9IjQyMyIgeT0iNjQwIiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuWRqOacn+ajgOafpSAvIOmAmuefpSAvIOW9kuahozwvdGV4dD48L2c+PGcgaWQ9ImpvYnMiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT7pg6jnvbIgSm9iIOS4juWHreaNrue7tOaKpCAvIFNjaGVtYSBlbnN1cmUgSm9i77ya6YOo572y5pe25oyJ6ZyA5omn6KGM77yb5LiN5piv5bi46am7IFBvZCAvIGF1cm9yYS1jcmVkZW50aWFsLXJlZnJlc2ggQ3JvbkpvYu+8muavj+Wwj+aXtuesrCAxNyDliIbpkp8gLyDku44gU2VjcmV0cyBNYW5hZ2VyIOivu+WPluWPo+S7pOW5tuabtOaWsCBDUFUgU2VjcmV0PC90aXRsZT4KICAgIDxyZWN0IHg9IjkwIiB5PSI3MjAiIHdpZHRoPSI2MTUiIGhlaWdodD0iMTMwIiByeD0iNCIgZmlsbD0iI2VlZjdmNiIgc3Ryb2tlPSIjMzM3Yzc1IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iOTAiIHk9IjcyMCIgd2lkdGg9IjUiIGhlaWdodD0iMTMwIiByeD0iMiIgZmlsbD0iIzMzN2M3NSIvPgogICAgPHRleHQgeD0iMTA4IiB5PSI3NTEiIGZvbnQtc2l6ZT0iMTkiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+6YOo572yIEpvYiDkuI7lh63mja7nu7TmiqQ8L3RleHQ+CiAgICA8dGV4dCB4PSIxMDgiIHk9Ijc4MCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5TY2hlbWEgZW5zdXJlIEpvYu+8mumDqOe9suaXtuaMiemcgOaJp+ihjO+8m+S4jeaYr+W4uOmpuyBQb2Q8L3RleHQ+PHRleHQgeD0iMTA4IiB5PSI4MDUiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+YXVyb3JhLWNyZWRlbnRpYWwtcmVmcmVzaCBDcm9uSm9i77ya5q+P5bCP5pe256ysIDE3IOWIhumSnzwvdGV4dD48dGV4dCB4PSIxMDgiIHk9IjgzMCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij7ku44gU2VjcmV0cyBNYW5hZ2VyIOivu+WPluWPo+S7pOW5tuabtOaWsCBDUFUgU2VjcmV0PC90ZXh0PjwvZz48ZyBpZD0iY3B1LWFkb3QiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5BV1MgRGlzdHJvIGZvciBPcGVuVGVsZW1ldHJ5IMK3IEFET1QgeDEgLyDph4fpm4bmjqfliLbpnaIgL21ldHJpY3PvvIxyZW1vdGVfd3JpdGUg5YiwIEFNUDwvdGl0bGU+CiAgICA8cmVjdCB4PSI5MCIgeT0iODg1IiB3aWR0aD0iNjE1IiBoZWlnaHQ9IjkwIiByeD0iNCIgZmlsbD0iI2VlZjdmNiIgc3Ryb2tlPSIjMzM3Yzc1IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iOTAiIHk9Ijg4NSIgd2lkdGg9IjUiIGhlaWdodD0iOTAiIHJ4PSIyIiBmaWxsPSIjMzM3Yzc1Ii8+CiAgICA8dGV4dCB4PSIxMDgiIHk9IjkxNiIgZm9udC1zaXplPSIyMCIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij5BV1MgRGlzdHJvIGZvciBPcGVuVGVsZW1ldHJ5IMK3IEFET1QgeDE8L3RleHQ+CiAgICA8dGV4dCB4PSIxMDgiIHk9Ijk0NSIgZm9udC1zaXplPSIxOCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij7ph4fpm4bmjqfliLbpnaIgL21ldHJpY3PvvIxyZW1vdGVfd3JpdGUg5YiwIEFNUDwvdGV4dD48L2c+PGcgaWQ9ImxvYWQtYmFsYW5jZXItY29udHJvbGxlciIgY2xhc3M9ImNvbXBvbmVudCI+PHRpdGxlPuW5s+WPsOWkjeeUqO+8mkFXUyBMb2FkIEJhbGFuY2VyIENvbnRyb2xsZXIgeDI8L3RpdGxlPgogICAgPHJlY3QgeD0iOTAiIHk9Ijk5MCIgd2lkdGg9IjYxNSIgaGVpZ2h0PSI0MiIgcng9IjQiIGZpbGw9IiNmZmZmZmYiIHN0cm9rZT0iIzhhOTY5ZiIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9IjkwIiB5PSI5OTAiIHdpZHRoPSI1IiBoZWlnaHQ9IjQyIiByeD0iMiIgZmlsbD0iIzhhOTY5ZiIvPgogICAgPHRleHQgeD0iMTA4IiB5PSIxMDIxIiBmb250LXNpemU9IjE5IiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuW5s+WPsOWkjeeUqO+8mkFXUyBMb2FkIEJhbGFuY2VyIENvbnRyb2xsZXIgeDI8L3RleHQ+CiAgICA8L2c+PGcgaWQ9ImF1cm9yYSIgY2xhc3M9ImNvbXBvbmVudCI+PHRpdGxlPkFtYXpvbiBBdXJvcmEgUG9zdGdyZVNRTCAxNi44IMK3IFNlcnZlcmxlc3MgdjIgLyBXcml0ZXIgeDEgKyBSZWFkZXIgeDHvvJvkuKQgQVrvvJvmr4/lrp7kvosgOOKAkzMyIEFDVSAvIOmYn+WIl+OAgWluY2lkZW5044CBd29ya2Zsb3fjgIHov5znq6/lkb3ku6TjgIHnp5/nuqbjgIHpgJrnn6Ugb3V0Ym94IC8g56eB5pyJ5pWw5o2u5bqT77ybS01TIOWKoOWvhu+8m+WHreaNrueUsSBSRFMgLyBTZWNyZXRzIE1hbmFnZXIg566h55CGPC90aXRsZT4KICAgIDxyZWN0IHg9IjkwIiB5PSIxMTIwIiB3aWR0aD0iNjE1IiBoZWlnaHQ9IjEzMCIgcng9IjQiIGZpbGw9IiNmZmY4ZWQiIHN0cm9rZT0iI2E4NzgzMiIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9IjkwIiB5PSIxMTIwIiB3aWR0aD0iNSIgaGVpZ2h0PSIxMzAiIHJ4PSIyIiBmaWxsPSIjYTg3ODMyIi8+CiAgICA8dGV4dCB4PSIxMDgiIHk9IjExNTEiIGZvbnQtc2l6ZT0iMTkiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QW1hem9uIEF1cm9yYSBQb3N0Z3JlU1FMIDE2LjggwrcgU2VydmVybGVzcyB2MjwvdGV4dD4KICAgIDx0ZXh0IHg9IjEwOCIgeT0iMTE4MCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5Xcml0ZXIgeDEgKyBSZWFkZXIgeDHvvJvkuKQgQVrvvJvmr4/lrp7kvosgOOKAkzMyIEFDVTwvdGV4dD48dGV4dCB4PSIxMDgiIHk9IjEyMDUiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+6Zif5YiX44CBaW5jaWRlbnTjgIF3b3JrZmxvd+OAgei/nOerr+WRveS7pOOAgeenn+e6puOAgemAmuefpSBvdXRib3g8L3RleHQ+PHRleHQgeD0iMTA4IiB5PSIxMjMwIiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuengeacieaVsOaNruW6k++8m0tNUyDliqDlr4bvvJvlh63mja7nlLEgUkRTIC8gU2VjcmV0cyBNYW5hZ2VyIOeuoeeQhjwvdGV4dD48L2c+PGcgaWQ9ImV4ZWN1dG9yIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+Q2x1c3RlciBFeGVjdXRvciB4MiAvIOacrOWcsCBLdWJlcm5ldGVzIC8gTm9kZSBBY3Rpb24gLyBIeXBlclBvZCBBZGFwdGVyIC8g5Li75YqoIGNsYWltIC8gcmVuZXcgLyByZXN1bHTvvJt3YXJtLXNwYXJlIOiDveWKm+WQr+eUqDwvdGl0bGU+CiAgICA8cmVjdCB4PSIxMzgwIiB5PSI1NTUiIHdpZHRoPSIzOTAiIGhlaWdodD0iMTAwIiByeD0iNCIgZmlsbD0iI2YwZjVmYiIgc3Ryb2tlPSIjNDc3NWE0IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iMTM4MCIgeT0iNTU1IiB3aWR0aD0iNSIgaGVpZ2h0PSIxMDAiIHJ4PSIyIiBmaWxsPSIjNDc3NWE0Ii8+CiAgICA8dGV4dCB4PSIxMzk4IiB5PSI1ODYiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+Q2x1c3RlciBFeGVjdXRvciB4MjwvdGV4dD4KICAgIDx0ZXh0IHg9IjEzOTgiIHk9IjYxNSIgZm9udC1zaXplPSIxNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij7mnKzlnLAgS3ViZXJuZXRlcyAvIE5vZGUgQWN0aW9uIC8gSHlwZXJQb2QgQWRhcHRlcjwvdGV4dD48dGV4dCB4PSIxMzk4IiB5PSI2NDAiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+5Li75YqoIGNsYWltIC8gcmVuZXcgLyByZXN1bHTvvJt3YXJtLXNwYXJlIOiDveWKm+WQr+eUqDwvdGV4dD48L2c+PGcgaWQ9IndhdGNoZXIiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5Db21wbGV0aW9uIFdhdGNoZXIgeDEgLyDmnKzpm4bnvqTorq3nu4Pop4LmtYvjgIHnu4jmgIHjgIHopobnm5blv4Pot7MgLyBXQUwg5LiO5rS76LeDIGF0dGVtcHQg54q25oCB5a2Y5LqOIENvbmZpZ01hcDwvdGl0bGU+CiAgICA8cmVjdCB4PSIxODAwIiB5PSI1NTUiIHdpZHRoPSIzNzAiIGhlaWdodD0iMTAwIiByeD0iNCIgZmlsbD0iI2YwZjVmYiIgc3Ryb2tlPSIjNDc3NWE0IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iMTgwMCIgeT0iNTU1IiB3aWR0aD0iNSIgaGVpZ2h0PSIxMDAiIHJ4PSIyIiBmaWxsPSIjNDc3NWE0Ii8+CiAgICA8dGV4dCB4PSIxODE4IiB5PSI1ODYiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+Q29tcGxldGlvbiBXYXRjaGVyIHgxPC90ZXh0PgogICAgPHRleHQgeD0iMTgxOCIgeT0iNjE1IiBmb250LXNpemU9IjE1IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuacrOmbhue+pOiuree7g+ingua1i+OAgee7iOaAgeOAgeimhuebluW/g+i3szwvdGV4dD48dGV4dCB4PSIxODE4IiB5PSI2NDAiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+V0FMIOS4jua0u+i3gyBhdHRlbXB0IOeKtuaAgeWtmOS6jiBDb25maWdNYXA8L3RleHQ+PC9nPjxnIGlkPSJyZXNvdXJjZS1jb2xsZWN0b3IiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5LdWJlcm5ldGVzIE5vZGUgUmVzb3VyY2UgQ29sbGVjdG9yIHgxIC8g6K+75Y+W5pys6ZuG576kIE5vZGUgLyBQb2Qg6LWE5rqQ54q25oCBIC8g6YCa6L+HIEhPU1RfVEVMRU1FVFJZIOmAmumBk+S4iuaKpTwvdGl0bGU+CiAgICA8cmVjdCB4PSIxMzgwIiB5PSI2ODUiIHdpZHRoPSIzOTAiIGhlaWdodD0iMTA1IiByeD0iNCIgZmlsbD0iI2YwZjVmYiIgc3Ryb2tlPSIjNDc3NWE0IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iMTM4MCIgeT0iNjg1IiB3aWR0aD0iNSIgaGVpZ2h0PSIxMDUiIHJ4PSIyIiBmaWxsPSIjNDc3NWE0Ii8+CiAgICA8dGV4dCB4PSIxMzk4IiB5PSI3MTYiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+S3ViZXJuZXRlcyBOb2RlIFJlc291cmNlIENvbGxlY3RvciB4MTwvdGV4dD4KICAgIDx0ZXh0IHg9IjEzOTgiIHk9Ijc0NSIgZm9udC1zaXplPSIxNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij7or7vlj5bmnKzpm4bnvqQgTm9kZSAvIFBvZCDotYTmupDnirbmgIE8L3RleHQ+PHRleHQgeD0iMTM5OCIgeT0iNzcwIiBmb250LXNpemU9IjE1IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPumAmui/hyBIT1NUX1RFTEVNRVRSWSDpgJrpgZPkuIrmiqU8L3RleHQ+PC9nPjxnIGlkPSJpbnN0YWxsZXIiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5Ob2RlIEluc3RhbGxlciBSZWNvbmNpbGVyIHgxIC8g5Y2P6LCD6IqC54K56L+Q6KGM5pe25a6J6KOF5LiO54mI5pys5pS25pWbIC8g5oyJ6ZyA5Yib5bu6IEluc3RhbGxlciBKb2LvvJvkuI3mmK8gU1NIIOaOp+WItuWZqDwvdGl0bGU+CiAgICA8cmVjdCB4PSIxODAwIiB5PSI2ODUiIHdpZHRoPSIzNzAiIGhlaWdodD0iMTA1IiByeD0iNCIgZmlsbD0iI2YwZjVmYiIgc3Ryb2tlPSIjNDc3NWE0IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iMTgwMCIgeT0iNjg1IiB3aWR0aD0iNSIgaGVpZ2h0PSIxMDUiIHJ4PSIyIiBmaWxsPSIjNDc3NWE0Ii8+CiAgICA8dGV4dCB4PSIxODE4IiB5PSI3MTYiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+Tm9kZSBJbnN0YWxsZXIgUmVjb25jaWxlciB4MTwvdGV4dD4KICAgIDx0ZXh0IHg9IjE4MTgiIHk9Ijc0NSIgZm9udC1zaXplPSIxNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij7ljY/osIPoioLngrnov5DooYzml7blronoo4XkuI7niYjmnKzmlLbmlZs8L3RleHQ+PHRleHQgeD0iMTgxOCIgeT0iNzcwIiBmb250LXNpemU9IjE1IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuaMiemcgOWIm+W7uiBJbnN0YWxsZXIgSm9i77yb5LiN5pivIFNTSCDmjqfliLblmag8L3RleHQ+PC9nPjxnIGlkPSJncHUtYWRvdCIgY2xhc3M9ImNvbXBvbmVudCI+PHRpdGxlPuaVsOaNrumdoiBBRE9UIHgxIC8g6YeH6ZuG57uE5Lu25oyH5qCHIOKGkiDlkIzkuIAgQU1QIHdvcmtzcGFjZTwvdGl0bGU+CiAgICA8cmVjdCB4PSIxMzgwIiB5PSI4MjAiIHdpZHRoPSIzOTAiIGhlaWdodD0iNzUiIHJ4PSI0IiBmaWxsPSIjZjBmNWZiIiBzdHJva2U9IiM0Nzc1YTQiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSIxMzgwIiB5PSI4MjAiIHdpZHRoPSI1IiBoZWlnaHQ9Ijc1IiByeD0iMiIgZmlsbD0iIzQ3NzVhNCIvPgogICAgPHRleHQgeD0iMTM5OCIgeT0iODUxIiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuaVsOaNrumdoiBBRE9UIHgxPC90ZXh0PgogICAgPHRleHQgeD0iMTM5OCIgeT0iODgwIiBmb250LXNpemU9IjE1IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPumHh+mbhue7hOS7tuaMh+aghyDihpIg5ZCM5LiAIEFNUCB3b3Jrc3BhY2U8L3RleHQ+PC9nPjxnIGlkPSJncHUtazhzIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+5pys6ZuG576kIEFtYXpvbiBFS1MgQVBJIC8gRXhlY3V0b3IgLyBXYXRjaGVyIC8gUmVjb25jaWxlciDkvb/nlKg8L3RpdGxlPgogICAgPHJlY3QgeD0iMTgwMCIgeT0iODIwIiB3aWR0aD0iMzcwIiBoZWlnaHQ9Ijc1IiByeD0iNCIgZmlsbD0iI2ZmZjhlZCIgc3Ryb2tlPSIjYTg3ODMyIiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iMTgwMCIgeT0iODIwIiB3aWR0aD0iNSIgaGVpZ2h0PSI3NSIgcng9IjIiIGZpbGw9IiNhODc4MzIiLz4KICAgIDx0ZXh0IHg9IjE4MTgiIHk9Ijg1MSIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij7mnKzpm4bnvqQgQW1hem9uIEVLUyBBUEk8L3RleHQ+CiAgICA8dGV4dCB4PSIxODE4IiB5PSI4ODAiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+RXhlY3V0b3IgLyBXYXRjaGVyIC8gUmVjb25jaWxlciDkvb/nlKg8L3RleHQ+PC9nPjxnIGlkPSJjb2xsZWN0b3JzIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+5q+P6IqC54K5IDQg5LiqIHN5c3RlbWQgQ29sbGVjdG9yIC8ga2VybmVs77yaWElEIC8g5YaF5qC45pel5b+XIC8gbWV0cmljc++8mkRDR00g5oyH5qCHICsgR1BVIGludmVudG9yeSAvIGhvc3TvvJrkuLvmnLogLyBHUFUgLyBFRkEg54q25oCBIC8gZmFicmljLW1hbmFnZXLvvJpTWElEIC8gRmFicmljIOaXpeW/lzwvdGl0bGU+CiAgICA8cmVjdCB4PSIxMzgwIiB5PSIxMDE1IiB3aWR0aD0iMzkwIiBoZWlnaHQ9IjE3MCIgcng9IjQiIGZpbGw9IiNmMGY1ZmIiIHN0cm9rZT0iIzQ3NzVhNCIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9IjEzODAiIHk9IjEwMTUiIHdpZHRoPSI1IiBoZWlnaHQ9IjE3MCIgcng9IjIiIGZpbGw9IiM0Nzc1YTQiLz4KICAgIDx0ZXh0IHg9IjEzOTgiIHk9IjEwNDYiIGZvbnQtc2l6ZT0iMTkiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+5q+P6IqC54K5IDQg5LiqIHN5c3RlbWQgQ29sbGVjdG9yPC90ZXh0PgogICAgPHRleHQgeD0iMTM5OCIgeT0iMTA3NSIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5rZXJuZWzvvJpYSUQgLyDlhoXmoLjml6Xlv5c8L3RleHQ+PHRleHQgeD0iMTM5OCIgeT0iMTEwMCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5tZXRyaWNz77yaRENHTSDmjIfmoIcgKyBHUFUgaW52ZW50b3J5PC90ZXh0Pjx0ZXh0IHg9IjEzOTgiIHk9IjExMjUiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+aG9zdO+8muS4u+acuiAvIEdQVSAvIEVGQSDnirbmgIE8L3RleHQ+PHRleHQgeD0iMTM5OCIgeT0iMTE1MCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5mYWJyaWMtbWFuYWdlcu+8mlNYSUQgLyBGYWJyaWMg5pel5b+XPC90ZXh0PjwvZz48ZyBpZD0iYWdlbnQiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT7mr4/oioLngrkgTm9kZSBBZ2VudCAvIOetvuWQjSBIVFRQUyA6OTA5Oe+8mzQvNCDlv4Pot7Pnp5/nuqbmnInmlYggLyDmnKzlnLAgU1FMaXRlIGxlZGdlcu+8muW5guetieS4juaJp+ihjOWuoeiuoTwvdGl0bGU+CiAgICA8cmVjdCB4PSIxODAwIiB5PSIxMDE1IiB3aWR0aD0iMzcwIiBoZWlnaHQ9IjEwMCIgcng9IjQiIGZpbGw9IiNmMGY1ZmIiIHN0cm9rZT0iIzQ3NzVhNCIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9IjE4MDAiIHk9IjEwMTUiIHdpZHRoPSI1IiBoZWlnaHQ9IjEwMCIgcng9IjIiIGZpbGw9IiM0Nzc1YTQiLz4KICAgIDx0ZXh0IHg9IjE4MTgiIHk9IjEwNDYiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+5q+P6IqC54K5IE5vZGUgQWdlbnQ8L3RleHQ+CiAgICA8dGV4dCB4PSIxODE4IiB5PSIxMDc1IiBmb250LXNpemU9IjE2IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuetvuWQjSBIVFRQUyA6OTA5Oe+8mzQvNCDlv4Pot7Pnp5/nuqbmnInmlYg8L3RleHQ+PHRleHQgeD0iMTgxOCIgeT0iMTEwMCIgZm9udC1zaXplPSIxNiIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij7mnKzlnLAgU1FMaXRlIGxlZGdlcu+8muW5guetieS4juaJp+ihjOWuoeiuoTwvdGV4dD48L2c+PGcgaWQ9Im5vZGUtbWFpbnRlbmFuY2UiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT7oioLngrnnu7TmiqTljZXlhYMgLyBHUFUgcGVyc2lzdGVuY2Ugb25lc2hvdO+8m+ivgeS5puajgOafpSB0aW1lcjwvdGl0bGU+CiAgICA8cmVjdCB4PSIxODAwIiB5PSIxMTM1IiB3aWR0aD0iMzcwIiBoZWlnaHQ9IjcwIiByeD0iNCIgZmlsbD0iI2YwZjVmYiIgc3Ryb2tlPSIjNDc3NWE0IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iMTgwMCIgeT0iMTEzNSIgd2lkdGg9IjUiIGhlaWdodD0iNzAiIHJ4PSIyIiBmaWxsPSIjNDc3NWE0Ii8+CiAgICA8dGV4dCB4PSIxODE4IiB5PSIxMTY2IiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuiKgueCuee7tOaKpOWNleWFgzwvdGV4dD4KICAgIDx0ZXh0IHg9IjE4MTgiIHk9IjExOTUiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+R1BVIHBlcnNpc3RlbmNlIG9uZXNob3TvvJvor4Hkuabmo4Dmn6UgdGltZXI8L3RleHQ+PC9nPjxnIGlkPSJkY2dtIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+RENHTSBFeHBvcnRlciBEYWVtb25TZXQgwrcgNC80IC8g5oyH5qCH55Sx5ZCM6IqC54K5IG1ldHJpY3MgY29sbGVjdG9yIOivu+WPljwvdGl0bGU+CiAgICA8cmVjdCB4PSIxMzgwIiB5PSIxMjAwIiB3aWR0aD0iMzkwIiBoZWlnaHQ9IjcwIiByeD0iNCIgZmlsbD0iI2YwZjVmYiIgc3Ryb2tlPSIjNDc3NWE0IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iMTM4MCIgeT0iMTIwMCIgd2lkdGg9IjUiIGhlaWdodD0iNzAiIHJ4PSIyIiBmaWxsPSIjNDc3NWE0Ii8+CiAgICA8dGV4dCB4PSIxMzk4IiB5PSIxMjMxIiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkRDR00gRXhwb3J0ZXIgRGFlbW9uU2V0IMK3IDQvNDwvdGV4dD4KICAgIDx0ZXh0IHg9IjEzOTgiIHk9IjEyNjAiIGZvbnQtc2l6ZT0iMTYiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+5oyH5qCH55Sx5ZCM6IqC54K5IG1ldHJpY3MgY29sbGVjdG9yIOivu+WPljwvdGV4dD48L2c+PGcgaWQ9ImdwdS1wbHVnaW5zIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+TlZJRElBIC8gRUZBIOaPkuS7tiDCtyDlkIQgNC80PC90aXRsZT4KICAgIDxyZWN0IHg9IjE4MDAiIHk9IjEyMjAiIHdpZHRoPSIzNzAiIGhlaWdodD0iNTAiIHJ4PSI0IiBmaWxsPSIjZmZmZmZmIiBzdHJva2U9IiM4YTk2OWYiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSIxODAwIiB5PSIxMjIwIiB3aWR0aD0iNSIgaGVpZ2h0PSI1MCIgcng9IjIiIGZpbGw9IiM4YTk2OWYiLz4KICAgIDx0ZXh0IHg9IjE4MTgiIHk9IjEyNTEiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+TlZJRElBIC8gRUZBIOaPkuS7tiDCtyDlkIQgNC80PC90ZXh0PgogICAgPC9nPjxnIGlkPSJhbXAiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5BbWF6b24gTWFuYWdlZCBTZXJ2aWNlIGZvciBQcm9tZXRoZXVzIC8gQU1QIHdvcmtzcGFjZe+8muaMh+aghyAvIOinhOWImSAvIEFsZXJ0bWFuYWdlcjwvdGl0bGU+CiAgICA8cmVjdCB4PSI4NDAiIHk9IjUxMCIgd2lkdGg9IjQwNSIgaGVpZ2h0PSI5NSIgcng9IjQiIGZpbGw9IiNmZmY4ZWQiIHN0cm9rZT0iI2E4NzgzMiIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9Ijg0MCIgeT0iNTEwIiB3aWR0aD0iNSIgaGVpZ2h0PSI5NSIgcng9IjIiIGZpbGw9IiNhODc4MzIiLz4KICAgIDx0ZXh0IHg9Ijg1OCIgeT0iNTQxIiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkFtYXpvbiBNYW5hZ2VkIFNlcnZpY2UgZm9yIFByb21ldGhldXM8L3RleHQ+CiAgICA8dGV4dCB4PSI4NTgiIHk9IjU3MCIgZm9udC1zaXplPSIxNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5BTVAgd29ya3NwYWNl77ya5oyH5qCHIC8g6KeE5YiZIC8gQWxlcnRtYW5hZ2VyPC90ZXh0PjwvZz48ZyBpZD0iZ3JhZmFuYSIgY2xhc3M9ImNvbXBvbmVudCI+PHRpdGxlPkFtYXpvbiBNYW5hZ2VkIEdyYWZhbmEgLyDlt7LlkK/nlKjvvJvmn6Xor6IgQU1Q77yM5L2/55SoIElBTSBJZGVudGl0eSBDZW50ZXIg55m75b2VPC90aXRsZT4KICAgIDxyZWN0IHg9Ijg0MCIgeT0iNjM1IiB3aWR0aD0iNDA1IiBoZWlnaHQ9Ijk1IiByeD0iNCIgZmlsbD0iI2ZmZjhlZCIgc3Ryb2tlPSIjYTg3ODMyIiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iODQwIiB5PSI2MzUiIHdpZHRoPSI1IiBoZWlnaHQ9Ijk1IiByeD0iMiIgZmlsbD0iI2E4NzgzMiIvPgogICAgPHRleHQgeD0iODU4IiB5PSI2NjYiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QW1hem9uIE1hbmFnZWQgR3JhZmFuYTwvdGV4dD4KICAgIDx0ZXh0IHg9Ijg1OCIgeT0iNjk1IiBmb250LXNpemU9IjE1IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuW3suWQr+eUqO+8m+afpeivoiBBTVDvvIzkvb/nlKggSUFNIElkZW50aXR5IENlbnRlciDnmbvlvZU8L3RleHQ+PC9nPjxnIGlkPSJzbnMiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5BbWF6b24gU05TIMK3IOermeeCuemAmuefpSAvIOaOp+WItumdoiBvdXRib3gg5LiOIEFNUCDlkYrorabmsYflhaXlkIzkuIDnq5nngrnpgJrpgZM8L3RpdGxlPgogICAgPHJlY3QgeD0iODQwIiB5PSI3NjAiIHdpZHRoPSI0MDUiIGhlaWdodD0iOTUiIHJ4PSI0IiBmaWxsPSIjZmZmOGVkIiBzdHJva2U9IiNhODc4MzIiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSI4NDAiIHk9Ijc2MCIgd2lkdGg9IjUiIGhlaWdodD0iOTUiIHJ4PSIyIiBmaWxsPSIjYTg3ODMyIi8+CiAgICA8dGV4dCB4PSI4NTgiIHk9Ijc5MSIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij5BbWF6b24gU05TIMK3IOermeeCuemAmuefpTwvdGV4dD4KICAgIDx0ZXh0IHg9Ijg1OCIgeT0iODIwIiBmb250LXNpemU9IjE1IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuaOp+WItumdoiBvdXRib3gg5LiOIEFNUCDlkYrorabmsYflhaXlkIzkuIDnq5nngrnpgJrpgZM8L3RleHQ+PC9nPjxnIGlkPSJjbG91ZHdhdGNoIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+QW1hem9uIENsb3VkV2F0Y2ggTG9ncyAvIOS4pOS+pyBFS1Mg5a6h6K6hIC8g5o6n5Yi26Z2i5pel5b+X77yb5bmz5Y+w5pel5b+XPC90aXRsZT4KICAgIDxyZWN0IHg9Ijg0MCIgeT0iODg1IiB3aWR0aD0iNDA1IiBoZWlnaHQ9Ijk1IiByeD0iNCIgZmlsbD0iI2ZmZjhlZCIgc3Ryb2tlPSIjYTg3ODMyIiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iODQwIiB5PSI4ODUiIHdpZHRoPSI1IiBoZWlnaHQ9Ijk1IiByeD0iMiIgZmlsbD0iI2E4NzgzMiIvPgogICAgPHRleHQgeD0iODU4IiB5PSI5MTYiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QW1hem9uIENsb3VkV2F0Y2ggTG9nczwvdGV4dD4KICAgIDx0ZXh0IHg9Ijg1OCIgeT0iOTQ1IiBmb250LXNpemU9IjE2IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuS4pOS+pyBFS1Mg5a6h6K6hIC8g5o6n5Yi26Z2i5pel5b+X77yb5bmz5Y+w5pel5b+XPC90ZXh0PjwvZz48ZyBpZD0iczMiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5BbWF6b24gUzMgLyDmjqfliLborrDlvZXlvZLmoaPlt7LphY3nva7vvJtIeXBlclBvZCDnlJ/lkb3lkajmnJ/ohJrmnKwgLyDlj6bmnInkuJrliqEgUzMgQ1NJIOaMgui9ve+8m+S4jeaYryBBdXJvcmEg5pu/5Luj5ZOBPC90aXRsZT4KICAgIDxyZWN0IHg9Ijg0MCIgeT0iMTAxMCIgd2lkdGg9IjQwNSIgaGVpZ2h0PSI5NSIgcng9IjQiIGZpbGw9IiNmZmY4ZWQiIHN0cm9rZT0iI2E4NzgzMiIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9Ijg0MCIgeT0iMTAxMCIgd2lkdGg9IjUiIGhlaWdodD0iOTUiIHJ4PSIyIiBmaWxsPSIjYTg3ODMyIi8+CiAgICA8dGV4dCB4PSI4NTgiIHk9IjEwNDEiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QW1hem9uIFMzPC90ZXh0PgogICAgPHRleHQgeD0iODU4IiB5PSIxMDcwIiBmb250LXNpemU9IjE1IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuaOp+WItuiusOW9leW9kuaho+W3sumFjee9ru+8m0h5cGVyUG9kIOeUn+WRveWRqOacn+iEmuacrDwvdGV4dD48dGV4dCB4PSI4NTgiIHk9IjEwOTUiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+5Y+m5pyJ5Lia5YqhIFMzIENTSSDmjILovb3vvJvkuI3mmK8gQXVyb3JhIOabv+S7o+WTgTwvdGV4dD48L2c+PGcgaWQ9ImVjciIgY2xhc3M9ImNvbXBvbmVudCI+PHRpdGxlPkFtYXpvbiBFQ1IgLyBSdW50aW1lIOmVnOWDj+S7k+W6kyArIEJ1aWxkS2l0IGNhY2hlIOS7k+W6kyAvIEt1YmVsZXQgLyBJbnN0YWxsZXIg5ouJ5Y+W5bey5Y+R5biD6ZWc5YOPPC90aXRsZT4KICAgIDxyZWN0IHg9Ijg0MCIgeT0iMTEzNSIgd2lkdGg9IjQwNSIgaGVpZ2h0PSI5NSIgcng9IjQiIGZpbGw9IiNmZmY4ZWQiIHN0cm9rZT0iI2E4NzgzMiIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9Ijg0MCIgeT0iMTEzNSIgd2lkdGg9IjUiIGhlaWdodD0iOTUiIHJ4PSIyIiBmaWxsPSIjYTg3ODMyIi8+CiAgICA8dGV4dCB4PSI4NTgiIHk9IjExNjYiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QW1hem9uIEVDUjwvdGV4dD4KICAgIDx0ZXh0IHg9Ijg1OCIgeT0iMTE5NSIgZm9udC1zaXplPSIxNSIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5SdW50aW1lIOmVnOWDj+S7k+W6kyArIEJ1aWxkS2l0IGNhY2hlIOS7k+W6kzwvdGV4dD48dGV4dCB4PSI4NTgiIHk9IjEyMjAiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+S3ViZWxldCAvIEluc3RhbGxlciDmi4nlj5blt7Llj5HluIPplZzlg488L3RleHQ+PC9nPjxnIGlkPSJzZWNyZXRzIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+QVdTIFNlY3JldHMgTWFuYWdlciAvIFJEUyDmiZjnrqHmlbDmja7lupPlj6Pku6QgKyDljLrln58gUEtJ77yb5LiN5piv5ZCRIEdQVSDliIblj5EgZXhlY3V0aW9uIHRva2VuPC90aXRsZT4KICAgIDxyZWN0IHg9IjYwIiB5PSIxNDEwIiB3aWR0aD0iNjkwIiBoZWlnaHQ9Ijk1IiByeD0iNCIgZmlsbD0iI2Y0ZjJmOCIgc3Ryb2tlPSIjODg3Nzk1IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iNjAiIHk9IjE0MTAiIHdpZHRoPSI1IiBoZWlnaHQ9Ijk1IiByeD0iMiIgZmlsbD0iIzg4Nzc5NSIvPgogICAgPHRleHQgeD0iNzgiIHk9IjE0NDEiIGZvbnQtc2l6ZT0iMTkiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QVdTIFNlY3JldHMgTWFuYWdlcjwvdGV4dD4KICAgIDx0ZXh0IHg9Ijc4IiB5PSIxNDcwIiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPlJEUyDmiZjnrqHmlbDmja7lupPlj6Pku6QgKyDljLrln58gUEtJ77yb5LiN5piv5ZCRIEdQVSDliIblj5EgZXhlY3V0aW9uIHRva2VuPC90ZXh0PjwvZz48ZyBpZD0ia21zIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+QVdTIEtNUyAvIEF1cm9yYSDnrYnmiZjnrqHliqDlr4bkvp3otZY8L3RpdGxlPgogICAgPHJlY3QgeD0iNzkwIiB5PSIxNDEwIiB3aWR0aD0iMzMwIiBoZWlnaHQ9Ijk1IiByeD0iNCIgZmlsbD0iI2Y0ZjJmOCIgc3Ryb2tlPSIjODg3Nzk1IiBzdHJva2Utd2lkdGg9IjEuNyIvPgogICAgPHJlY3QgeD0iNzkwIiB5PSIxNDEwIiB3aWR0aD0iNSIgaGVpZ2h0PSI5NSIgcng9IjIiIGZpbGw9IiM4ODc3OTUiLz4KICAgIDx0ZXh0IHg9IjgwOCIgeT0iMTQ0MSIgZm9udC1zaXplPSIxOSIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij5BV1MgS01TPC90ZXh0PgogICAgPHRleHQgeD0iODA4IiB5PSIxNDcwIiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkF1cm9yYSDnrYnmiZjnrqHliqDlr4bkvp3otZY8L3RleHQ+PC9nPjxnIGlkPSJpYW0iIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT5BV1MgSUFNIC8gU1RTIMK3IEVLUyBQb2QgSWRlbnRpdHkgLyBJUlNBIC8gQ1BVIOS9v+eUqCBQb2QgSWRlbnRpdHnvvJtHUFUgRXhlY3V0b3IgLyBBRE9UIOS9v+eUqCBJUlNBPC90aXRsZT4KICAgIDxyZWN0IHg9IjExNjAiIHk9IjE0MTAiIHdpZHRoPSI1MjAiIGhlaWdodD0iOTUiIHJ4PSI0IiBmaWxsPSIjZjRmMmY4IiBzdHJva2U9IiM4ODc3OTUiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSIxMTYwIiB5PSIxNDEwIiB3aWR0aD0iNSIgaGVpZ2h0PSI5NSIgcng9IjIiIGZpbGw9IiM4ODc3OTUiLz4KICAgIDx0ZXh0IHg9IjExNzgiIHk9IjE0NDEiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QVdTIElBTSAvIFNUUyDCtyBFS1MgUG9kIElkZW50aXR5IC8gSVJTQTwvdGV4dD4KICAgIDx0ZXh0IHg9IjExNzgiIHk9IjE0NzAiIGZvbnQtc2l6ZT0iMTUiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+Q1BVIOS9v+eUqCBQb2QgSWRlbnRpdHnvvJtHUFUgRXhlY3V0b3IgLyBBRE9UIOS9v+eUqCBJUlNBPC90ZXh0PjwvZz48ZyBpZD0ic3NvIiBjbGFzcz0iY29tcG9uZW50Ij48dGl0bGU+QVdTIElBTSBJZGVudGl0eSBDZW50ZXIgLyBNYW5hZ2VkIEdyYWZhbmEg55qEIEFXU19TU08g55m75b2VPC90aXRsZT4KICAgIDxyZWN0IHg9IjE3MjAiIHk9IjE0MTAiIHdpZHRoPSI0ODAiIGhlaWdodD0iOTUiIHJ4PSI0IiBmaWxsPSIjZjRmMmY4IiBzdHJva2U9IiM4ODc3OTUiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSIxNzIwIiB5PSIxNDEwIiB3aWR0aD0iNSIgaGVpZ2h0PSI5NSIgcng9IjIiIGZpbGw9IiM4ODc3OTUiLz4KICAgIDx0ZXh0IHg9IjE3MzgiIHk9IjE0NDEiIGZvbnQtc2l6ZT0iMTkiIGZvbnQtd2VpZ2h0PSI3MDAiIGZpbGw9IiMyNjM0M2MiIHRleHQtYW5jaG9yPSJzdGFydCI+QVdTIElBTSBJZGVudGl0eSBDZW50ZXI8L3RleHQ+CiAgICA8dGV4dCB4PSIxNzM4IiB5PSIxNDcwIiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPk1hbmFnZWQgR3JhZmFuYSDnmoQgQVdTX1NTTyDnmbvlvZU8L3RleHQ+PC9nPjxnIGlkPSJkZXBsb3ltZW50LWhvc3QiIGNsYXNzPSJjb21wb25lbnQiPjx0aXRsZT7pg6jnvbLkuI7ov5Dnu7Tnq68gwrcgZ3B1LWZhdWx0LWFkbWluIC8g5LuF5Zyo6YOo572y5py65omn6KGM77ya5Y+R5biDIC8g6aqM562+IC8gRUNSIOaOqOmAgSAvIEFXUyDkuI4gS3ViZXJuZXRlcyDotYTmupDnrqHnkIYgLyDkuI3mmK/luLjpqbvmjqfliLbpnaLnu4Tku7bvvJvkuLvlm77kuI3ljIXlkKvpqozmlLbms6jlhaXjgIHlvbHlrZAgbnZpZGlhLXNtaSDmiJYgZGVidWcg5bel5YW3IC8gU05TIOKGkiDov5Dnu7TmlLbku7bkurrvvJvov5Dnu7TkurrlkZjnu48gSWRlbnRpdHkgQ2VudGVyIOeZu+W9lSBNYW5hZ2VkIEdyYWZhbmE8L3RpdGxlPgogICAgPHJlY3QgeD0iNjAiIHk9IjE1NzAiIHdpZHRoPSIxMDM1IiBoZWlnaHQ9IjEzMiIgcng9IjQiIGZpbGw9IiNmZmZmZmYiIHN0cm9rZT0iIzhhOTY5ZiIgc3Ryb2tlLXdpZHRoPSIxLjciLz4KICAgIDxyZWN0IHg9IjYwIiB5PSIxNTcwIiB3aWR0aD0iNSIgaGVpZ2h0PSIxMzIiIHJ4PSIyIiBmaWxsPSIjOGE5NjlmIi8+CiAgICA8dGV4dCB4PSI3OCIgeT0iMTYwMSIgZm9udC1zaXplPSIyMCIgZm9udC13ZWlnaHQ9IjcwMCIgZmlsbD0iIzI2MzQzYyIgdGV4dC1hbmNob3I9InN0YXJ0Ij7pg6jnvbLkuI7ov5Dnu7Tnq68gwrcgZ3B1LWZhdWx0LWFkbWluPC90ZXh0PgogICAgPHRleHQgeD0iNzgiIHk9IjE2MzAiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+5LuF5Zyo6YOo572y5py65omn6KGM77ya5Y+R5biDIC8g6aqM562+IC8gRUNSIOaOqOmAgSAvIEFXUyDkuI4gS3ViZXJuZXRlcyDotYTmupDnrqHnkIY8L3RleHQ+PHRleHQgeD0iNzgiIHk9IjE2NTUiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+5LiN5piv5bi46am75o6n5Yi26Z2i57uE5Lu277yb5Li75Zu+5LiN5YyF5ZCr6aqM5pS25rOo5YWl44CB5b2x5a2QIG52aWRpYS1zbWkg5oiWIGRlYnVnIOW3peWFtzwvdGV4dD48dGV4dCB4PSI3OCIgeT0iMTY4MCIgZm9udC1zaXplPSIxOCIgZm9udC13ZWlnaHQ9IjQwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5TTlMg4oaSIOi/kOe7tOaUtuS7tuS6uu+8m+i/kOe7tOS6uuWRmOe7jyBJZGVudGl0eSBDZW50ZXIg55m75b2VIE1hbmFnZWQgR3JhZmFuYTwvdGV4dD48L2c+PGcgaWQ9Im5ldHdvcmstZm91bmRhdGlvbiIgY2xhc3M9ImNvbXBvbmVudCI+PHRpdGxlPuW3suehruiupOeahOe9kee7nOS4jueul+WKm+WfuuehgCAvIENQVSBOQVQgeDHvvJtHUFUgTkFUIHgy77yb5Lik5L6n5ZCEIDEg5LiqIFMzIEdhdGV3YXkgRW5kcG9pbnQgLyBDUFUgVlBDIOWPpuaciSBBTVAgLyBHcmFmYW5hIEludGVyZmFjZSBFbmRwb2ludO+8m1NH44CB6Lev55Sx6KGo5LiOIElHVyAvIEVDMiAvIEVCUyDmib/ovb0gSHlwZXJQb2Qg5bel5L2c6IqC54K577yb5Lik5L6n5a6e5L6L57uE5Z2H6YWN572uIDUwMCBHaUIgRUJTIOaVsOaNruWNtzwvdGl0bGU+CiAgICA8cmVjdCB4PSIxMTM1IiB5PSIxNTcwIiB3aWR0aD0iMTA2NSIgaGVpZ2h0PSIxMzIiIHJ4PSI0IiBmaWxsPSIjZmZmZmZmIiBzdHJva2U9IiM4YTk2OWYiIHN0cm9rZS13aWR0aD0iMS43Ii8+CiAgICA8cmVjdCB4PSIxMTM1IiB5PSIxNTcwIiB3aWR0aD0iNSIgaGVpZ2h0PSIxMzIiIHJ4PSIyIiBmaWxsPSIjOGE5NjlmIi8+CiAgICA8dGV4dCB4PSIxMTUzIiB5PSIxNjAxIiBmb250LXNpemU9IjIwIiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMjYzNDNjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPuW3suehruiupOeahOe9kee7nOS4jueul+WKm+WfuuehgDwvdGV4dD4KICAgIDx0ZXh0IHg9IjExNTMiIHk9IjE2MzAiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+Q1BVIE5BVCB4Me+8m0dQVSBOQVQgeDLvvJvkuKTkvqflkIQgMSDkuKogUzMgR2F0ZXdheSBFbmRwb2ludDwvdGV4dD48dGV4dCB4PSIxMTUzIiB5PSIxNjU1IiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iNDAwIiBmaWxsPSIjNDY1NzVmIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPkNQVSBWUEMg5Y+m5pyJIEFNUCAvIEdyYWZhbmEgSW50ZXJmYWNlIEVuZHBvaW5077ybU0fjgIHot6/nlLHooajkuI4gSUdXPC90ZXh0Pjx0ZXh0IHg9IjExNTMiIHk9IjE2ODAiIGZvbnQtc2l6ZT0iMTgiIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+RUMyIC8gRUJTIOaJv+i9vSBIeXBlclBvZCDlt6XkvZzoioLngrnvvJvkuKTkvqflrp7kvovnu4TlnYfphY3nva4gNTAwIEdpQiBFQlMg5pWw5o2u5Y23PC90ZXh0PjwvZz48ZyBjbGFzcz0iZWRnZS1sYWJlbCI+PHJlY3QgeD0iNzY1IiB5PSIyMjkiIHdpZHRoPSI5MjAiIGhlaWdodD0iMjciIHJ4PSIyIiBmaWxsPSIjZmZmZmZmIi8+CiAgICA8dGV4dCB4PSI3NzAiIHk9IjI0OSIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjUwMCIgZmlsbD0iIzQ2NTc1ZiIgdGV4dC1hbmNob3I9InN0YXJ0Ij5HUFUg5Li75Yqo5bu656uLIEhUVFBTIDo0NDPvvJrkuIrmiqUgLyDlv4Pot7MgLyDpooblj5bkuI7lm57miqXvvJvlkb3ku6Tmsr/or7fmsYLov57mjqXov5Tlm548L3RleHQ+PC9nPjxnIGNsYXNzPSJlZGdlLWxhYmVsIj48cmVjdCB4PSI1NTciIHk9IjEwNzAiIHdpZHRoPSIxNzAiIGhlaWdodD0iMjciIHJ4PSIyIiBmaWxsPSIjZmZmZmZmIi8+CiAgICA8dGV4dCB4PSI1NjIiIHk9IjEwOTAiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI1MDAiIGZpbGw9IiM0NjU3NWYiIHRleHQtYW5jaG9yPSJzdGFydCI+U1FMIC8gVExTIDo1NDMyPC90ZXh0PjwvZz48ZyBjbGFzcz0iZWRnZS1sYWJlbCI+PHJlY3QgeD0iNzQzIiB5PSI3MjUiIHdpZHRoPSI2NSIgaGVpZ2h0PSIyNyIgcng9IjIiIGZpbGw9IiNmZmZmZmYiLz4KICAgIDx0ZXh0IHg9Ijc0OCIgeT0iNzQ1IiBmb250LXNpemU9IjE3IiBmb250LXdlaWdodD0iNTAwIiBmaWxsPSIjOTg2ZDI3IiB0ZXh0LWFuY2hvcj0ic3RhcnQiPm91dGJveDwvdGV4dD48L2c+PGcgY2xhc3M9ImVkZ2UtbGFiZWwiPjxyZWN0IHg9IjcyMSIgeT0iMTAzMCIgd2lkdGg9IjExNiIgaGVpZ2h0PSIyNyIgcng9IjIiIGZpbGw9IiNmZmZmZmYiLz4KICAgIDx0ZXh0IHg9IjcyNiIgeT0iMTA1MCIgZm9udC1zaXplPSIxNyIgZm9udC13ZWlnaHQ9IjUwMCIgZmlsbD0iIzk4NmQyNyIgdGV4dC1hbmNob3I9InN0YXJ0Ij7mjqfliLborrDlvZXlvZLmoaM8L3RleHQ+PC9nPjxnIGNsYXNzPSJlZGdlLWxhYmVsIj48cmVjdCB4PSIxODAwIiB5PSI5MjYiIHdpZHRoPSIyNTAiIGhlaWdodD0iMjciIHJ4PSIyIiBmaWxsPSIjZmZmZmZmIi8+CiAgICA8dGV4dCB4PSIxODA1IiB5PSI5NDYiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI1MDAiIGZpbGw9IiM0NzZmYWEiIHRleHQtYW5jaG9yPSJzdGFydCI+562+5ZCNIE5vZGUgQWN0aW9uIDo5MDk5PC90ZXh0PjwvZz4KPHRleHQgeD0iMTg0MCIgeT0iOTkwIiBmb250LXNpemU9IjE4IiBmb250LXdlaWdodD0iNzAwIiBmaWxsPSIjMzQ1ZThjIiB0ZXh0LWFuY2hvcj0ic3RhcnQiPnA1ZW4uNDh4bGFyZ2UgwrcgTm9kZVJlY292ZXJ5ID0gTm9uZTwvdGV4dD4KPHRleHQgeD0iOTUiIHk9IjY5OCIgZm9udC1zaXplPSIxNiIgZm9udC13ZWlnaHQ9IjUwMCIgZmlsbD0iIzUyNjc3MCIgdGV4dC1hbmNob3I9InN0YXJ0Ij5BUEkg5YWl6Zif5LiOIFdvcmtlciDmtojotLnnu48gQXVyb3Jh77ybQ1BVIOS4jeaMgeaciSBHUFUga3ViZWNvbmZpZzwvdGV4dD4KPHRleHQgeD0iMzgiIHk9IjE3MzgiIGZvbnQtc2l6ZT0iMTciIGZvbnQtd2VpZ2h0PSI0MDAiIGZpbGw9IiM1MzY0NmUiIHRleHQtYW5jaG9yPSJzdGFydCI+6L+e57q/56qB5Ye65Lia5Yqh44CB5oyH5qCH5LiO5ZG95Luk6Lev5b6E77yb5pSv5pKR5pyN5Yqh55qE5raI6LS56ICF5Zyo5qGG5YaF5Y+K5LiL5pa55riF5Y2V5rOo5piO44CC5ZCv55SoIHdhcm0tc3BhcmUg5LiN562J5LqO5b2T5YmN5pyJ5Y+v55So5aSH55So5a656YeP44CCPC90ZXh0Pgo8L3N2Zz4=" alt="图 4-4 已启用部署架构与 AWS 服务（2026-09-20 核对快照）" /></p>
+<p>本快照的控制面为 3 台 <code>ml.c5.4xlarge</code>，运行 ingress 3
+副本、control-worker 6 副本和 ADOT 1 副本，并复用平台已有的 Load
+Balancer Controller。GPU 集群为 4 台 <code>ml.p5en.48xlarge</code>，运行
+Executor 2 副本，Watcher、Node Resource Collector、 Installer Reconciler
+和数据面 ADOT 各 1 副本；DCGM Exporter、NVIDIA/EFA 插件各 4/4， 四种节点
+Collector 为 active/enabled。GPU HyperPod 保持
+<code>NodeRecovery=None</code>。 受管训练 Pod
+按业务需要创建，本次查询运行数为 0；安装和 schema Job 按需执行，
+不按常驻组件计数。</p>
+<p>图中的区域 AWS 服务及支撑依赖：</p>
+<table>
+<thead>
+<tr class="header">
+<th>服务</th>
+<th>本次确认的用途与边界</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Amazon EKS / SageMaker HyperPod</td>
+<td>分别承载 CPU 控制面与 GPU 数据面；GPU 集群只由本地 Executor
+执行获准操作</td>
+</tr>
+<tr class="even">
+<td>Amazon EC2 / EBS</td>
+<td>HyperPod 工作节点与数据卷；不替代区域共享状态库</td>
+</tr>
+<tr class="odd">
+<td>Amazon VPC</td>
+<td>两侧独立 VPC、子网、SG、路由、IGW 和 NAT/EIP；两侧均有 S3 Gateway
+Endpoint，CPU 侧另有 AMP/Grafana Interface Endpoint</td>
+</tr>
+<tr class="even">
+<td>ELB Network Load Balancer / Route 53 / ACM</td>
+<td>双 AZ 公网 NLB：TLS 443 终止后转发 ingress TCP 8080；私有 Hosted
+Zone 关联两侧 VPC并指向 NLB；使用导入的 ACM 证书，不将其误称为 AWS
+Private CA</td>
+</tr>
+<tr class="odd">
+<td>Aurora PostgreSQL / RDS</td>
+<td>Serverless v2 PostgreSQL 16.8，跨 AZ 的 writer/reader 各 1
+个，每实例 8–32 ACU；保存队列、workflow、租约、回执与通知 outbox</td>
+</tr>
+<tr class="even">
+<td>Secrets Manager / KMS</td>
+<td>RDS 托管数据库口令、区域 PKI 与托管加密；凭据刷新 CronJob
+已部署，不向 GPU 下发 execution token</td>
+</tr>
+<tr class="odd">
+<td>IAM / STS</td>
+<td>CPU 组件使用 EKS Pod Identity，GPU Executor/ADOT 使用各自
+IRSA；按组件授权临时 AWS 凭据</td>
+</tr>
+<tr class="even">
+<td>Amazon Managed Service for Prometheus / Managed Grafana / IAM
+Identity Center</td>
+<td>两侧 ADOT 写入站点 AMP；Grafana 查询 AMP，通过 Identity Center
+登录</td>
+</tr>
+<tr class="odd">
+<td>Amazon CloudWatch Logs</td>
+<td>两侧 EKS 的控制面/审计及平台日志，与业务 AMP 指标路径区分</td>
+</tr>
+<tr class="even">
+<td>Amazon SNS</td>
+<td>当前站点通知通道；接收控制面 outbox 通知与 AMP 告警，本次有 1
+个已确认订阅</td>
+</tr>
+<tr class="odd">
+<td>Amazon S3 / ECR</td>
+<td>S3 控制记录归档已配置，HyperPod 生命周期脚本及现有业务 CSI 挂载使用
+S3；ECR 分为 Runtime 镜像与 BuildKit cache 仓库</td>
+</tr>
+</tbody>
+</table>
+<p>未画入常驻主图的项目包括：spool-worker（0
+副本）、NodeLogCollector（disabled）、 training-progress health
+monitor（关闭）、MPS DaemonSet（0），以及已退役、发布不再部署的 HMA
+watcher / SQS / Lambda / EventBridge 采集链、未选用的 SES
+通知和验收注入工具。 FSx CSI 驱动存在不等于本方案使用
+FSx；本次没有把它列为故障系统的存储依赖。 Node Agent 的诊断包 S3
+上传未确认启用，因此图中没有该上传箭头。 warm-spare Adapter
+已启用也不等于当前有可用备用容量。</p>
+<p>部署关系的代码依据为
+<code>src/gpu_fault_release/regional_deployment_inventory.py</code>、
+<code>src/gpu_fault_release/regional_release_rendering.py</code>、
+<code>src/gpu_fault/admin/resource_registry.py</code> 和
+<code>deploy/dataplane/</code>、<code>deploy/systemd/</code>。 SVG
+已作为本地文档图源纳入仓库，不依赖私有 S3
+链接；图中省略账号、ARN、私有地址和
+具体集群名称。后续更新须重新核对部署并同步图源与核对日期，不能用本快照替代当前
+<code>site</code>、配置模型或安装资源注册表。</p>
+<h3 data-number="1.4.4" id="42-节点数据面"><span class="header-section-number">1.4.4</span> 节点数据面</h3>
 <p>Collector
 按&quot;实现类型&quot;计数，不把同一进程产生的不同事件通道重复算成两个
-collector。当前代码实现 10 个 Collector 类。生产默认每个 GPU 节点运行 4
+collector。当前代码实现 8 个 Collector 类。生产默认每个 GPU 节点运行 4
 个 systemd collector，每个 GPU 集群另运行 1 个集群级 collector；NodeLog
 与 nvidia-smi fallback 默认禁用。</p>
 <table>
@@ -5217,23 +5531,13 @@ collector。当前代码实现 10 个 Collector 类。生产默认每个 GPU 节
 <td>训练 step/吞吐/loss/checkpoint</td>
 <td>未部署</td>
 </tr>
-<tr class="odd">
-<td><code>KubernetesHmaNodeCollector</code></td>
-<td>Kubernetes HMA Node 对象</td>
-<td><code>gpu-fault-hma-watcher</code> 为 0 副本</td>
-</tr>
-<tr class="even">
-<td><code>CloudWatchHmaCollector</code></td>
-<td>CloudWatch HMA 订阅事件</td>
-<td>当前集群未部署；可经 SQS bridge 接入</td>
-</tr>
 </tbody>
 </table>
 <p><strong>物理 producer 与逻辑通道必须分开表述。</strong>
 <code>GPU_INVENTORY</code> 与 <code>GPU_METRICS</code>
 不是两个进程，也不是集群级 collector：它们由每节点同一个
 <code>gpu-fault-metrics-collector</code> 产生。真正集群级的是
-<code>KubernetesNodeResourceCollector</code>。因此控制面状态、指标和邮件必须同时显示两者：</p>
+<code>KubernetesNodeResourceCollector</code>。因此控制面状态、指标和通知必须同时显示两者：</p>
 <pre class="text"><code>Collector: DCGM_METRICS_COLLECTOR
 Signal channel: GPU_INVENTORY</code></pre>
 <p>不得把 <code>GPU_INVENTORY</code> 或 <code>GPU_METRICS</code>
@@ -5257,10 +5561,8 @@ terminal</td>
 </tr>
 </tbody>
 </table>
-<p><code>gpu-fault-hma-watcher</code> 虽以 watcher 命名，领域职责属于
-<code>KubernetesHmaNodeCollector</code>，不计入 Completion Watcher
-数量。Cluster Action Executor 和 Node Installer Reconciler
-是执行器/控制器，也不计入 collector 或 watcher。</p>
+<p>两条可选 HMA 采集链路已退役。Cluster Action Executor 和 Node
+Installer Reconciler 是执行器/控制器，不计入 collector 或 watcher。</p>
 <p>NodeLog 首次启用默认从训练日志 EOF 开始，不回放历史文件尾部；journal
 规则已收紧， 不会把包含 <code>efa-plugin</code> 名称的普通 operator
 错误误判为 RDMA 故障。</p>
@@ -5277,13 +5579,16 @@ terminal</td>
 <tbody>
 <tr class="odd">
 <td>Node Action Agent</td>
-<td>执行签名的 client 检查和 GPU reset</td>
+<td>执行签名的节点动作：client 检查、证据与诊断采集、GPU
+服务静默与恢复、GPU reset / drain-P2P / 全 GPU+NVSwitch reset、Fabric
+Manager restart、EFA 驱动修复、collector outbox 维护</td>
 <td>GPU 集群</td>
-<td>是，默认关闭 reset</td>
+<td>是；安装器裸默认关闭 reset，区域生产安装显式开启</td>
 </tr>
 <tr class="even">
 <td>Cluster Action Executor</td>
-<td>领取并执行本集群 Kubernetes/Node Agent/HyperPod 动作</td>
+<td>领取并执行本集群 Kubernetes/Node Agent/provider（HyperPod 或
+EC2）动作</td>
 <td>GPU 集群，仅区域形态</td>
 <td>是</td>
 </tr>
@@ -5292,21 +5597,28 @@ terminal</td>
 <p>Node Agent 通过 HMAC、命令 TTL、目标节点、Agent generation、incident
 fencing token 和本地 SQLite ledger 防止伪造及重复操作。</p>
 <p>数据面固定配置
-<code>AWS_REGION</code>、<code>GPU_FAULT_CLUSTER_ID</code>、控制面 URL
-和该集群独立凭证。 Completion Watcher 只 watch 本集群，并把本集群 ID
-写入所有 observation 与 terminal event。Cluster Action Executor
-只能领取与自身认证身份和 <code>cluster_id</code> 匹配的动作。</p>
-<h3 data-number="1.4.4" id="421-无-amp-区域的-collector-静默告警"><span class="header-section-number">1.4.4</span> 无 AMP 区域的 collector
+<code>AWS_REGION</code>、<code>GPU_FAULT_CLUSTER_ID</code>、<code>GPU_FAULT_CLUSTER_PROVIDER</code>、
+<code>GPU_FAULT_NODE_SELECTOR</code>（该集群 GPU
+节点的标签选择器）、控制面 URL 和该集群独立凭证。 Completion Watcher 只
+watch 本集群，并把本集群 ID 写入所有 observation 与 terminal
+event。Cluster Action Executor 只能领取与自身认证身份和
+<code>cluster_id</code> 匹配的动作。</p>
+<h3 data-number="1.4.5" id="421-无-amp-区域的-collector-静默告警"><span class="header-section-number">1.4.5</span> 无 AMP 区域的 collector
 静默告警</h3>
-<p>AMP/ADOT 是可选增强，不是 collector 健康告警的必需组件。控制面每 60
-秒扫描 <strong>ACTIVE 且 heartbeat lease 仍有效</strong>的 Agent
-连续型通道；历史上仍标为 ACTIVE 但 lease
-已过期的节点不参与指标或邮件告警，避免已退役节点形成永久静默误报：</p>
+<p>AMP/ADOT 是可选增强，不是 collector 静默告警的必需组件。控制面默认以
+60 秒间隔 检查已持久化的采集状态，范围限于活跃集群中 <strong>ACTIVE 且
+heartbeat lease 仍有效</strong> 的 Agent 所需采集通道，显式
+disabled/masked 的采集服务不纳入；历史上仍标为 ACTIVE 但 lease
+已过期的节点不参与指标或通知告警，避免已退役节点形成永久静默误报。60
+秒是
+可配置的扫描间隔，不是失联阈值或告警送达时限；任务从本轮结束后计时，实际执行还受
+Worker、Store 和周期任务租约影响。</p>
+<p>没有成功记录，或距最近成功上报超过对应阈值时，生成通知。默认阈值如下：</p>
 <table>
 <thead>
 <tr class="header">
 <th>通道</th>
-<th style="text-align: right;">静默阈值</th>
+<th style="text-align: right;">默认静默阈值</th>
 </tr>
 </thead>
 <tbody>
@@ -5322,15 +5634,34 @@ fencing token 和本地 SQLite ledger 防止伪造及重复操作。</p>
 <td><code>HOST_TELEMETRY</code></td>
 <td style="text-align: right;">420 秒</td>
 </tr>
+<tr class="even">
+<td><code>NVIDIA_KERNEL</code> / <code>FABRIC_MANAGER_LOG</code> /
+<code>NODE_LOGS</code>（纳入检查时）</td>
+<td style="text-align: right;">900 秒</td>
+</tr>
 </tbody>
 </table>
-<p>超时后控制面直接写 <code>AdvisoryNotification</code> 并通过现有
-Notification Dispatcher/SES 邮件发送；同一节点、collector 和 channel
-每小时最多一封。没有 AMP 的 region 设置
-<code>GPU_FAULT_ENABLE_AMP=false</code>，安装脚本跳过 AMP/ADOT
-资源，内置邮件路径仍生效。 有 AMP 时，ADOT 同时把相同指标远程写入 AMP
+<p>控制面写入 <code>AdvisoryNotification</code>，由 Notification
+Dispatcher 经站点 SNS/SES 通道 投递，按集群、节点和通道的默认 3600
+秒时间桶去重（同一节点、collector 和 channel
+每小时最多一条）。扫描同时把每个所需通道的观测有效性记为
+<code>collector_observation_valid</code>（<code>HEALTHY</code>/<code>UNKNOWN</code>，按节点和通道，不是统一的节点状态）；
+对确实静默的通道，每节点每小时最多提交一次有界刷新请求，即非破坏性的观测类诊断
+workflow
+<code>TRIGGER_HEALTH_SNAPSHOT → VALIDATE_HOST</code>（让节点重新采一份新快照，不隔离、不停训练、
+不是恢复 workflow；仍在上报、只是报告采集错误的通道不触发刷新，见
+<code>src/gpu_fault/app/collector_silence.py::notify_silent_collectors</code>）。Agent
+心跳租约已过期的 节点不参与本扫描及对应指标统计，应另看 Fleet readiness
+和 stale-agent 指标；不能将 &quot;没有采集器静默告警&quot;等同于&quot;节点健康&quot;。</p>
+<p>未启用 AMP
+的兼容部署中（<code>GPU_FAULT_ENABLE_AMP=false</code>，安装脚本跳过
+AMP/ADOT 资源； <code>gpu-fault-admin</code> 部署恒写
+<code>true</code>，只有直接调用安装脚本的兼容路径可设
+<code>false</code>），
+内置通知路径仍然生效；<code>GPU_FAULT_ENABLE_AMP</code>
+不控制这条通知链。 有 AMP 时，ADOT 同时把相同指标远程写入 AMP
 并使用规则做第二层告警。</p>
-<h3 data-number="1.4.5" id="43-控制面服务"><span class="header-section-number">1.4.5</span> 控制面服务</h3>
+<h3 data-number="1.4.6" id="43-控制面服务"><span class="header-section-number">1.4.6</span> 控制面服务</h3>
 <p>控制面是同一份 wheel、同一个 FastAPI 应用，按
 <code>GPU_FAULT_SERVICE_ROLE</code> 拆成三种 角色进程：</p>
 <table>
@@ -5351,7 +5682,7 @@ Notification Dispatcher/SES 邮件发送；同一节点、collector 和 channel
 <td>3</td>
 <td>4</td>
 <td>8080</td>
-<td>只收请求、限流、入队，不跑后台线程</td>
+<td>收请求、限流、入队；运行注册表与指标维护，不启动业务消费线程</td>
 </tr>
 <tr class="even">
 <td><code>worker</code></td>
@@ -5371,10 +5702,15 @@ Notification Dispatcher/SES 邮件发送；同一节点、collector 和 channel
 </tr>
 </tbody>
 </table>
-<p>角色取值只允许
+<p>每个进程由 <code>gpu_fault.app.serve</code> 启动（uvicorn；每个
+worker 进程以 <code>SO_REUSEPORT</code>
+各自绑定服务端口），存活/就绪探针走&quot;服务端口 + 10&quot;的专用 liveness
+端口（8090/8091/8092）。 角色取值只允许
 <code>all</code>/<code>ingress</code>/<code>worker</code>/<code>spool-worker</code>，其余值启动失败；生产不用
-<code>all</code>。ingress 副本也会构造 Processor 对象（入队和 admission
-需要），但不启动任何 消费线程——<strong>&quot;ingress Pod
+<code>all</code>；<code>spool-worker</code> 还要求队列模式 Processor 与
+<code>GPU_FAULT_TELEMETRY_SPOOL=true</code>。 ingress 副本也会构造
+Processor 对象（入队和 admission 需要），但不启动任何
+消费线程——<strong>&quot;ingress Pod
 Ready&quot;不代表有人在消费队列</strong>，判读要看 worker 角色。</p>
 <p>worker 角色进程承载 API、策略服务和后台线程，按 §2
 的五个阶段归类如下：</p>
@@ -5389,13 +5725,16 @@ Ready&quot;不代表有人在消费队列</strong>，判读要看 worker 角色�
 <tbody>
 <tr class="odd">
 <td>① 采集接入</td>
-<td>HMA Normalizer</td>
-<td>规范化 Kubernetes Node、CloudWatch 与 kernel 信号</td>
+<td><code>NvidiaLogNormalizer</code></td>
+<td>规范化 Kernel 和 Fabric Manager
+日志，保留事件身份、时间与原始证据</td>
 </tr>
 <tr class="even">
 <td>② 关联</td>
 <td>Completion Service</td>
-<td>处理唯一训练终态，关联 marker 或发起快速诊断</td>
+<td>处理唯一训练终态：关联可信 marker；无 marker
+时在重启预算内单次重启；allocation 缺失或 Profile
+不能重启时取证并升级</td>
 </tr>
 <tr class="odd">
 <td>② 关联</td>
@@ -5440,7 +5779,7 @@ Ready&quot;不代表有人在消费队列</strong>，判读要看 worker 角色�
 <tr class="odd">
 <td>⑤ 验证与留痕</td>
 <td>Notification Service</td>
-<td>生成并可选发送 HyperPod advisory 邮件</td>
+<td>生成并经站点 SNS/SES 通道投递 advisory 通知</td>
 </tr>
 <tr class="even">
 <td>全阶段</td>
@@ -5451,12 +5790,30 @@ Ready&quot;不代表有人在消费队列</strong>，判读要看 worker 角色�
 </table>
 <p>区域形态下 Processor 是 <code>active-active</code>，不选举全局
 service leader：每个 worker 进程都运行 workflow dispatcher 和
-correlation finalizer（6 副本 × 4 进程 = 24 份）， 由 workflow execution
-lease/fencing 与 correlation lease 分别仲裁，因此没有 leadership
-线程也没有单点 leader。ingress 与 spool-worker 都不派发工作流。控制面
-不部署 GPU collector、DCGM exporter 或 GPU Node Agent。</p>
+correlation finalizer（6 副本 × 4 进程 = 24 份）。 队列消费由 lane
+租约仲裁，correlation 由 correlation lease 仲裁；dispatcher 每轮先取
+全站 <code>workflow-dispatch</code> 派发租约（默认 15 秒，按 tick
+续租），同一时刻只有持有者扫描
+并派发，其余进程跳过本轮，持有者退出后租约到期即由任一进程接管；单条
+workflow 的 执行再由 workflow execution lease/fencing
+仲裁。因此没有选举出的 leader，也没有固定 的单点。ingress 与
+spool-worker 都不派发工作流。控制面 不部署 GPU collector、DCGM exporter
+或 GPU Node Agent。</p>
+<p>Processor 的重试也不依赖进程内 sleep：回放得到 408/425/429/5xx
+且未超过 300 秒重试年龄时，请求写回 <code>not_before</code> 与递增后的
+<code>retry_count</code>，按 1 秒起步、 30 秒封顶的指数退避重新开放
+claim。默认 <code>STRICT</code> 请求在等待期间继续充当 lane
+barrier；只有显式标记为 <code>REORDERABLE</code> 的 latest-wins priority
+100 请求允许同 lane 后续安全请求越过。worker 优雅停机时主动释放已 claim
+但尚未开始执行的请求， 避免等待完整 request lease 才能接管。</p>
+<p>PostgreSQL completion 仍保持“一 cluster 一事务”。同一 batch 的不同
+cluster 可由
+<code>GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY</code>
+做有界并行；生产生成清单固定 为 1，保持串行提交。提高到 2/4
+前必须通过真实 PostgreSQL 的 deadlock、counter、 fencing
+与部分失败回归；该参数只优化数据库完成阶段，不是修复动作的集群级并发上限。</p>
 <p>线程与通道分级的模块级细节见详细设计 §2.18。</p>
-<h3 data-number="1.4.6" id="44-状态存储"><span class="header-section-number">1.4.6</span> 状态存储</h3>
+<h3 data-number="1.4.7" id="44-状态存储"><span class="header-section-number">1.4.7</span> 状态存储</h3>
 <table>
 <thead>
 <tr class="header">
@@ -5488,19 +5845,50 @@ lease/fencing 与 correlation lease 分别仲裁，因此没有 leadership
 </tr>
 </tbody>
 </table>
-<p>Aurora 上共 14 张 base table，分六族：schema 元数据 2、通用对象与关系
-2、热状态 专表 4、Processor 队列与 lane 2、Processor 计数 3、遥测 spool
-1。热状态四张专表 只在 <code>GPU_FAULT_POSTGRES_HOT_STATE_MODE</code> 为
+<p>Aurora 上 DDL 共声明 21 张 base
+table（不含运行期按集群或时间桶创建的分区），分七族： schema 元数据
+2、通用对象与关系 2、热状态专表 5（含 v23 按集群 LIST 分区的 GPU 指标
+latest 表）、Processor 队列与 lane 及 v23 分离载荷/回放表 4、Processor
+计数 3、 遥测 spool 1、控制状态专表及模式元数据 4（含 v23
+热表布局模式表）。热状态的四张原有专表 只在
+<code>GPU_FAULT_POSTGRES_HOT_STATE_MODE</code> 为
 <code>dual</code>/<code>dedicated</code> 时参与读写，生产为
-<code>dedicated</code>，启动时校验表存在且 backfill
-已完成，否则拒绝启动。</p>
-<p>Schema 由<strong>版本化迁移框架</strong>维护（6
-个版本，导入期校验注册表连续性与 DDL 源码 校验和），生产部署用
+<code>dedicated</code>（应用缺省同为
+<code>dedicated</code>），启动时校验表存在且 backfill
+已完成，否则拒绝启动。 v23 的分离式热表布局（Processor
+载荷/回放表、按集群分区的指标 latest 表）由写入方按
+数据库里的布局模式选择：缺省
+<code>inline</code>，运维在控制面滚动完成后用
+<code>gpu-fault-store-migrate --set-hot-layout detached</code>
+单向切换，读路径两种布局都读。</p>
+<p>workflow/remote_command 专表分别在 v16/v15 引入，已有数据库默认
+legacy，模式以数据库为 唯一事实源；全新数据库由 schema Job 以
+<code>--fresh-control-state-mode dedicated</code> 直接从 dedicated
+起步。受检 CLI 分阶段双写、回填校验与 dedicated 切换；新表将租约和大
+JSON 分开，续租只写未索引列。普通 deploy 不自动迁移或清理旧行，详见 <a href="components/postgres-state-tables.md">专表迁移实现</a>。</p>
+<p>Schema 由<strong>版本化迁移框架</strong>维护（当前 23 个版本；v7 增加
+Processor 延迟重试与 lane policy，v13 增加控制面评审索引与 autovacuum
+参数，v14 增加 <code>gpu_fault_objects</code> 的 wakeup NOTIFY
+触发器，v15/v16 引入 remote_command/workflow 专表及其 cutover fence，
+v17/v18 收紧控制状态双投影的条件删除与 legacy 复制重置，v19
+设置热表存储参数与 HOT 更新友好的索引，v20 把 Processor
+计数改为每写入后端一行，v21 改为边沿触发的语句级 唤醒，v22 增加按 key
+固定计划的唤醒探针，v23 分离 Processor 队列载荷与回放并按集群
+分区；导入期校验注册表连续性与 DDL 源码校验和），生产部署用
 <code>gpu-fault-store-migrate --ensure-schema</code> 单独执行，业务进程
 的 <code>GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT</code> 在所有生产清单里都是
 <code>false</code>——业务进程
 不自行建表。表结构、索引、触发器和迁移流程见详细设计 §3.1 与 §3.3。</p>
-<h3 data-number="1.4.7" id="45-runtime-adapter"><span class="header-section-number">1.4.7</span> Runtime Adapter</h3>
+<p>AWS 资源生命周期另有一套正式注册表：<code>InstallationResource</code>
+以 <code>installation_resource</code> kind 写入
+<code>gpu_fault_objects</code>，稳定键为
+<code>site_id + resource_key</code>。ARN/ID、Region/账号、ownership、delete
+policy 和依赖属于 不可变身份，状态可在
+<code>ACTIVE → DELETE_PENDING → DELETED/DETACHED/PRESERVED</code>
+之间推进。它与 Kubernetes 的 <code>gpu-fault-installed-resources</code>
+ConfigMap 分工不同： 前者负责 AWS
+资源的部署、接管、移除和全站卸载，后者负责集群内对象清理。</p>
+<h3 data-number="1.4.8" id="45-runtime-adapter"><span class="header-section-number">1.4.8</span> Runtime Adapter</h3>
 <p>核心逻辑不直接依赖运行环境。Runtime Profile
 通过以下模式声明能力：</p>
 <table>
@@ -5537,43 +5925,63 @@ lease/fencing 与 correlation lease 分别仲裁，因此没有 leadership
 <code>AUGMENT</code>，缺失 observed capability 时将
 <code>OWN/DELEGATE</code> 降为 <code>OBSERVE</code> 并生成 warning。</p>
 <p>能力模式与部署形态无关，但<strong>谁来执行</strong>取决于形态。区域形态下控制面必须把集群变更
-委派给目标集群执行器，以下三项在控制面侧启用会导致启动失败：</p>
+委派给目标集群执行器，以下两项在控制面侧启用会导致启动失败：</p>
 <ul>
 <li>in-cluster <code>KubernetesWorkflowAdapter</code>；</li>
-<li>HyperPod mutation adapter；</li>
-<li>in-cluster quick diagnostics。</li>
+<li>provider（HyperPod / EKS）mutation adapter。</li>
 </ul>
 <p>默认委派给远端执行的 owner 为
 <code>gpu-fault-kubernetes-adapter</code>、
-<code>gpu-fault-node-agent</code>、<code>gpu-fault-hyperpod-adapter</code>，可用
-<code>GPU_FAULT_REMOTE_EXECUTION_OWNERS</code>
-覆盖。模块级细节见详细设计 §2.11 与 §2.15–2.17。</p>
+<code>gpu-fault-node-agent</code>、<code>gpu-fault-hyperpod-adapter</code>、<code>gpu-fault-eks-adapter</code>，可用
+<code>GPU_FAULT_REMOTE_EXECUTION_OWNERS</code> 覆盖。每个 OWN/DELEGATE
+owner 必须由目标集群 executor 实际构造的 adapter 广告出来；站点 profile
+的 <code>nodeReboot</code> owner 服务不了集群 provider 时，join
+为该集群生成匹配的 profile 版本并要求审批（§2.4）。模块级细节见详细设计
+§2.11 与 §2.15–2.17。</p>
 <h2 data-number="1.5" id="5-核心业务流程"><span class="header-section-number">1.5</span> 核心业务流程</h2>
 <p>五条流程的分工：§5.1 是常态主线（信号驱动）；§5.2
 是另一个入口（训练进程先死， 再回查原因）；§5.3
 是前两者共用的执行门禁；§5.4 是一个把主线走完整的具体例子 （掉卡）；§5.5
 是区域形态下所有集群内动作的下发协议。</p>
 <h3 data-number="1.5.1" id="51-主动故障流程"><span class="header-section-number">1.5.1</span> 主动故障流程</h3>
-<p>信号从 collector 进来，经策略决策后落成一个受 fencing 保护的
-workflow， 再由 dispatcher 按 step 派发。</p>
+<p><a id="proactive-fault-overview"></a></p>
+<p>下图概括区域生产形态下的主动故障主流程：采集信号异步入队，控制面在后台判定；
+需要处置且满足执行条件时，由受 lease/fencing 保护的 workflow
+推进获准步骤。</p>
 <pre class="mermaid">sequenceDiagram
-    participant C as Collector
-    participant A as API
-    participant P as Policy
-    participant O as Orchestrator
-    participant S as Store
-    participant D as Dispatcher
-    participant X as Adapter
-
-    C-&gt;&gt;A: XID/SXID/metrics/log
-    A-&gt;&gt;P: 规范化并评估
-    P--&gt;&gt;A: decision + marker
-    A-&gt;&gt;O: 创建或复用 incident
-    O-&gt;&gt;S: 保存 workflow + fencing token
-    D-&gt;&gt;S: claim lease/epoch
-    D-&gt;&gt;X: 执行当前 step
-    X--&gt;&gt;D: SUCCEEDED/WAITING/FAILED
-    D-&gt;&gt;S: 原子更新 step、workflow、incident</pre>
+    autonumber
+    participant C as GPU 采集器
+    participant P as CPU 控制面
+    participant E as GPU 集群执行器
+    participant T as 执行目标
+    C-&gt;&gt;P: 上报故障信号
+    P--&gt;&gt;C: 202 已入队（不代表修复完成）
+    P-&gt;&gt;P: 后台判定、编排&lt;br/&gt;检查执行条件
+    loop 每个获准的远端步骤
+        E-&gt;&gt;P: 领取本集群命令
+        P--&gt;&gt;E: 返回授权命令
+        E-&gt;&gt;T: 校验后执行或查询
+        T--&gt;&gt;E: 动作结果或仍在处理
+        E-&gt;&gt;P: 回报成功 / 等待 / 失败
+        P-&gt;&gt;P: 保存进度&lt;br/&gt;推进 / 等待 / 转人工
+    end
+    P-&gt;&gt;P: 达到终态后&lt;br/&gt;保存结果并通知</pre>
+<p>“CPU 控制面”合并了 API、规则、编排和调度角色；“执行目标”按步骤对应
+Kubernetes、 Node Agent 或
+HyperPod，并非每步都调用三者。图中省略控制面本地的取证、样本验证等步骤。</p>
+<ul>
+<li><strong>受理不等于处置完成</strong>：<code>202</code>
+只确认入队，后台消费无需等待客户端收到回执。
+无需动作、复用已有处置、等待证据或 <code>BLOCKED</code>
+时，不会直接走完整条修复流程。</li>
+<li><strong>集群执行器主动拉取</strong>：CPU 不直接操作 GPU 节点；本地
+Adapter 经校验后执行， Node Agent
+请求必须签名。安全处置模式仅运行获准的安全步骤。</li>
+<li><strong>进度与收尾分开提交</strong>：普通进度通常只保存
+workflow；终态按 incident 当前归属 决定是否联合提交，通知随后处理。单条
+workflow 终态不一定代表后继处置链已结束。</li>
+</ul>
+<p>参与者与部署组件的对应关系、完整分支和存储边界见 <a href="#proactive-fault-sequence">详细设计 §1.3</a>。</p>
 <p>workflow
 的基本安全顺序如下——<strong>证据在前、破坏在后、验证通过才恢复</strong>：</p>
 <pre class="mermaid">flowchart LR
@@ -5584,10 +5992,28 @@ workflow， 再由 dispatcher 按 step 派发。</p>
     V --&gt; R[&quot;RESTORE_SCHEDULING&lt;br/&gt;+ RESTART_WORKLOAD&quot;]</pre>
 <p>实际步骤由官方动作、证据和 Runtime Profile 决定，不是固定模板。</p>
 <h3 data-number="1.5.2" id="52-被动训练终态流程"><span class="header-section-number">1.5.2</span> 被动训练终态流程</h3>
+<p><a id="passive-terminal-overview"></a></p>
 <p>Completion Watcher 只观察带 <code>gpu-fault.io/managed=true</code>
 的训练 Pod，持续保存 rank、 Pod、node、GPU UUID 和 workload 映射。</p>
+<pre class="mermaid">flowchart TD
+    A[&quot;Watcher 观察受管训练&lt;br/&gt;记录 rank、节点和 GPU&quot;] --&gt; B[&quot;满足终态条件&lt;br/&gt;上报唯一训练终态&quot;]
+    A -. &quot;发现失败&quot; .-&gt; C[&quot;保全证据&lt;br/&gt;停止整个训练 attempt&quot;]
+    C -. &quot;异步停止，不阻塞上报&quot; .-&gt; B
+    B --&gt; D{&quot;需要被动恢复？&quot;}
+    D -- &quot;正常成功 / 用户停止&lt;br/&gt;或其他 incident 发起终止&quot; --&gt; X[&quot;不新建恢复&lt;br/&gt;结束或沿用原流程&quot;]
+    D -- &quot;失败 / 超时&lt;br/&gt;或本系统遏制造成的停止&quot; --&gt; E{&quot;有可用故障标记？&quot;}
+    E -- &quot;有&quot; --&gt; F[&quot;复用已有恢复流程&lt;br/&gt;或按标记生成处置计划&quot;]
+    E -- &quot;无&quot; --&gt; H{&quot;有分配记录&lt;br/&gt;且 Profile 允许重启？&quot;}
+    H -- &quot;否&quot; --&gt; I[&quot;取证并通知运维&lt;br/&gt;不自动重启&quot;]
+    H -- &quot;是&quot; --&gt; J[&quot;生成单次训练重启计划&quot;]
+    F --&gt; G[&quot;执行安全门禁与处置&lt;br/&gt;校验重启预算和修复状态&quot;]
+    J --&gt; G
+    G --&gt; L[&quot;回写处置结果&lt;br/&gt;若重启，创建新 attempt&quot;]</pre>
+<p>图中虚线是异步遏制路径，不是终态上报的同步前置条件。完整分支见 <a href="#passive-failure-containment">发现失败与遏制</a>、 <a href="#passive-terminal-decision">终态决策与恢复</a>。</p>
 <ol type="1">
-<li>首个关键 rank 非零退出时产生一次 FailureDetected。</li>
+<li>首次确认关键 rank 非零退出，或 workload adapter 报告
+<code>FAILED</code> 时，产生一次 FailureDetected；主动删除或其他
+incident 发起的终止不按普通训练失败递归处理。</li>
 <li>Watcher 将事件提交到控制面；控制面幂等创建
 <code>FREEZE_EVIDENCE -&gt; STOP_WORKLOADS</code> containment workflow。
 incident、workflow 和 event 索引在同一存储事务中创建；PostgreSQL 按
@@ -5597,13 +6023,17 @@ workflow，不能覆盖已推进的状态。</li>
 <li>该 workflow 通过统一 dispatcher、lease、fencing 和 Kubernetes
 adapter 停止整个分布式 attempt，Watcher 正常路径不直接修改
 workload。</li>
-<li>只有控制面连续不可达超过配置超时，Watcher 才执行带
+<li>只有 failure 事件持续未被控制面受理超过配置超时，Watcher 才执行带
 <code>passive-stop-mode=emergency-fallback</code> 标记的紧急
 suspend。</li>
-<li>全部关键 rank 结束，或超过 cleanup timeout，产生唯一
-TerminalEvent。</li>
+<li>全部关键 rank 结束，或失败后的 cleanup timeout
+到期等终态条件满足时， 产生唯一 TerminalEvent；投递失败由 outbox
+重试。</li>
+<li>终态可以先于 FailureDetected 到达。满足条件时由 Completion Service
+幂等补建 遏制，再立即作出决策；恢复 workflow
+的前驱依赖保证执行顺序，终态上报不等待停训练完成。</li>
 </ol>
-<p>拿到唯一终态后，怎么定因决定了后续动作，四种情况互斥：</p>
+<p>拿到唯一终态后，先区分停止来源，再决定后续动作：</p>
 <table>
 <thead>
 <tr class="header">
@@ -5613,26 +6043,55 @@ TerminalEvent。</li>
 </thead>
 <tbody>
 <tr class="odd">
-<td>成功，或用户主动停止</td>
-<td>不自动恢复</td>
+<td>其他 incident 发起终止，或显式 initiator 无法确认</td>
+<td><code>NO_ACTION</code>，不递归创建恢复</td>
 </tr>
 <tr class="even">
-<td>失败，且 allocation 范围内有可信且未过期的 marker</td>
-<td>优先关联该 marker 定因</td>
+<td>正常成功，或用户主动停止，且无本 attempt 被动遏制</td>
+<td>不自动恢复，并撤回该 job 的相关重启 workflow</td>
 </tr>
 <tr class="odd">
-<td>失败，无 marker 但 allocation 完整</td>
-<td>发起快速诊断</td>
+<td>本 attempt 被动遏制造成的 <code>STOPPED</code></td>
+<td>继续后续恢复判定；即使 initiator
+标注丢失，也查询已存的被动遏制记录</td>
 </tr>
 <tr class="even">
-<td>失败，且 allocation 缺失</td>
-<td>形成隔离计划；不猜测节点，不自动重启训练</td>
+<td>需要恢复，且 allocation 范围内有可信且未过期的可用 marker</td>
+<td>选择动作优先级最高者；已有 workflow
+负责重启时不重复恢复，否则等待对应 incident 恢复，或按 marker
+生成处置计划</td>
+</tr>
+<tr class="odd">
+<td>需要恢复，无可用 marker 但 allocation 存在</td>
+<td>不做硬件定因，按无硬件证据路径在同一 allocation 上规划一次
+<code>RESTART_WORKLOAD</code>；执行仍受同一 job
+重启预算和遏制结果门禁约束，Profile 不能重启时改为取证并升级运维</td>
+</tr>
+<tr class="even">
+<td>需要恢复，且 allocation 缺失</td>
+<td>取证并升级人工（<code>allocation-missing:INCONCLUSIVE</code>）；不猜测节点，不自动重启训练，也不据此虚构节点隔离动作</td>
 </tr>
 </tbody>
 </table>
+<p>“正常成功”还要求退出证据不指向失败；具体判定以
+<code>TerminalEvent.is_failure</code> 为准。 “allocation
+存在”只表示列表非空，不等于完整性已经验证。“可用 marker”的过滤规则见 <a href="#passive-terminal-decision">详细决策</a>。计划创建不等于允许重启：
+执行期仍检查前驱、授权、incident
+前提和预算；预算耗尽只禁止重启，已规划的其余 节点修复步骤继续，最后
+workflow 以 <code>FAILED</code> 收尾。</p>
+<p>对应 <code>PlanBuilder.without_hardware_evidence</code> 的触发标识为
+<code>no-hardware-evidence:RESTART</code> 或
+<code>no-hardware-evidence:ESCALATE</code>。没有可信硬件证据
+不等于已证明硬件健康；当前不存在可开启的 in-cluster quick diagnostics
+路径。</p>
 <h3 data-number="1.5.3" id="53-工作流执行门禁"><span class="header-section-number">1.5.3</span> 工作流执行门禁</h3>
 <p>工作流状态为
-<code>PENDING</code>/<code>SAFETY_PENDING</code>/<code>BLOCKED</code>/<code>RUNNING</code>/<code>SUCCEEDED</code>/<code>FAILED</code>。
+<code>PENDING</code>/<code>SAFETY_PENDING</code>/<code>BLOCKED</code>/<code>RUNNING</code>/<code>SUCCEEDED</code>/<code>FAILED</code>/
+<code>SUPERSEDED</code>；后三者与 <code>BLOCKED</code> 都不会再被
+dispatcher 执行。<code>SUPERSEDED</code> 表示该记录 已被后继 workflow
+接替并记下 <code>preempted_by_workflow_id</code>：dispatcher
+撤销被抢占或退役的 旧世代时写入，<code>workflow-reconcile</code>
+在后继已恢复目标后收尾时也写入。
 每次执行必须同时满足下列条件，任一不满足即不推进（fail-closed，不是跳过）：</p>
 <ul>
 <li>operation 在控制面 allowlist 中；</li>
@@ -5712,15 +6171,26 @@ GPU/EFA 期望值，否则节点安装失败。</p>
 <code>gpu_inventory_mismatch</code> 或
 <code>efa_inventory_mismatch</code>。控制面创建 CRITICAL
 finding，发送固定 <code>hardware-inventory-mismatch-zh-v1</code>
-邮件，并执行：</p>
+通知。GPU 掉卡与 EFA PCI 设备缺失
+（<code>failure_mode=PCI_DEVICE_MISSING</code>）执行节点重启链：</p>
 <pre class="text"><code>FREEZE_EVIDENCE -&gt; MARK_UNSCHEDULABLE -&gt; QUARANTINE
--&gt; [STOP_WORKLOADS] -&gt; RESTART_NODE -&gt; VALIDATE_GPU
+-&gt; [STOP_WORKLOADS] -&gt; RESTART_NODE -&gt; VALIDATE_GPU -&gt; VALIDATE_HOST
 -&gt; VALIDATE_FABRIC -&gt; RESTORE_SCHEDULING -&gt; [RESTART_WORKLOAD]</code></pre>
+<p>EFA 的其他失败模式按
+<code>src/gpu_fault/host_health.py::efa_inventory_rule</code> 分层：
+<code>DRIVER_UNBOUND</code>（PCI 设备在、驱动未绑定）先走
+<code>REMEDIATE_EFA_DRIVER → RESTART_EFA_DEVICE_PLUGIN → TRIGGER_HEALTH_SNAPSHOT → VALIDATE_FABRIC</code>，<code>LINK_INACTIVE</code>
+（端口未 ACTIVE/LinkUp）、<code>EXCESS_DEVICE</code>
+与未知模式先走诊断；驱动修复或 <code>LINK_INACTIVE</code>
+诊断后验证仍失败才升级到节点重启。配置的期望 GPU
+数与实例类型矛盾属于配置错误， 只通知复核，不派生重启或隔离。</p>
 <p>验证必须使用节点 reboot 完成后产生的<strong>新</strong>
 HostTelemetry，同时重新比较 GPU ACTIVE、EFA ACTIVE 与各自 expected
 数量，重启前缓存样本不能通过。任一仍掉卡时 workflow 失败并升级为
 <code>REPLACE_NODE</code>；替换只能选择同规格健康 warm spare，
-替换后再次验证。spare 不足时保持 blocked。</p>
+替换后再次验证。没有足够的健康热备时 <code>REPLACE_NODE</code>
+fail-closed（<code>FAILED</code>），
+升级为人工处理，故障节点保持隔离。</p>
 <h3 data-number="1.5.5" id="55-跨边界动作下发"><span class="header-section-number">1.5.5</span> 跨边界动作下发</h3>
 <p>区域形态下控制面不直接操作 GPU 集群。每个需要在集群内生效的 workflow
 step 走 pull/claim/lease/result 协议：</p>
@@ -5756,8 +6226,15 @@ allowlist 内、 恰好有一个本地 Adapter 支持该 step。任一不满足�
 <code>WAITING</code>/<code>SUCCEEDED</code>/<code>FAILED</code>。lease
 过期、 fencing token 变化或命令已终态时，旧 executor 的写入被拒绝。</li>
 </ol>
-<p>重复回执不产生第二次副作用，包括不产生第二封邮件。协议的模块级设计见详细设计
-§2.16 与 §2.17；边界与不变量见 §4.1。</p>
+<p>重复回执不产生第二次副作用，包括不产生第二次通知投递。单节点 GPU
+reset 链中相邻的
+节点侧步骤（<code>QUIESCE_GPU_SERVICES</code>、<code>VERIFY_NO_GPU_CLIENTS</code>、<code>RESET_GPU</code>、
+<code>RESTORE_GPU_SERVICES</code>、<code>TRIGGER_HEALTH_SNAPSHOT</code>）可合成一条复合命令，executor
+按原来 逐步的上下文回放，Node Agent
+协议不变（<code>src/gpu_fault/remote_step_batching.py</code>，
+<code>GPU_FAULT_REMOTE_STEP_BATCHING</code> 默认开启，并要求 executor
+协议版本支持）。 协议的模块级设计见详细设计 §2.16 与
+§2.17；边界与不变量见 §4.1。</p>
 <p><strong>实现成熟度：代码已实现，真实环境上线门禁未全部通过（见
 §10）。</strong></p>
 <h2 data-number="1.6" id="6-数据与接口概要"><span class="header-section-number">1.6</span> 数据与接口概要</h2>
@@ -5810,7 +6287,8 @@ inventory/digest</td>
 <tr class="even">
 <td>RegionalClusterRegistration</td>
 <td><code>cluster_id</code></td>
-<td>集群注册、token 摘要与 namespace allowlist</td>
+<td>集群注册、token 摘要（轮换期另含 retiring 摘要与过期时刻）与
+namespace allowlist</td>
 </tr>
 <tr class="odd">
 <td>RemoteActionCommand</td>
@@ -5820,7 +6298,13 @@ inventory/digest</td>
 <tr class="even">
 <td>HyperPodSubmissionRecord</td>
 <td>幂等键</td>
-<td>provider 提交意图与结果，跨进程重启存活</td>
+<td>provider（HyperPod reboot 或 eks-managed 的 EC2
+reboot）提交意图与结果，跨进程重启存活</td>
+</tr>
+<tr class="odd">
+<td>InstallationResource</td>
+<td><code>site_id + resource_key</code></td>
+<td>AWS 资源归属、删除策略、依赖与卸载状态；身份不可变，状态可推进</td>
 </tr>
 </tbody>
 </table>
@@ -5838,54 +6322,82 @@ inventory/digest</td>
 decision 当前均使用 <code>cluster_id + attempt_id</code>，对应查询为
 <code>GET /v1/attempts/{cluster_id}/{attempt_id}/decision</code>。</p>
 <h3 data-number="1.6.3" id="63-路由分组"><span class="header-section-number">1.6.3</span> 路由分组</h3>
-<p>区域形态下真实注册 81 条路由，按功能分为：</p>
+<p><code>create_app()</code> 当前始终挂载 93
+条应用路由；区域生产形态会在其上安装五桶默认拒绝
+中间件。按功能分为：</p>
 <ul>
 <li><code>/v1/gpu-events/*</code>：XID、分布式 XID、SXID
 与关联进度回查。</li>
 <li><code>/v1/collector-events/*</code>：kernel、Fabric Manager、GPU
 inventory、GPU 指标、 host 遥测、节点日志、采集器自检，共 7
 条采集通道。</li>
-<li><code>/v1/provider-events/*</code>：HyperPod HMA 的
-CloudWatch、节点、K8s Node、能力发现。</li>
-<li><code>/v1/attempts/*</code>、<code>/v1/workload-observations</code>、<code>/v1/training-progress</code>、
-<code>/v1/triage-results</code>：训练观察、终态与节点自检结论。</li>
-<li><code>/v1/incidents/*</code>、<code>/v1/workflows/*</code>、<code>/v1/recovery-plans/*</code>：故障、执行与计划。</li>
+<li><code>/v1/attempts/*</code>、<code>/v1/workload-observations</code>、<code>/v1/training-progress</code>：
+训练观察、终态与失败上报。</li>
+<li><code>/v1/incidents/*</code>、<code>/v1/workflows/*</code>、<code>/v1/recovery-plans/*</code>：故障、执行与计划；
+<code>/v1/markers</code>、<code>/v1/restart-budgets/*</code>：可信健康标记写入与重启预算查询。</li>
 <li><code>/v1/fleet/*</code>：Agent、readiness、滚动发布与
 barrier。</li>
+<li><code>/v1/regional/registry/*</code>：不可变 revision
+发布、收敛状态与单调 rollback。收敛以发布时
+活跃的控制面成员集合为准：所有当前活跃进程，包括发布后加入者，必须以有效持久心跳
+ACK 同一 generation/摘要；required
+记录缺失、未来心跳或全体失联均不能算收敛，而超过
+<code>GPU_FAULT_REGISTRY_STALE_SECONDS</code>（生产 90
+s）无心跳的成员视为离开 fleet，不阻塞收敛。</li>
 <li><code>/v1/evidence/*</code>、<code>/v1/collector-status/*</code>、<code>/v1/collector-readiness/*</code>、
 <code>/v1/gpu-health-findings/*</code>、<code>/v1/gpu-metrics/*</code>：证据、采集健康与热状态查询。</li>
-<li><code>/v1/advisory-notifications/*</code>：通知预览、派发与补发。</li>
-<li><code>/v1/processor/*</code>、<code>/v1/internal/*</code>、<code>/v1/capabilities/*</code>、<code>/v1/admin/*</code>：
-队列状态、入队回执、内部遥测批提交与运维注入。</li>
-<li><code>/v1/regional/*</code>：集群注册查询、远端命令领取/续租/回执、HyperPod
-提交幂等、 spare 健康、Agent
-drain/revoke、证据与通知回写。仅区域形态启用， 共 <strong>14
-个端点</strong>，逐个见详细设计 §4.4。</li>
+<li><code>/v1/advisory-notifications/*</code>：通知查询、补发、重新入队与立即派发（预览经
+<code>/v1/incidents/{incident_id}/advisory-notifications</code>）。</li>
+<li><code>/v1/efa-traffic/admin-actions</code>、<code>/v1/training-health/*</code>、<code>/v1/runtime-profiles</code>：EFA
+流量 误报确认/接受新 baseline、训练健康扫描与 Runtime Profile
+注册。</li>
+<li><code>/v1/installation-resources*</code>：AWS
+安装资源注册表的批量同步、按站点查询、状态更新与替换过渡（<code>replace-resource</code>）。</li>
+<li><code>/v1/processor/*</code>、<code>/v1/internal/*</code>、<code>/v1/capabilities/*</code>、<code>/v1/admin/*</code>、<code>/v1/version</code>：
+队列状态、入队回执、内部遥测批提交与静默指标、operation
+能力清单、运维注入与版本。</li>
+<li><code>/v1/regional/*</code>（不含 registry）共 <strong>19
+个端点</strong>：<code>executors</code> 下 17 个（远端命令领取/
+续租/进度/回执、HyperPod 提交幂等、incident 归属与 fleet rollout fence
+查询、spare 健康、 Agent
+drain/revoke/reactivate、证据与通知回写、节点清单与 executor readiness
+上报），加上 集群注册查询 <code>/v1/regional/clusters</code> 与替换节点
+Node Action key 补齐 <code>/v1/regional/node-action-keys</code>；另 4
+个在 <code>/v1/regional/registry/*</code>。路由在本地 <code>all</code>
+模式也会挂载，但只有 regional 是受支持的生产语义与完整鉴权路径，逐个见
+详细设计 §4.4。</li>
 </ul>
 <p>OpenAPI 页面默认位于 <code>/docs</code>。</p>
 <h3 data-number="1.6.4" id="64-授权模型"><span class="header-section-number">1.6.4</span> 授权模型</h3>
 <p>授权是<strong>每条路由显式声明桶</strong>的默认拒绝模型，五个桶为
 <code>public</code>、<code>metrics</code>、
-<code>cluster-token</code>、<code>dual-credential</code>、<code>execution-token</code>，当前分布依次为
-1/1/36/7/36。新增路由若未声明桶，应用装配期即启动失败；运行期取不到桶一律
-403。 模型细节见详细设计 §4.5。</p>
+<code>cluster-token</code>、<code>dual-credential</code>、<code>execution-token</code>，按此顺序
+当前分布 2 / 1 / 37 / 7 / 46（<code>public</code> 为
+<code>/healthz</code> 与
+<code>/livez</code>）。新增路由若未声明桶，应用装配期
+即启动失败；运行期路由存在却未声明桶一律
+403（fail-closed），无任何路由服务的未知 路径返回
+404，不把退役入口伪装成凭据错误。 模型细节见详细设计 §4.5。</p>
 <h2 data-number="1.7" id="7-部署形态与非交付参考"><span class="header-section-number">1.7</span> 部署形态与非交付参考</h2>
 <p>§1.3 给了形态一览，本节逐个展开。只有 §7.1 是生产交付形态。</p>
 <h3 data-number="1.7.1" id="71-区域分离多集群目标形态"><span class="header-section-number">1.7.1</span>
 区域分离多集群（目标形态）</h3>
-<p>一个 AWS Region 一套控制面，纳管该 Region 内多个 GPU HyperPod
-集群。</p>
+<p>一个 AWS Region 一套控制面，纳管该 Region 内多个 GPU 集群（HyperPod
+EKS 或普通 EKS，§2.4）。</p>
 <p>控制面侧：</p>
 <ul>
 <li>独立 CPU HyperPod instance group，承载三类角色 Deployment：ingress
 <code>replicas: 3</code>、control-worker
 <code>replicas: 6</code>、telemetry spool worker
 <code>replicas: 0</code>（见 §4.3）；</li>
-<li>required node affinity 绑定 CPU instance group 的稳定节点
-label；</li>
-<li>Pod anti-affinity 与 topology spread 使用
-<code>whenUnsatisfiable: DoNotSchedule</code>，
-节点不足时不允许多个副本落到同一节点；</li>
+<li>清单不设 node affinity 或 nodeSelector，副本可调度到 CPU
+集群的任一可调度节点；</li>
+<li>同角色副本按 <code>kubernetes.io/hostname</code> 做 topology
+spread（<code>maxSkew: 1</code>、
+<code>whenUnsatisfiable: DoNotSchedule</code>，按
+<code>pod-template-hash</code> 计数），另以 preferred Pod anti-affinity
+尽量一节点一副本；副本数多于节点数时（如 3 个节点上 6 个
+control-worker）每个节点均摊多个副本；</li>
 <li>ingress PDB <code>minAvailable: 2</code>，control-worker 与 spool
 worker PDB <code>maxUnavailable: 1</code>；</li>
 <li>共享 Aurora PostgreSQL，禁止 SQLite 或本地文件作为生产状态库；</li>
@@ -5898,27 +6410,61 @@ worker PDB <code>maxUnavailable: 1</code>；</li>
 <li>endpoint 使用内部 NLB/PrivateLink，或带来源 IP allowlist 的公网
 NLB，必须配 TLS；</li>
 <li>GPU VPC CIDR 冲突时，各 GPU 集群可经 NAT Gateway 访问公网 NLB；</li>
-<li>无自有域名时可用 NLB 默认 AWS 域名，并用私有 CA 签发 SAN
-与该完整域名一致的 服务端证书；各数据面必须安装该
+<li><code>gpu-fault-admin deploy</code> 创建站点私有 Hosted Zone
+<code>&lt;站点 ID&gt;.gpu-fault.internal</code>（关联 控制面与各 GPU
+VPC，<code>api.</code> 记录指向 NLB），由站点私有 CA 签发 SAN
+与该主机名一致的 服务端证书并导入 ACM；各数据面必须安装该
 CA，禁止关闭主机名或证书校验；</li>
-<li>NLB 重建导致 AWS 域名变化时，必须重新签发证书并更新所有数据面
-endpoint；</li>
+<li>改用其他主机名（例如 NLB 默认 AWS 域名）时，必须重新签发 SAN
+一致的证书并更新所有 数据面 endpoint；</li>
 <li>不得把无鉴权的 collector API 暴露到公网；</li>
 <li>NLB IP target 模式下 API Pod 的 <code>preStop</code>
 排空等待必须长于 target 注销传播时间，
 <code>terminationGracePeriodSeconds</code> 必须覆盖 <code>preStop</code>
 与应用优雅退出时间。</li>
 </ul>
-<p>两侧组件、连接方向、监听端口与凭证的完整拓扑见 §4.1.1。</p>
+<p>两侧组件、连接方向、监听端口与凭证的交互拓扑见 §4.1.1； 已启用组件与
+AWS 服务的核对快照见 <a href="#deployment-architecture-snapshot">§4.1.2</a>。</p>
 <p>每 GPU 集群侧部署 §4.2 表中标注&quot;GPU 集群&quot;的全部组件，含 Cluster
-Action Executor。 集群注册使用
-<code>GPU_FAULT_REGIONAL_CLUSTERS_JSON</code>，区域模式不接受单值
-<code>GPU_FAULT_HYPERPOD_CLUSTER</code>。</p>
-<p>管理员邮件由区域控制面发送：控制面 EKS ServiceAccount 的 Pod Identity
-role 把 <code>ses:SendEmail</code> 限定到已验证 sender identity；GPU
-集群 executor 不需要 SES 权限。 邮件走 Aurora outbox——业务处理只创建幂等
-notification，dispatcher 用 owner/epoch/lease claim 并指数退避；旧 epoch
-不能完成新 lease，SES 故障不能反向 改变 workflow step 结果。</p>
+Action Executor。 <code>GPU_FAULT_REGIONAL_CLUSTERS_JSON</code> Secret
+是首次 bootstrap 的种子与灾备输入；Aurora 中 已有 durable registry head
+时以它为准（join-cluster/remove-cluster 在此发布不可变
+revision），Secret 与 head 不一致只报告
+<code>secret_drift</code>，不能覆盖运行时成员。区域模式 不接受单值
+<code>GPU_FAULT_HYPERPOD_CLUSTER</code>。机制见
+<code>regional_registry.sync_regional_cluster_registry</code> 与
+<code>RegionalRegistryRuntime</code>。</p>
+<p>管理员通知由区域控制面发送：CPU ServiceAccount 的 Pod Identity role
+按站点渠道只获得 站点 SNS 主题的
+<code>sns:Publish</code>，或限定到已验证 SES sender 的
+<code>ses:SendEmail</code>（<code>channel: ses</code>）；GPU Executor
+两者都不需要。业务处理只创建幂等 notification，Aurora outbox dispatcher
+使用 owner/epoch/lease claim 并指数退避；旧 epoch 不能完成新
+lease，SNS/SES 故障不能反向改变 workflow step
+结果。未启用投递时仍保存通知，但不能把落库当作管理员 已收到。</p>
+<p>部署与纳管由 <code>gpu-fault-admin</code>
+的受检入口驱动（<code>deploy</code> 一条命令覆盖首装、升级、
+加集群、单步回滚与 profile 计划批准；另有
+<code>join-cluster</code>/<code>remove-cluster</code>/<code>uninstall</code>/
+<code>rotate-token</code>/<code>config</code>/<code>status</code>
+等），底层是 <code>src/gpu_fault_release</code> 的发布引擎：每次
+发布是一个按持久 checkpoint 续跑的可恢复事务
+（<code>PREPARING → CPU_STAGED → ROLLING_CLUSTERS → FINALIZING → COMMITTED</code>，失败为
+<code>FAILED</code>/<code>PAUSED → ROLLING_BACK → ROLLED_BACK</code>），保持签名制品、逐波安全检查和回滚
+门禁：控制面一次滚一个副本、GPU 集群按
+<code>spec.release.upgradeMaxParallelClusters</code> （默认 1，最大
+8）的并行度滚动，集群内节点按波次滚动且首波是单节点 canary，验证或
+稳定窗口失败时按 <code>spec.autoRollback</code> 自动回滚到上一发布；跨
+schema 版本的发布见 §11 第 4 条。发布工件（wheel、node bundle）以
+ConfigMap 承载，wheel 以 <code>.xz</code> 压缩存储， 超过单个 ConfigMap
+上限时拆成逐片校验摘要的分片集合；运行时进程使用 Runtime 镜像里的
+wheel，ConfigMap 只用于保全与摘要核对。 状态都在
+<code>--state-dir</code> 下（site.yaml、checkpoint、join/rotate 的
+state.json）。安装后的 deploy-host 绑定受管 state-dir，资产由
+<code>gpu_fault_release.repository_root()</code> 定位到
+受信源码快照；Manifest 内的 wheel/bundle 相对路径另由
+<code>load_release_artifacts</code> 按该 Manifest
+所属快照解析，二者不替代验签。</p>
 <p><strong>实现成熟度：代码已实现，真实环境上线门禁未全部通过（见
 §10）。</strong> 部署步骤见<a href="#operations-manual">部署和运维手册</a>的区域章节。</p>
 <h3 data-number="1.7.2" id="72-单集群一体化-hyperpod-eks历史过渡非生产交付"><span class="header-section-number">1.7.2</span> 单集群一体化 HyperPod
@@ -5926,9 +6472,8 @@ EKS（历史过渡，非生产交付）</h3>
 <p><code>deploy/hyperpod/deploy.sh</code>
 保留旧版单集群自动部署能力：Aurora PostgreSQL Serverless v2 Multi-AZ、3
 个控制面副本、Completion Watcher、每 GPU 节点的 DCGM
-Exporter/采集器/签名 Agent、HMA 信号复用、HyperPod 托管恢复
-observer（或在明确 关闭托管恢复后启用自建 lifecycle）、非破坏性闭环
-E2E。</p>
+Exporter/采集器/签名 Agent、HyperPod 托管恢复 observer（或在明确
+关闭托管恢复后启用自建 lifecycle）、非破坏性闭环 E2E。</p>
 <p>该形态控制面与数据面同处一个 GPU EKS，没有 Cluster Action Executor，
 控制面直接用 in-cluster client
 操作本集群。它只用于历史环境维护、迁移起点和 有限
@@ -5966,8 +6511,10 @@ API 和策略验证， 不执行真实工作流。</p>
 + 请求中的cluster_id必须与Token注册身份一致</code></pre>
 <p>Collector
 严格验证控制面服务端证书；控制面使用常量时间摘要比较验证集群 Token。
-不同 GPU 集群不得共享 Token，Token 只保存在对应集群 Secret
-中，并按凭证轮换流程 更新。数据面必须校验控制面证书链与主机名；禁止
+不同 GPU 集群不得共享 Token，Token 只保存在对应集群 Secret（及站点
+<code>--state-dir</code> 的 token 文件）中，经
+<code>gpu-fault-admin rotate-token</code>
+轮换。数据面必须校验控制面证书链与 主机名；禁止
 <code>insecure</code>/跳过校验开关。</p>
 <p>当前<strong>不启用mTLS</strong>。原因是区域入口由NLB终止TLS，FastAPI后端无法获得客户端证书。
 这是已接受的阶段性安全风险，不阻断当前部署。后续安全增强可选择：</p>
@@ -5976,14 +6523,20 @@ API 和策略验证， 不执行真实工作流。</p>
 <li>NLB改为TCP透传，由Envoy/service mesh或控制面进程终止mTLS。</li>
 </ol>
 <p>升级mTLS时需要补齐每集群/节点证书签发、SAN身份映射、轮换、吊销和双证书过渡。
-在此之前，发现Token泄露必须立即禁用对应regional
-registration、轮换Token并审计该 cluster_id的全部事件。</p>
+在此之前，发现 Token 泄露用
+<code>gpu-fault-admin rotate-token --state-dir &lt;dir&gt; --gpu-cluster-arn &lt;ARN&gt; --window-minutes 10</code>
+立即轮换（重叠窗口默认 120 分钟，可取
+10–10080）：注册表进入新旧摘要并存的重叠窗口，GPU Secret、数据面
+Deployment 与节点 Agent 分波切换，随后更新站点 token 文件、注册表 Secret
+并重启控制面；轮换结束时默认 立即丢弃旧摘要（<code>--keep-window</code>
+则保留到窗口到期），中断后重跑即续跑；随后审计该 cluster_id
+的全部事件。</p>
 <h3 data-number="1.8.2" id="82-授权模型"><span class="header-section-number">1.8.2</span> 授权模型</h3>
 <ul>
 <li>区域模式授权默认拒绝，且不靠路径前缀：每条路由用装饰器显式声明五个桶之一
 （<code>public</code>、<code>metrics</code>、<code>cluster-token</code>、<code>dual-credential</code>、<code>execution-token</code>），
-应用装配期遍历全部路由，任一条未声明即启动失败；运行期取不到桶一律
-403。</li>
+应用装配期遍历全部路由，任一条未声明即启动失败；运行期取不到桶时，路径无任何
+路由服务返回 404，路由存在却未声明桶一律 403（fail-closed）。</li>
 <li>服务端必须校验认证身份绑定的 <code>cluster_id</code> 与请求 payload
 一致；不一致返回 403。</li>
 <li>主动执行 API 使用 <code>X-GPU-Fault-Execution-Token</code>；active
@@ -6002,14 +6555,30 @@ operator token；因此禁止 <code>FORWARDED_ALLOW_IPS</code>
 删除权限</strong>），训练对象
 （<code>jobs</code>、<code>pytorchjobs</code>、<code>jobsets</code>）为
 <code>get,list,watch,patch,create</code>（同样无 delete）。
-<code>pods</code> 的 <code>delete</code>
-是唯一被授予的删除权限，且只用于两处：重启 GPU/EFA device plugin 的
-DaemonSet Pod，以及停止受管训练任务时标记终止其 Pod。本方案不调用
-Kubernetes Eviction API，也不删除节点或训练对象本身。</li>
-<li>GPU reset 默认关闭，并在执行前重新检查 compute client
-和设备文件持有者。</li>
-<li>HyperPod mutation 默认关闭；<code>NodeRecovery=Automatic</code>
-时默认拒绝自建 mutation。</li>
+在故障处置路径（executor 与 Completion Watcher）上，<code>pods</code> 的
+<code>delete</code> 是唯一被授予的 删除权限，且只用于两处：重启 GPU/EFA
+device plugin 的 DaemonSet Pod，以及停止受管训练任务时标记终止其
+Pod。本方案不调用 Kubernetes Eviction
+API，也不删除节点或训练对象本身；node-installer-reconciler 另只在
+<code>gpu-fault-system</code> 内可删除它自己创建的 installer Job。
+这些写动词不在 ClusterRole 里：ClusterRole 只授 <code>nodes</code> patch
+与各 kind 的读动词 （Completion Watcher 的 ClusterRole 另按
+<code>resourceNames</code> 只对自己的两个 outbox ConfigMap 授
+get/update/patch）， 写动词由发布引擎按每个 allowed workload namespace
+渲染 Role/RoleBinding（executor： <code>pods</code>
+patch/delete、训练对象 create/patch；Completion
+Watcher：<code>pods</code> patch、 <code>pods/exec</code>
+get/create、<code>pods/log</code> get、训练对象 patch），device plugin
+的 <code>pods delete</code> 只在 <code>kube-system</code>。namespace
+之外的命令被 executor 与 API server 双重拒绝。</li>
+<li>GPU reset
+在安装器裸默认关闭、区域生产安装显式开启，并在执行前重新检查 compute
+client 和设备文件持有者。</li>
+<li>provider 节点 reboot（HyperPod 与 eks-managed 共用
+<code>GPU_FAULT_ALLOW_HYPERPOD_REBOOT</code>） 在应用裸默认关闭、区域
+executor 清单显式开启；<code>NodeRecovery=Automatic</code> 时一律拒绝
+自建 mutation，eks-managed 节点组开启 node auto repair 时同样拒绝
+reboot。</li>
 <li><strong><code>GPU_FAULT_ALLOW_HYPERPOD_REPLACE</code> 与
 <code>GPU_FAULT_ALLOW_WITH_AUTOMATIC_NODE_RECOVERY</code> 恒为
 <code>false</code>（§2.1 硬约束）； 受管集群 <code>NodeRecovery</code>
@@ -6022,8 +6591,8 @@ Kubernetes Eviction API，也不删除节点或训练对象本身。</li>
 <li>每个 GPU 集群使用独立身份，token 至少 32 字符，控制面只持久化其
 SHA-256 摘要， 比对使用常量时间函数。</li>
 <li>节点 action secret 至少 32 字符，文件权限为 <code>0600</code>。</li>
-<li><code>ses:SendEmail</code> 只授予控制面侧 ServiceAccount，GPU
-集群侧不授予。</li>
+<li>站点通知的 <code>sns:Publish</code>/<code>ses:SendEmail</code>
+只授予控制面侧 ServiceAccount，GPU 集群侧不授予。</li>
 </ul>
 <h2 data-number="1.9" id="9-可用性与容量"><span class="header-section-number">1.9</span> 可用性与容量</h2>
 <h3 data-number="1.9.1" id="91-高可用与超时基线"><span class="header-section-number">1.9.1</span> 高可用与超时基线</h3>
@@ -6033,9 +6602,19 @@ SHA-256 摘要， 比对使用常量时间函数。</li>
 <code>maxUnavailable=1</code>。</li>
 <li>PostgreSQL 是共享一致性点；控制面不能使用每 Pod 独立 SQLite。</li>
 <li>默认 workflow lease 为 180 秒，最小 30 秒。</li>
-<li>默认 dispatcher 每 5 秒扫描，单批 100 个 workflow。</li>
+<li>默认 dispatcher 每 5 秒一轮（存储 wakeup 可提前触发），只有持有 15
+秒 <code>workflow-dispatch</code>
+租约的进程扫描；单批行数由派发线程数与租约推导（默认 8 线程、15
+秒租约时为 346，限 100–400），<code>WAITING</code> 行只持 30
+秒短租约，便于租约交接。</li>
 <li>默认 Agent 心跳 30 秒，90 秒视为过期。</li>
 <li>原始证据默认保留 24 小时、每节点 10000 条。</li>
+<li>站点已关闭的 incident 及其 workflow 等核心控制记录默认保留 30 天
+（<code>spec.retention.controlRecordRetentionDays</code>，默认开启，显式写
+0 关闭），满足完整 终态与引用条件后先归档到站点 S3 桶再删除。节点 ledger
+另有 30 天与 10000 行上限，
+不与数据库归档混为一谈；控制记录的应用裸默认是 0，与站点默认 30
+天不同。</li>
 <li>单个 GPU 集群离线不阻塞其他集群的处理。</li>
 </ul>
 <h3 data-number="1.9.2" id="92-数据面缓冲与请求体上限"><span class="header-section-number">1.9.2</span> 数据面缓冲与请求体上限</h3>
@@ -6073,13 +6652,18 @@ PostgreSQL连接预算分别扩缩。</li>
 <li>容量必须按&quot;每进程值 × 每Pod进程数 ×
 副本数&quot;折算，不能按Pod数折算：后台线程和
 数据库连接是<strong>每Uvicorn进程</strong>各一份，Control Worker
-的处理槽位是 6 × 4 × 24 = 576。同理，<code>--limit-max-requests</code>
-之类的每进程限额要用 &quot;限额 ÷ 间隔 vs.
-产生速率&quot;核对，否则周期性回收会撞上后台循环。</li>
+的处理槽位是 6 × 4 × 24 = 576。生产 ingress 不使用按请求数自动回收
+worker；进程生命周期由 受检 Deployment rollout、Pod replacement 和
+liveness 管理，避免多个 retire-first worker replacement 在 burst
+中重叠。</li>
 <li>容量保护同时限制区域总未完成队列与单集群未完成队列，超限请求不入库并返回
-<code>429 Retry-After</code>；全局和单集群上限分别预留40%给priority=0的XID/SXID、
-incident和workflow故障路径，普通遥测/observation不能占用该预留容量。
-Store I/O 准入超时返回 <code>503 Retry-After</code>。</li>
+<code>429 Retry-After</code>；两个上限各为故障层级（priority ≤
+10：incident/workflow 控制面动作 为 0，XID/SXID 设备事件为
+10）预留一部分深度，普通遥测/observation 不能占用。生产渲染
+的预留是全局深度的八分之一、单集群深度的八分之一且不少于最大集群的节点数
+（<code>src/gpu_fault/admin/capacity_evidence.py</code>，当前生成清单为
+65536/8192 与 4096/512）； 未配置时的应用裸默认为 40%。Store I/O
+准入超时返回 <code>503 Retry-After</code>。</li>
 </ul>
 <h2 data-number="1.10" id="10-上线门禁"><span class="header-section-number">1.10</span> 上线门禁</h2>
 <p>区域控制面上线前必须验证：</p>
@@ -6096,12 +6680,14 @@ Store I/O 准入超时返回 <code>503 Retry-After</code>。</li>
 <li>单集群离线不会阻塞其他 GPU 集群；</li>
 <li>每个 GPU 集群分别完成 Collector -&gt; Control Plane -&gt; Local
 Executor 的 E2E。</li>
-<li>启用邮件时，XID/SXID notification result 为 <code>SENT</code>
-且具有非空 SES MessageId； <code>GPU_FAULT_ALLOW_EMAIL=true</code> 但
-IAM 返回 AccessDenied 必须视为上线失败。</li>
+<li>启用通知时，XID/SXID notification result 为 <code>SENT</code>
+且具有非空 <code>provider_message_id</code>（SNS 或 SES MessageId）；
+<code>GPU_FAULT_ALLOW_EMAIL=true</code> 但 IAM 返回 AccessDenied
+必须视为上线失败。</li>
 <li><code>RESET_GPU</code> 和 <code>RESTART_WORKLOAD</code>
-各有一条成功通知；重复 remote result 不得产生 第二次 SES
-投递。低利用率邮件必须按节点/任务聚合，不能按 GPU 数量线性增长。</li>
+各有一条成功通知；重复 remote result 不得产生
+第二次通知投递。低利用率通知必须按节点/任务聚合，不能按 GPU
+数量线性增长。</li>
 </ul>
 <p>实现已具备区域多集群隔离和远端执行协议，但在上述真实环境门禁完成前，不能宣称
 已经完成生产级多集群 E2E。</p>
@@ -6110,20 +6696,45 @@ IAM 返回 AccessDenied 必须视为上线失败。</li>
 更新该文档的映射表。</strong></p>
 <h2 data-number="1.11" id="11-当前边界与风险"><span class="header-section-number">1.11</span> 当前边界与风险</h2>
 <ol type="1">
-<li>Completion Watcher 的 GPU UUID 依赖 Pod 注解或上游映射，尚未直接接入
-kubelet PodResources。</li>
-<li>通用 Kubernetes 部署当前未实现为交付能力；遗留清单含
-<code>REPLACE_WITH_*</code>， 只作开发参考，不能原样上线。</li>
+<li>Completion Watcher 的 GPU UUID 来自 Pod 注解
+<code>gpu-fault.io/gpu-uuids</code>，或在训练容器内 exec
+<code>nvidia-smi --query-gpu=uuid</code>
+发现（<code>GPU_FAULT_DISCOVER_POD_GPU_UUIDS</code>，生产开启，依赖按
+workload 命名空间授予的 <code>pods/exec</code>）；尚未直接接入 kubelet
+PodResources。</li>
+<li>通用 Kubernetes
+部署当前未实现为交付能力，历史清单已从公开树移除。仓库里仍带
+<code>REPLACE_WITH_*</code> 占位符的 <code>deploy/</code> 模板与
+<code>config/</code> 示例 profile 只供发布引擎渲染， 不能原样
+<code>kubectl apply</code>。</li>
 <li>若直接使用部分 HyperPod
 示例清单，必须替换其中的测试集群名、节点名、Service 名和 wheel ConfigMap
-名；推荐使用 <code>deploy/hyperpod/deploy.sh</code> 动态生成。</li>
-<li>PostgreSQL schema 已有版本化迁移框架（当前 6
-个版本，导入期校验版本连续、 名称唯一和 DDL 源码校验和，生产用
+名。正常生产发布使用 <code>gpu-fault-admin deploy</code>
+与受信源码快照的 发布引擎
+renderer；<code>deploy/hyperpod/deploy.sh</code> 仅是 §7.2
+历史单集群形态的兼容入口， 不能替代区域发布事务。</li>
+<li>PostgreSQL schema 已有版本化迁移框架（当前 23 个版本，详见
+<code>schema_migrations.POSTGRES_SCHEMA_MIGRATIONS</code>：v7 增加
+Processor <code>not_before</code>、
+<code>retry_count</code>、<code>lane_policy</code> 与可用性索引，v13
+增加控制面评审索引与 autovacuum 参数，v14 增加
+<code>gpu_fault_objects</code> 的 wakeup NOTIFY 触发器，v15–v18
+引入并收紧 remote_command/workflow 专表，v19–v23
+调整热表存储参数、计数分片、唤醒机制与 Processor
+热表布局（§4.4）；导入期校验版本连续、名称唯一和 DDL 源码校验和，生产用
 <code>gpu-fault-store-migrate --ensure-schema</code> 配合
-<code>deploy/migrations/</code> 的 Job
-单独执行，业务进程不自建表）。残留限制是 <strong>只向前</strong>：没有
-down migration，回滚依赖 <code>dual</code> 双写模式过渡而不是降级 DDL，
-因此新版本上线前必须确认旧版本进程仍能读新 schema。</li>
+<code>deploy/migrations/</code> 的 Job 单独执行，
+业务进程不自建表）。残留限制是<strong>只向前</strong>：没有 down
+migration，业务进程只接受与 自身一致的精确 schema
+版本，跨版本发布不能回滚。热状态与 workflow/remote-command 专表的
+<code>dual</code> 模式不是通用 DDL 回滚机制。这类发布必须以
+<code>gpu-fault-admin deploy --accept-schema-change</code>
+执行：发布引擎先创建 Aurora 手动 快照，再把本事务标为
+fail-forward（验证失败不自动回滚，<code>SKIPPED_POLICY</code>），
+<code>spec.autoRollback</code>
+不被改写；唯一的后退路径是恢复快照后再回滚，不能直接把旧进程
+切回新库。没有人会恢复的数据库（staging）可用
+<code>--accept-schema-change-without-snapshot</code> 跳过快照。</li>
 <li>collector本地outbox是容量受限的事件补交机制；持续长时间离线超过其容量时仍需
 外部告警和运维介入，不能将其视为无限期消息队列或长期日志存储。</li>
 <li>GPU 数量变化已提供 annotation 审批门禁，但尚无独立审批 UI。</li>
@@ -6142,12 +6753,14 @@ E2E。首次部署必须先通过部署清单本身的 可运行性门禁。</li
 <li>单集群一体化代码只作历史过渡。维护旧环境时，同一能力的执行方与区域形态不同
 （控制面直连 vs. 集群执行器），Runtime Profile 的 owner
 必须匹配实际环境； 新生产环境不得再选择该路径。</li>
-<li><strong>只支持 HyperPod EKS 编排，HyperPod Slurm
+<li><strong>HyperPod 只支持 EKS 编排，HyperPod Slurm
 编排暂不支持</strong>（§2.1 约束 4）。 Slurm 侧缺 scheduler
 adapter、<code>scontrol</code> 隔离证据回读和 workload stop/restart
-执行器；<code>Environment</code> 枚举中的 <code>hyperpod-slurm</code> /
-<code>slurm</code> 只是数据模型取值。文档中出现的 Slurm
-协议细节均为参考与未来扩展说明。</li>
+执行器；<code>Environment</code> 枚举中的 <code>hyperpod-slurm</code>
+只是数据模型取值。文档中出现的 Slurm 协议细节均为参考与未来扩展说明。
+另一种受支持的 GPU 集群是普通
+EKS（<code>eks-managed</code>，§2.4），它是新增形态，真机验收 范围小于
+<code>hyperpod</code>。</li>
 <li><strong>任务自动恢复由本方案独占</strong>（§2.1 约束 3），HyperPod
 Job Auto Restart
 必须禁用。该约束由两层落实：纳管前置检查（部署期，人工，会漏） 与
@@ -6164,6 +6777,9 @@ annotation，因此纳管前置检查仍是必需的第一层——
 门禁的逐条验证</li>
 <li><a href="#fault-simulation-manual">故障模拟测试手册</a>——故障场景
 catalog 与验证分级</li>
+<li><a href="components/plain-eks-gpu-cluster.md">普通 EKS GPU
+集群与混合 provider 站点</a>——<code>eks-managed</code>
+的设计、前置与验证状态</li>
 <li><code>COLLECTORS.md</code></li>
 </ul>
 </body>
