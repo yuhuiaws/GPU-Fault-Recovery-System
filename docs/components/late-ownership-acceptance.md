@@ -165,7 +165,10 @@ validation; it is not the signed Node Action authorization.
 exact Agent process and checks every thread's kernel `TracerPid`. The live
 observation domain is the resolved `nvidia-smi` executable, filtered by its
 exact path and hash-pinned before and after observation. Recognized read-only
-queries are distinct from reset attempts.
+queries are distinct from reset attempts. An invocation no rule can read is
+refused and named only by its argv SHA-256; no receipt holds raw argv. Before
+the attach line the witness accepts only strace's own "resolved into" notice
+for its pinned path (a symlinked executable); any other preamble is a refusal.
 
 Raw exec data stays in an anonymous, size-bounded regular file. Only sanitized
 receipts leave the observer. Complete exec/exit pairs, failed execs and killed
