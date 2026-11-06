@@ -411,8 +411,8 @@ flush (0.15/0.30 s), so a 1.08 s average flush closes hard instead of holding. T
 its own batcher and Store I/O threads inside each process, so a telemetry burst never takes a fault slot; the depth
 reserve (`GPU_FAULT_PROCESSOR_FAULT_RESERVED_*`) keeps its semantics. The recommended site values are the defaults; the
 acceptance target for the default configuration is this site's calibrated 1,000+ req/s with zero reserved 503s and
-zero P0 503s, `..._in_flight_limit` constant at 8/4 on the routine/fault tiers and `..._raised_total` /
-`..._lowered_total` at 0. The adaptive cap of the batch delay, `admissionBatchDelayMaxSeconds` (default 0.05, 0..0.5): once
+zero P0 503s, the per-process `..._in_flight_limit` constant at 8/4 on the routine/fault tiers (an api-ha Pod's
+`/metrics` sums its 4 processes and reads 32/16) and the per-process `..._raised_total` / `..._lowered_total` at 0. The adaptive cap of the batch delay, `admissionBatchDelayMaxSeconds` (default 0.05, 0..0.5): once
 the flush-duration EWMA passes 100 ms the batcher raises the coalescing window linearly from `admissionBatchDelaySeconds`
 toward this cap (fully at an EWMA of 200 ms) and lets it fall back as the store recovers; a cap at or below the base
 delay switches the adaptation off (the runtime takes the larger of the two, so raising the base alone stays valid). The window is not a lever on items per flush: a flush is one transaction
