@@ -4555,9 +4555,9 @@ the request was lost**; use the `processor_request_id` to query `GET /v1/process
 is parsed and validated by `AdmissionRuntime` at startup (a non-positive or unparsable value refuses to start), not read from the environment on every
 request, so a wrong value in the ConfigMap immediately shows up as a Pod that will not come up, rather than a deployment that looks
 healthy but answers 500 to every synchronous request. While waiting, polling of the store uses a backoff starting at 10ms, growing ×1.6,
-capped at 250ms, with ±25% jitter added to each interval: the first probe is an order of magnitude earlier than the previous fixed 100ms
-(most requests complete within tens of milliseconds), the number of store reads over the whole wait window is less than half of before, and concurrent waiters
-do not fire in unison.
+capped at 250ms, with ±25% jitter added to each interval (`RESPONSE_POLL_*` in `app/middleware/dispatch.py`): most requests complete within
+tens of milliseconds, long waiters drop to a lower read rate, and concurrent waiters do not fire in unison; when a worker of the same process
+completes the request, `ProcessorCompletionSignals` ends the current interval early.
 
 **Version compatibility**: the path prefix is fixed at `/v1`. What really needs negotiation is the executor protocol, via
 `executor_protocol_version` in the request body (`ge=1`, defaulting to `LEGACY_REGIONAL_EXECUTOR_PROTOCOL_VERSION`),
@@ -4613,7 +4613,7 @@ The 12 routes most used during integration:
 
 ### 8.3 Event Ingress Fields
 
-`XidEvent` has 40 fields in total, `SxidEvent` 36; both are `StrictModel`, and any field not listed
+`XidEvent` has 41 fields in total, `SxidEvent` 37; both are `StrictModel`, and any field not listed
 is a 422. Only a few are required:
 
 | Field | Type | Required | Constraint / enum |
@@ -4629,6 +4629,7 @@ is a 422. Only a few are required:
 | `gpu_uuid` / `pci_bdf` | str | ⭕ | In MIG scenarios `gpu_uuid` carries the MIG prefix |
 | `pod_uid` / `container_id` / `host_pid` / `cgroup_path` | | ⭕ | The four elements of application attribution (§5.5) |
 | `job_id` / `attempt_id` / `workload_identity_source` | str | ⭕ | Training job attribution |
+| `gpu_identity_source` | str | ⭕ | Written by the control plane when it fills `product` from the GPU inventory (`GPU_INVENTORY:<snapshot>` / `NO_FRESH_GPU_INVENTORY`); empty when the collector stamped it |
 | `workload_state` | `WorkloadState` | ⭕ | `UNKNOWN` (default) / `IDLE` / `ACTIVE` |
 | `affected_workload_ids` | list[str] | ⭕ | Empty by default |
 | `fabric_partition` | str | ⭕ | Basis for SXID scope expansion (§7.8) |
@@ -4657,7 +4658,7 @@ Rejection paths:
 | Status | When | Body |
 |---:|---|---|
 | 413 | Exceeds `MAX_REQUEST_BYTES=16777216`; rejected early when the declared length exceeds the limit, rejected during streaming read when there is no length declaration; both gzip wire bytes and the decompressed size are checked | `{"detail":"processor request body is too large","max_bytes":…}` |
-| 422 | JSON body contains a `\u0000` escape (jsonb cannot store it, E-3) | `{"detail":"JSON request body contains a NUL character (\\u0000), …"}`; the sink treats it as final → outbox dead letter |
+| 422 | JSON body contains a `\u0000` escape (jsonb cannot store it) | `{"detail":"JSON request body contains a NUL character (\\u0000), …"}`; the sink treats it as final → outbox dead letter |
 | 429 | Queue depth limit exceeded | `{"detail":"processor queue capacity exceeded","scope":"global\|cluster\|global_reserved\|cluster_reserved"}` + `Retry-After` |
 | 429 | Spool depth limit exceeded | `{"detail":"telemetry spool capacity exceeded","scope":…}` + `Retry-After` |
 | 503 | In-process store I/O or decode concurrency is saturated | `{"detail":"store I/O capacity exceeded"}` (timed out waiting for a slot) / `{"detail":"request deadline exceeded"}` (request deadline arrived first) / `{"detail":"request decode capacity exceeded"}` + `Retry-After` (value from `GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS`, 2 in production) |
@@ -4677,7 +4678,7 @@ control plane, so the protocol itself carries idempotency.
 
 | Step | Endpoint | Key fields |
 |---|---|---|
-| Claim | `POST /v1/regional/executors/claim` | `executor_id`, `executor_protocol_version≥1`, `execution_owners` (≤32, deduplicated, non-empty, no leading/trailing whitespace), `max_commands` (1–25), `lease_seconds` (10–7200, default 60), `wait_seconds` (0–30, default 0; long polling, see below) |
+| Claim | `POST /v1/regional/executors/claim` | `executor_id`, `executor_protocol_version≥1`, the optional `executor_artifact_sha256` / `executor_compatibility_digest` (64 hex characters, checked by the control plane against the executor artifact pins), `execution_owners` (≤32, deduplicated, non-empty, no leading/trailing whitespace), `max_commands` (1–25, default 1), `lease_seconds` (10–7200, default 60), `wait_seconds` (0–30, default 0; long polling, see below) |
 | Renew | `POST /v1/regional/executors/{command_id}/renew` | `executor_id`, `lease_token`, `lease_seconds` |
 | Progress | `POST /v1/regional/executors/{command_id}/progress` | `executor_id`, `lease_token`, `batched_results` (`{"<step_index>": {status ∈ {WAITING, SUCCEEDED, FAILED}, status_source, details, error}}`, at least one entry); lease check same as renew, does not extend the lease or change state; used only by compound commands (protocol ≥3) |
 | Report | `POST /v1/regional/executors/{command_id}/result` | `lease_token`, `status ∈ {WAITING, SUCCEEDED, FAILED}`, `status_source`, `details`, `error` (required for `FAILED`) |
@@ -4703,11 +4704,11 @@ Three design points that must be understood:
    it wakes via `call_soon_threadsafe`, then claims once more and returns (possibly still empty). The server-side ceiling is 25s
    (below the executor's 20s+15s request timeout; uvicorn `--timeout-keep-alive` only governs idle connections, and the
    NLB is L4). **Liveness rule**: when the listener thread is not connected or drops (`on_state(False)`), the wait is compressed to
-   the old 2s polling interval, and all waiters are released at the moment of disconnection -- a deaf listener degrades to today's polling and never
+   the old 2s polling interval, and all waiters are released at the moment of disconnection -- a deaf listener degrades to polling and never
    wedges claims. At most 4 concurrent pending requests per cluster (the deployment shape is 2 replicas); any beyond that are answered immediately with the first result
    without waiting. This field is an **optional new request field**; the response model is unchanged, an old executor that omits it gets the old behavior,
    it is shipped control plane first then data plane per the §8.1 rule, and `CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION` is not bumped.
-5. **`batched_steps` is a new response-side field, so the protocol is bumped to 3** (performance item C). The
+5. **`batched_steps` is a new response-side field, so the protocol is bumped to 3**. The
    `RemoteActionCommand` in the claim response gains `batched_steps: [{step_index, step, idempotency_key}]`;
    the executor decodes with `extra="forbid"`, so an old executor receiving it would 422; unlike the pure request-side field addition of `wait_seconds`,
    this can only rely on version negotiation. Three safeguards: ① on serialization **an empty list is omitted entirely**, so the response for a single-step command
@@ -4746,15 +4747,19 @@ with a fixed four-field body `{code, message, retryable, requires_new_command}`:
 | `STALE_AGENT_GENERATION` | 409 | ✓ | ✓ | The agent generation in the Fleet Registry has changed |
 | `COMMAND_EXPIRED` | 410 | ✓ | ✓ | The command has expired |
 | `STALE_FENCING_TOKEN` | 409 | ✓ | ✓ | The fencing token is older than one already seen |
+| `GPU_MAINTENANCE_WINDOW_OPEN` | 409 | ✓ | ✗ | Another incident's quiesce window is open on the node and this command is the Agent's own GPU work (§3.1 ④); resubmitted as-is once the window closes |
 | `COMMAND_ID_REUSED` | 409 | ✗ | ✗ | The same `command_id` came with a different operation, `gpu_uuids` or `parameters`; terminal failure, handed to the operator, no automatic id change |
+| `OWNERSHIP_REFUSED` | 409 | ✗ | ✗ | The post-dequeue final ownership check refused (§3.1 ⑧ layer 5), with the refused action's details; a safety refusal, not a GPU failure |
 | `ACTION_CONFLICT` | 409 | ✗ | ✗ | All other conflicts (fallback) |
 
 The control plane (`adapters/node_action/transport.py`) looks only at `requires_new_command`: the five codes where it is true
 (`STALE_AGENT_GENERATION`, `COMMAND_EXPIRED`, `STALE_FENCING_TOKEN`, `INVALID_ISSUED_AT`,
 `INVALID_TTL`) make the step return WAITING `NEW_COMMAND_REQUIRED`, and the next dispatch **automatically re-signs** a new envelope;
-those with `retryable=true` but no new command needed (`AGENT_GENERATION_UNKNOWN`, plus 5xx / transient transport errors) go through
-`TRANSPORT_RETRY` and are resubmitted as-is; those with neither (`INVALID_SIGNATURE`, `TARGET_NODE_MISMATCH`,
-`OPERATION_NOT_ALLOWED`, `COMMAND_ID_REUSED`, `ACTION_CONFLICT`) require stopping to investigate; retrying only wastes time.
+those with `retryable=true` but no new command needed (`AGENT_GENERATION_UNKNOWN`, `GPU_MAINTENANCE_WINDOW_OPEN`, plus 5xx / transient
+transport errors) go through `TRANSPORT_RETRY` and are resubmitted as-is; those with neither (`INVALID_SIGNATURE`, `TARGET_NODE_MISMATCH`,
+`OPERATION_NOT_ALLOWED`, `COMMAND_ID_REUSED`, `OWNERSHIP_REFUSED`, `ACTION_CONFLICT`) fail the step and require stopping to investigate;
+retrying only wastes time. `COMMAND_ID_REUSED` and `OWNERSHIP_REFUSED` (and any refusal of a command carrying an ownership guard) also record
+`manual_confirmation_required`, the latter with `safety_rejection`, and neither climbs the hardware ladder.
 
 ### 8.7 The Four Proposed Endpoints → Real Equivalents
 
@@ -4781,6 +4786,7 @@ Two more that the proposal did not mention but integration always uses: `POST /v
 | 410 | Command has expired | Re-issue it |
 | 413 | Body too large | Split the batch |
 | 422 | Strict validation failed (extra field, enum out of range, invalid time) | Fix the request; **note that an extra field is also a 422** |
+| 423 | The cluster's registry lifecycle is not `ACTIVE` and does not admit the request (`regional_cluster_request_allowed`): `REVOKED`/`ROLLED_BACK` refuse everything; the other states admit GET/HEAD plus the Agent heartbeat and readiness requests, `PENDING` also admits telemetry ingress POSTs (claims stay refused), `DRAINING` admits only renew/result of in-flight commands and the HyperPod submission outcome, `FAILED` refuses the rest | Wait for the membership change (join/remove/uninstall) to end; do not hammer retries |
 | 429 | Admission rate limit | Back off per `Retry-After` |
 | 503 | Capacity full or synchronous wait timed out | Back off per `Retry-After`; for a timeout, query the result with `processor_request_id`; do not resend |
 
@@ -4801,7 +4807,8 @@ can each deliver the same thing twice at every layer. Deduplication does not rel
 | Notification | `notification_dedup` link | Same as above | The same content is not delivered twice |
 | Queue request | `processor_request_id` | `gpu_fault_processor_queue` + `processor_request` object | The `COMPLETED` response body is replayed verbatim; the side effect happens only once |
 | Workflow step | `completed_step_indexes` / `completed_operations` | `workflow` object | Completed steps are skipped after takeover |
-| Node action | `command_id` | Agent-side ledger (`NODE_ACTION_RETENTION_SECONDS=2592000`, `NODE_ACTION_MAX_RESULTS=10000`) | A re-post returns the archived result of the latest attempt; retryable failures are re-posted by the control plane (`GPU_FAULT_NODE_ACTION_RETRY_LIMIT`, default 3); once the limit is exceeded the terminal state is FAILED |
+| Node action | `command_id` | Agent-side ledger (`GPU_FAULT_NODE_ACTION_RETENTION_SECONDS=2592000`, `GPU_FAULT_NODE_ACTION_MAX_RESULTS=10000`) | A re-post returns the archived result of the latest attempt; retryable failures are re-posted by the control plane (`GPU_FAULT_NODE_ACTION_RETRY_LIMIT`, default 3); once the limit is exceeded the terminal state is FAILED |
+| Provider submission (reboot/replace) | `<request_id>/<operation>/<step_index>` (`hyperpod_submission_idempotency_key`) | Submission record `HyperPodSubmissionRecord`, kept on the control plane through `RegionalHyperPodSubmissionStore` (HyperPod and EC2 share `provider_submissions.ProviderSubmissionLedger`) | Among concurrent replicas only the one that won the reservation submits; written INTENDED before the provider call, SUBMITTED/FAILED after; a call that raised (and may have taken effect) records UNKNOWN, which is never retried and goes to an operator decision |
 
 **Sliding-window correlation** is evidenced by markers, see §5.4; it is a separate matter from primary-key deduplication.
 The primary key handles re-posts of the same event; reuse of an action after correlation must still prove complete coverage, and a TTL cannot substitute for arbitration.
@@ -4821,7 +4828,7 @@ writes fail with EROFS under `ProtectSystem=strict`, and "the outbox that exists
 | Replay trigger | **One successful real-time delivery wakes it up, or a failed delivery arms a bounded backoff retry** | With no worker running, a successful delivery first runs a bounded batch synchronously and, with backlog left, a single background worker keeps draining; a failed delivery that reached the outbox runs no synchronous batch but starts that same worker, which waits out a backoff before trying; while a worker is waiting out its backoff a successful delivery only wakes it early instead of running a synchronous batch -- no new live event needed |
 | Replay order | **Real-time events go first, backlog is caught up afterwards**; not FIFO | The background worker does not hold the real-time POST path; a new XID can be delivered concurrently and does not queue behind historical backlog |
 | Replay batching | Per round `outbox_replay_batch_size=10` + a `GPU_FAULT_COLLECTOR_OUTBOX_REPLAY_BUDGET_SECONDS=5` wall-clock budget, with 0.25 s between background rounds that made progress | Each record is tried only once and receipts are not polled; a round with zero successes waits out a backoff (`outbox_replay_retry_initial_seconds=10` doubling to the `outbox_replay_retry_max_seconds=60` cap, jittered within `[base/2, base]`) before the next round, so a down network sees at most one bounded batch per interval; a successful real-time delivery wakes the worker early through an `Event`; `outbox_replay_retry_max_seconds=0` disables the timed retry and restores the delivery-only wake; the worker exits once no replayable record is left |
-| Filter | Only records marked `replayable` are replayed | 4xx-class failures are not replayed |
+| Filter | Only records marked `replayable` are replayed | Network failures, 5xx, 408/425/429 and the 401/403 of a token-rotation window become replayable once the delivery retries are spent; every other 4xx is a verdict on the event itself and is kept as a non-replayable dead letter (`is_retryable_collector_status`) |
 
 **The cost must be stated clearly**: the design above deliberately sacrifices global ordering. Analysis must sort by the event's
 `source_event_time` / `source_monotonic_us` / `source_boot_id`, **never by arrival order**.
@@ -4841,9 +4848,9 @@ See the four layers of mutual exclusion in §6.5. Three additional runtime facts
 | Action | Idempotency mechanism | Consequence of repeated execution |
 |---|---|---|
 | Isolation (cordon + taint) | Target-state style: patch to "unschedulable + tainted"; if already in that state, no-op | None |
-| Stop workload | Patch by workload target state; `STOP_WORKLOADS` does not use the Eviction API. After patch + grace-0 Pod deletion, the workload is **read back within the same call**; if it is no longer active the step is SUCCEEDED; only if it is still active or its state is unknown does it go WAITING for the next round (before 2026-09-08 the first call was unconditionally WAITING, costing at least one extra 5 s tick per stop) | None |
+| Stop workload | Patch by workload target state; `STOP_WORKLOADS` does not use the Eviction API. After patch + grace-0 Pod deletion, the workload is **read back within the same call**; if it is no longer active the step is SUCCEEDED; only if it is still active or its state is unknown does it go WAITING for the next round, which saves an unconditional WAITING round trip (a 5 s tick locally, plus a remote-command hop on the regional path) | None |
 | GPU reset | `command_id` ledger + `VERIFY_NO_GPU_CLIENTS` before execution | A ledger hit means no second reset; only if the ledger has expired (>30 days) can a reset genuinely happen twice |
-| Node reboot | `command_id` ledger + `agent_generation` comparison | After the reboot the ledger marks that `command_id` `INTERRUPTED`; the control plane rules "already happened" from this and does not reboot again |
+| Node reboot | Not through the Node Agent: the provider submission record (§9.1) + the Agent `boot_id` / `agent_incarnation_id` baseline recorded before submission | One submission per step; when the executor Pod that submitted the reboot is killed by it or taken over, the record is read back and "rebooted" is confirmed against the baseline (§7.4), so it never reboots twice; UNKNOWN is never silently retried |
 | Un-isolate | Ownership check + target-state style patch (see below) | None. Historical pitfall: clearing only the cordon without clearing the taint leaves the node permanently unschedulable |
 
 **Ownership protocol for isolation/un-isolation** (this section must be understood before writing code, otherwise you will write the
@@ -4866,9 +4873,11 @@ The four hard rules of `RESTORE_SCHEDULING`:
    This blocks "incident A's workflow lifted incident B's isolation".
 2. **Restore the pre-isolation value, not blindly set false**: `unschedulable` is taken from
    `gpu-fault.io/previous-unschedulable`. If operations had manually cordoned this machine before the fault,
-   it **stays cordoned** after repair; the system only gives back what it took.
-3. **Do all four things in one patch**: clear the taint, restore `unschedulable`, clear the three annotations, and carry
-   `resourceVersion` for optimistic concurrency. Splitting into multiple patches produces the intermediate state "taint cleared but cordon remains",
+   it **stays cordoned** after repair; the system only gives back what it took. Exception: a declared warm spare that no
+   incident holds always stays cordoned, otherwise the spare pool's health check fails and no path would cordon it again.
+3. **Do all four things in one patch**: clear the taint (`gpu-fault.io/quarantined`, on eks-managed together with this
+   incident's `gpu-fault.io/quiesce` NoExecute taint), restore `unschedulable`, clear the three annotations, and carry
+   `resourceVersion` for optimistic concurrency (a conflict → WAITING; the next pass re-reads the node and re-derives the patch). Splitting into multiple patches produces the intermediate state "taint cleared but cordon remains",
    and nothing in that intermediate state proves who it belongs to.
 4. **Re-read the STOP receipt's nodes before the release**: the annotations prove *who* isolated the node, not that it is
    still the same machine -- a HyperPod in-place re-image (`UpdateClusterSoftware`) keeps the Node object, the UID, the
@@ -4884,6 +4893,13 @@ The four hard rules of `RESTORE_SCHEDULING`:
    kubelet has reported, so a release landing in the seconds a re-image has begun and kubelet has not reported the new boot
    is not caught (the node is NotReady then and the scheduler's not-ready taint holds new Pods off it).
 
+A release is a no-op when the node carries no gpu-fault isolation trace (neither annotation, neither taint) or the Node is
+deleted (404) (`already_restored_nodes` / `absent_nodes`); a node pinned by a terminal quarantine is refused outright
+(`TERMINAL_QUARANTINE_HOLD`, `safety_rejection`). Isolation is symmetric: a node already isolated by another incident/token is
+refused (`node is already isolated by another incident/token`); only a newer fencing generation of the same incident, or an old
+incident whose workflow has ended (one that ended holding a quarantine passes only to its escalation successor or a workflow that preserves the terminal quarantine; an unreadable state counts as not ended), takes it, and the earliest `previous-unschedulable` baseline is kept
+(`adapters/kubernetes/node_operations.py`).
+
 ### 9.5 Concurrency and Blast Radius
 
 The implementation uses a persistent remediation budget claim, taken in the same transaction as the workflow lease. Until the
@@ -4891,8 +4907,8 @@ workflow's budgeted steps (node/workload changes) begin, every claim asks for th
 run, the job tokens of the steps among them that stop or restart a job, and the failure-domain scope of a step's fabric
 partition; if any scope is full, the workflow stays retryable (with the refusing scope recorded) and does not call the adapter.
 There is no Region, cluster or resource class scope: no fixed number decides how many workflows a cluster or the region repairs
-at once, the remediation storm breaker below bounds a correlated fault. The fixed limits it replaced (Region 20, 5 per cluster,
-2 per resource class) drained a whole-cluster correlated fault five nodes at a time and queued unrelated jobs behind each other.
+at once, the remediation storm breaker below bounds a correlated fault. The retired fixed limits (Region 20, 5 per cluster,
+2 per resource class) would drain a whole-cluster correlated fault five nodes at a time and queue unrelated jobs behind each other.
 
 Failure domains are workloads, and they are not a budget slot: merging and the per-node exclusion deliver them. One training
 job is one workflow: the faults of one job attempt merge into it by `[cluster, job_id, attempt_id]`, and its nodes and GPUs are
@@ -4913,16 +4929,15 @@ The other kind of failure domain is unchanged: the NVSwitch fabric partition the
 (`fabric_partition`). On every fabric the product grades -- HGX NVSwitch baseboards (H100/H200/H800/H20, HGX B200/B300,
 `gpu_fabric_manager.py`), whose NVSwitches sit inside the node -- the partition defaults to `<cluster>/<node>/local-nvswitch`
 (`workflow_builder.py` and the SXID ingest in `app/ingest/faults.py`), so it nests inside the node and never couples
-two nodes or two jobs (the live DESTR-010 workflow held exactly
-`domain:gpu-eks-cluster:gpu-eks-cluster/ip-10-0-43-5…/local-nvswitch`). Rack-scale NVLink (GB200/GB300 NVL72, GH200, whose switch
+two nodes or two jobs (the scope reads `domain:<cluster>:<cluster>/<node>/local-nvswitch`). Rack-scale NVLink (GB200/GB300 NVL72, GH200, whose switch
 trays are shared by many nodes) is deliberately not graded today; supporting NVL72 would need either a rack / NVLink-partition
 failure domain for switch-tray actions or the rule "one NVLink partition never hosts two jobs".
 
-Node labels no longer divide remediation failure domains. `domain:` used to come from the node map (HyperPod instance group ->
-EKS node group -> zone); on the site every GPU node of a cluster fell into one domain, so one cluster ran one workflow with
-budgeted steps at a time and different jobs and different idle nodes were serialized. The ConfigMap
-`gpu-fault-failure-domain-map` is still rendered, published and mounted into the control-worker by deploy/join/remove
-(`GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP` still names the mounted file), but no runtime code reads it: it is a read-only
+Node labels do not divide remediation failure domains: taken from the node map (HyperPod instance group ->
+EKS node group -> zone), `domain:` would put every GPU node of a cluster into one domain, so one cluster would run one workflow with
+budgeted steps at a time and different jobs and different idle nodes would be serialized. The ConfigMap
+`gpu-fault-failure-domain-map` is still rendered and published by deploy/join/remove and mounted by the Pod template the three
+control-plane roles share (`GPU_FAULT_REMEDIATION_FAILURE_DOMAIN_MAP` names the mounted file), but no runtime code reads it: it is a read-only
 topology view of the fleet's labels, not a limit. The fleet rollout's per-domain wave cap reads the node labels directly
 (`failure_domains.node_failure_domain`), not this map.
 
@@ -4939,21 +4954,20 @@ remediation** -- within a workflow's first admission of its budgeted steps (a ho
 and a preempting successor taking over its predecessor's reserved slot are work in flight, never counted and never held), the
 nodes that receive a **node-hardware mutation** (reset/reboot/replace, driver/firmware, fabric-manager, device-plugin, quiesce --
 `operation_registry.NODE_HARDWARE_MUTATING_OPERATIONS`) or an **isolation** (`QUARANTINE`, counted to bound a false-positive
-cascade, F-C5). A healthy node named only because its job is stopped or restarted as a whole is **not** counted:
+cascade). A healthy node named only because its job is stopped or restarted as a whole is **not** counted:
 `STOP_WORKLOADS` / `RESTART_WORKLOAD` act on the job's workload objects and the job family widens them to every node of the
 attempt (§3.7), which still claim each node's `node:` exclusion but are not node-hardware repair, so a two-node job with one bad
-node counts only its rebooted node (`remediation_budget.storm_counted_node_ids`; b223 -- counting the healthy peer serialized two
-independent small jobs and false-tripped at scale, e.g. two 64-node jobs with one bad node each counted 128 against a threshold
-of 100). It trips when, in a sliding 600-s window, those nodes reach max(3, ceil(20% of the cluster's GPU nodes)) and belong to
+node counts only its rebooted node (`remediation_budget.storm_counted_node_ids`; counting the healthy peers would serialize two
+independent small jobs and false-trip at scale: on a 500-node cluster two 64-node jobs with one bad node each would count 128
+against a threshold of 100). It trips when, in a sliding 600-s window, those nodes reach max(3, ceil(20% of the cluster's GPU nodes)) and belong to
 at least two workload domains (the nodes of one job, or of one incident without a job, are one domain). One big job failing on
 many nodes is one fault and never trips it; many unrelated nodes failing together look like a bad driver, image or policy. The node count is the
 cluster's `ACTIVE`/`DRAINING` fleet Agents (one per GPU node; a departed node counts until the departed-node cleanup retires its
 Agent, so the threshold errs high, not low), read at most once a minute per process and cluster
 (`execution/storm_admission.py`). PostgreSQL counts them in place (`count_agents`: one count over the agent cluster index,
 no Agent record leaves the database); a store without that count is listed and counted. Listing decodes every Agent of the
-cluster, and the first admissions of one cluster in a burst read before any of them has kept its count: on the 32 x 4 x 4
-action model with 256-node clusters (local A/B) that decoding made the first dispatch tick about 4 s longer, and every
-workflow's first command waited for it (batch 246). A failed read is never kept: the last good count judges for up to 300 s (a count changes
+cluster, and the first admissions of one cluster in a burst read before any of them has kept its count, so that decoding
+lengthens the first dispatch tick, and every workflow's first command waits for it. A failed read is never kept: the last good count judges for up to 300 s (a count changes
 only through joins, departures and retirements, and a departed node is retired no sooner than the 10-minute departure guard,
 so a count five minutes old misses at most five minutes of retirements), with no count that young the floor of 3 applies, the
 store is not read again for 5 s (one dispatcher tick), and every failed read is logged and counted in
@@ -4975,7 +4989,7 @@ closes and re-arms it (the window empties; rows held through the trip are admitt
 faults after it count from zero); `abort` keeps it open and hands every held workflow to the operator -- `SUPERSEDED` with a
 `REMEDIATION_STORM_ABORTED` operator event, the incident `ESCALATED` -- until a later `release`. A held workflow stays `PENDING`
 whole, as a budget refusal leaves it: its `FREEZE_EVIDENCE` / `MARK_UNSCHEDULABLE` prefix does not run first (containment while
-waiting is b220's design proposal, not implemented), so the nodes an `abort` hands over were not cordoned by that workflow.
+waiting is not implemented), so the nodes an `abort` hands over were not cordoned by that workflow.
 Processes still on an older release during a roll do not update the window; their admissions go uncounted.
 
 Once admitted, the claim is held until the workflow is terminal (`SUCCEEDED`, `FAILED`, `SUPERSEDED`, or a `BLOCKED` with
@@ -4987,6 +5001,11 @@ claim is a hold: it keeps the scopes held, adds its own plan's scopes and is nev
 `RESTORE_GPU_SERVICES` compensation in flight are never blocked by the budget, and a record whose claims an older release dropped
 counts again. A row the dispatcher hands back after an internal error stays `RUNNING` (rather than the `PENDING` its scan saw)
 once its budgeted work began in that dispatch, so its hold outlives the backoff while the node is mid-remediation.
+
+A rung the in-place escalation ladder (`RESET_GPU` -> `RESTART_NODE` -> `REPLACE_NODE`) appends may touch a node, a job or a
+fabric partition the original plan never counted: before the rung runs, the executor takes only those new scopes under the
+store's budget lock (`src/gpu_fault/execution/remediation_budget.py::escalation_budget_claims` -> `extend_remediation_budget`);
+if it cannot, the branch is exhausted and goes to an operator (fail closed) rather than exceed the limit.
 
 `BLOCKED` releases the claim unless the node may still be mid-action; the rule is the same for admission, the dispatcher's
 occupancy read and the `/metrics` gauges:
@@ -5014,10 +5033,9 @@ the action's age and bound, counts it (`gpu_fault_remediation_budget_parked_hold
 stays `BLOCKED` for the operator. The bound assumes the shipped executor cap: a GPU cluster that raises
 `GPU_FAULT_CLUSTER_EXECUTOR_MAX_EXECUTION_SECONDS` runs commands longer than the control plane can see.
 PostgreSQL applies the rule in two parts: it counts the `RUNNING` holders of the requested scopes in SQL and decodes only the
-node-occupying `BLOCKED` rows and the preemption handoffs the rule has to judge. Decoding every holder for every admission made
-a burst of N admissions N²/2 decodes under the lock of the Region scope every admission then claimed (measured: 18.8 s for 350
-admissions in one tick, over the dispatch lease; 6.8 s counted in SQL). Since the Region scope's retirement, unrelated admissions
-share no lock at all.
+node-occupying `BLOCKED` rows and the preemption handoffs the rule has to judge. Decoding every holder for every admission would make
+a burst of N admissions N²/2 decodes under a shared lock, past the dispatch lease; with no Region scope, unrelated admissions
+share no lock at all either.
 
 Preemption handoff: when a predecessor gives way to a stronger successor at a step boundary and becomes `SUPERSEDED`, its claim
 is reserved for that successor until the successor claims or ends -- no other workflow takes the slot, the successor is not refused
@@ -5075,13 +5093,12 @@ other workflow admitted in that window shows the scope one over for as long as t
 
 Observability: occupancy is `gpu_fault_remediation_budget_active_claims{scope_type}` (node, job, domain, counted by the
 admission rule; an older release's rows add region, cluster and class by type until they end); waiting is
-`gpu_fault_remediation_budget_waiting_workflows` (by refusing scope type in `_by_scope`, `storm` for the breaker's), the rows the
+`gpu_fault_remediation_budget_waiting_workflows` (by refusing scope type in
+`gpu_fault_remediation_budget_waiting_workflows_by_scope{scope_type}`, `storm` for the breaker's), the rows the
 starvation guard passes over each tick in `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`, and the oldest
-waiter's age in `gpu_fault_workflow_pending_age_seconds_max`. No family is per cluster and none is a limit: there is no fixed
+waiter's age in `gpu_fault_workflow_pending_age_seconds_max`. No family is per cluster, none is a limit and no alert watches a saturated cluster: there is no fixed
 number left to compare with; which cluster a correlated fault hits, and how close it came to holding, is the breaker's families
-below. `gpu_fault_remediation_budget_cluster_active_claims`, `..._cluster_limit`, `..._region_limit`,
-`..._cluster_waiting_workflows` and the alert `GpuFaultRemediationBudgetClusterSaturated` (a cluster at its limit with waiters for
-30 minutes) went with the per-cluster limit. The alerts `GpuFaultRemediationBudgetStarved` (waiters for 30 minutes) and
+below. The alerts `GpuFaultRemediationBudgetStarved` (waiters for 30 minutes) and
 `GpuFaultWorkflowPendingAge` (the oldest `PENDING` workflow older than 30 minutes) stay; the handling is in the matching entries
 of administrator operations §8: confirm the holders still progress, and do not raise a limit to clear an alert. A waiting count
 cannot say how long one workflow has waited: the refusal that begins a wait
@@ -5147,10 +5164,10 @@ All node actions go through pull/claim/lease/result; **the control plane never i
 | Cross-cluster isolation | Every request checks that `X-GPU-Fault-Cluster-ID` is bound to the token; reading another cluster's objects returns 403 |
 | Node actions | HMAC signature + monotonic `fencing_token` + `issued_at`/TTL + `allowed_operations` allowlist + target node check |
 | Node action keys | v1 = one fleet-wide shared key; v2 = per-node keys (provided explicitly, or HMAC-derived from the fleet master key with the `gpu-fault/node-action/v1\0<cluster>\0<node>` context). Key source is `GPU_FAULT_NODE_ACTION_KEYS_DIR=/etc/gpu-fault/node-action-keys` or `…_KEYS_JSON`, at least 32 characters |
-| Transport | The regional install auto-generates node TLS cert/key; the signed heartbeat carries the certificate, and the control plane initiates HTTPS pinned to that certificate. The endpoint CIDR is read from the corresponding cluster registration |
-| Internal interfaces | `X-GPU-Fault-Processor-Replay` is accepted only on the loopback address and relies on `validate_direct_client_identity_environment()` to guarantee the client IP cannot be spoofed |
+| Transport | The regional install auto-generates node TLS cert/key; the signed heartbeat carries the certificate into the control plane's fleet Agent record, and the cluster executor reads that record and opens HTTPS to the Agent trusting exactly that certificate (in regional mode the control-plane processes build no node-action channel themselves). The endpoint CIDRs come from the cluster registration's `agent_endpoint_allowed_cidrs` |
+| Internal interfaces | `X-GPU-Fault-Processor-Replay` is accepted only on the loopback address and with a valid internal replay secret (otherwise 403), and relies on `validate_direct_client_identity_environment()` to guarantee the client IP cannot be spoofed |
 | Credentials on disk | `/etc/gpu-fault/node-agent.env` chmod 0600 |
-| Kubernetes permissions | Data-plane RBAC tightened verb by verb (§2.5); NodeCondition is **read-only**, and no Kubernetes Events are written |
+| Kubernetes permissions | Data-plane RBAC tightened verb by verb (§2.5); NodeCondition is **read-only**, and the data plane writes no Kubernetes Events |
 
 **What rotation actually looks like**:
 
@@ -5163,7 +5180,13 @@ All node actions go through pull/claim/lease/result; **the control plane never i
   401 window between "changing the registration" and "changing the data-plane Secret". The direction of expiry is safe: the window ending naturally only revokes the old credential and does not affect an
   Executor that has already switched over. The cost is that a revoked token remains valid within the window, so the window should be measured in minutes and closed out by confirming the retiring log line of
   `matched_token_slot` (§6.1 of `docs/管理员日常运维.md` (Administrator Daily Operations)).
-- **Aurora credentials**: refreshed periodically by `src/gpu_fault/aurora_credential_refresh.py`.
+- **Aurora credentials**: `src/gpu_fault/aurora_credential_refresh.py` runs hourly (:17 UTC) as the CPU-cluster CronJob
+  `gpu-fault-aurora-credential-refresh`: it reads `AWSCURRENT` from Secrets Manager and, when it differs from the Secret,
+  first opens the database with the new DSN and only then writes the Secret; every control-plane Pod mounts the Secret as
+  files and the connection pool re-reads `postgres-url` on every connect (`GPU_FAULT_STORE_URL_FILE`), so a rotation restarts
+  no Pod. Every run writes its outcome into the same Secret as `last-refresh-status.json` (exported as
+  `gpu_fault_aurora_credential_refresh_last_success_age_seconds`); a run that still fails after its retries also writes a
+  Warning Event `AuroraCredentialRefreshFailed`.
 
 **Audit**: there is no `OperationAudit` table (§4.3). Audit facts come from a combination of three places: the step-by-step execution records in the `workflow`
 object (including owner/epoch/time/result), the Agent-side ledger, and the
@@ -5171,9 +5194,10 @@ object (including owner/epoch/time/result), the Agent-side ledger, and the
 that is the cost of the current form.
 
 **High-risk actions and maintenance windows**: destructive steps are preceded by four gates: `VERIFY_NO_GPU_CLIENTS`, the fleet
-consistency gate, Agent heartbeat freshness (`AGENT_MAX_HEARTBEAT_AGE_SECONDS=90`), and the quiesce maintenance window.
+consistency gate, Agent heartbeat freshness (`GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS=90`), and the quiesce maintenance window; after the
+command is dequeued the Agent also runs its final ownership check (§3.1 ⑧ layer 5, a refusal is `OWNERSHIP_REFUSED`).
 
-The fourth gate needs to be spelled out separately because its name is easily misread: `AGENT_MAINTENANCE_WINDOW_SECONDS=420`
+The fourth gate needs to be spelled out separately because its name is easily misread: `GPU_FAULT_AGENT_MAINTENANCE_WINDOW_SECONDS=420`
 is **not** "a calendar period during which action is allowed", nor is it "an exemption from disconnection judgement while the Agent itself upgrades". It is a validity period written into that step's evidence after
 `QUIESCE_GPU_SERVICES` succeeds
 (`maintenance_window_started_at` / `maintenance_window_expires_at`,
