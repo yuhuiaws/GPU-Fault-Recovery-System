@@ -82,6 +82,11 @@ watcher 已接管时跳过后续主动取证。未知观察不冒充已退出。
 第二份必须比第二次触发前的文件更新，且读取前后的 inode/大小/mtime 一致。
 半写入文件在剩余预算内重试；旧文件、第二份缺失或 PID 变化都不能当作停滞。
 没有 FR 配置时不增加第二轮等待，不安装或自动开启 FR。
+触发和读取都按 rank 自己的 `/proc/<pid>/environ` 与挂载命名空间解析：触发写 `TORCH_NCCL_DEBUG_INFO_PIPE_FILE`
+指向的 FIFO（PyTorch 2.9 只在 `TORCH_NCCL_TRACE_BUFFER_SIZE` 大于 0 时创建它；只设 `TORCH_FR_BUFFER_SIZE` 没有 FIFO）；
+dump 前缀按 PyTorch 的优先级取 `TORCH_FR_DUMP_TEMP_FILE`，其次 `TORCH_NCCL_DEBUG_INFO_TEMP_FILE`，都未设置时依次尝试
+`$XDG_CACHE_HOME/torch/comm_lib_trace_rank_<rank>`、`$HOME/.cache/torch/comm_lib_trace_rank_<rank>`（HOME 未设置为 `/tmp`）
+和旧版的 `/tmp/nccl_trace_rank_<rank>`（`node_agent/operations/flight_recorder.py`）。
 
 新 plan 的 `triage_timeout_seconds=20`，Agent 上限 25 秒；
 `triage_fr_sample_interval_seconds=2`，可在 operation 参数中设为 1～10 秒。
@@ -139,10 +144,10 @@ collective 使用 PyTorch 2.10 collective 分支的操作类型、shape、dtype 
 manifest 的 `records` 包含 `rank/node_id/pid/process_start_ticks/path/sha256`，
 每次分析选择同一轮、不同 rank 的原始文件。适配器拒绝重复 rank、越界路径、
 混合版本和摘要不匹配，调用官方 `build_db(..., allow_incomplete_ranks=False)`。
-缺依赖返回 UNAVAILABLE，不自动安装、不在训练节点启动。已在独立 CPU 环境安装
-PyTorch 2.10.0+cpu 并实际调用官方引擎：114 组原生 `Op.match` 规则对照、
-10 组 `build_db` 正反例通过，包含 all_gather/reduce_scatter/coalesced。
-可用 `PYTHONPATH=src python -m tools.verify_fr_analyzer --report report.json` 重跑。
+缺依赖返回 UNAVAILABLE，不自动安装、不在训练节点启动。`tools.verify_fr_analyzer` 在装有
+PyTorch 2.10 的独立 CPU 环境中实际调用官方引擎：逐条对照原生 `Op.match` 规则，并运行
+`build_db` 正反例（包含 all_gather/reduce_scatter/coalesced）；
+用 `PYTHONPATH=src python -m tools.verify_fr_analyzer --report report.json` 运行，结果不进入仓库。
 运行时轻量匹配是保留版权声明的官方 collective 规则适配，不在控制面引入 torch；
 all-to-all 的 pairwise UNDECIDED、跨状态差异仍不强行判错。离线工具保留官方
 完整匹配结果与缺失 rank、shape 等细节。这不是实际 CUDA/NCCL 执行验收。
@@ -313,13 +318,11 @@ RDMA 数值只引用触发节点，不能伪称已获取其他所有节点的流
 不能由此声称所有训练 rank 都已被识别。
 
 workload cgroup 从哪里来。watcher 只从 Pod 注解 `gpu-fault.io/cgroup-path` 得到容器的 cgroup 路径，
-而这个路径含运行时容器 ID，容器启动前不存在，受管 YAML 契约和产品都不写它；于是每个真机受管任务的
-hung DAG 都只有 `workload_cgroup_paths_by_node={node: []}`。HyperPod GF-GENERAL-LIVE-011 live3/live4 全部变体
-（2026-10-24/25，含 b161 之前的 bf1bb0037847）：两节点的 summary 都是 `SCOPE_UNKNOWN`，`after_summary` 无可选节点，
-triage 以 `NO_VALID_SURVEY` 一个节点都不请求（`active_requested_node_count=0`、节点预算 2 未用），
-`fr_enabled` 与 `fr_disabled` 都报 "COLLECT_HUNG_TRIAGE sampled no rank process"；VALIDATE_FABRIC 的
-`scope_basis=NOT_REPORTED` 也出自同一原因（summary 在计算任务端口绑定之前就返回了）。
-现在控制面另按节点下发 kubelet 在 `containerStatuses[].containerID` 报告的容器 ID
+而这个路径含运行时容器 ID，容器启动前不存在，受管 YAML 契约和产品都不写它；只靠注解时受管任务的
+hung DAG 只有 `workload_cgroup_paths_by_node={node: []}`：summary 只能是 `SCOPE_UNKNOWN`，`after_summary` 无可选节点，
+triage 以 `NO_VALID_SURVEY` 一个节点都不请求，VALIDATE_FABRIC 也只能报 `scope_basis=NOT_REPORTED`
+（summary 在计算任务端口绑定之前就返回）。
+因此控制面另按节点下发 kubelet 在 `containerStatuses[].containerID` 报告的容器 ID
 （`workload_container_ids_by_node`，只含没有显式路径的运行中容器，只接受 64 位小写十六进制，每节点最多 64 个；
 没有可用 ID 时不下发该参数）。Node Agent 在 summary 和 triage 开始时读本机 `/proc/<pid>/cgroup`，
 把以该 ID 命名的路径段（`cri-containerd-<id>.scope`、`crio-<id>.scope`、`docker-<id>.scope`、cgroupfs 的 `<id>`）
@@ -330,10 +333,10 @@ triage 以 `NO_VALID_SURVEY` 一个节点都不请求（`active_requested_node_c
 （`reason=CONTAINER_CGROUP_NOT_FOUND`，扫描被截断时为 `PROCESS_SCAN_INCOMPLETE`），只找到部分时
 `scan_complete=false`。只读 `/proc`，不扩大 attach 范围：其他作业的容器、同一 GPU 上别的进程都不在 scope 内。
 旧 Agent 忽略该参数，行为同修复前；旧 workflow 没有该参数，也同修复前。
-被动通信监测（communication monitor）原先同样只认显式路径：受管 Pod 的租约里 `expected_target_count=1`
+被动通信监测（communication monitor）只认显式路径时，受管 Pod 的租约有 `expected_target_count=1`
 却没有 target（Agent healthz `expected_targets=1`、`assigned_targets=0`），从不采样，hung summary 的
-`communication_history` 也就一直是 `UNAVAILABLE`/`INSUFFICIENT_SAMPLES`——只读证据缺失，没有采错进程。
-现在 target 可以带 `container_ids`（该节点上没有显式路径的运行中容器的 64 位十六进制运行时 ID，最多 64 个；
+`communication_history` 只能是 `UNAVAILABLE`/`INSUFFICIENT_SAMPLES`——只读证据缺失，不会采错进程。
+因此 target 可以带 `container_ids`（该节点上没有显式路径的运行中容器的 64 位十六进制运行时 ID，最多 64 个；
 有一个容器既无显式路径也无可用 ID、路径为根或含 `..`、或 ID 超过 64 个，该节点仍不分配 target）。
 旧 Agent 用 `extra="forbid"` 校验租约，多一个字段就拒收整个计划，所以新字段按 Agent 能力下发：
 升级后的 Agent 在 heartbeat 里通告 `communication_monitor_version=communication-monitor/v2`，
@@ -345,11 +348,11 @@ Agent config digest 里的 `communication_monitor_version` 仍记 v1（它表示
 且不写历史行，绝不记成空任务。兼容：旧控制面不认识 v2，不给升级后的 Agent 租约，在控制面也升级之前被动监测空转
 （发布先升级控制面再滚 Agent 波次；旧控制面对受管 Pod 本来也不分配 target）。
 
-QUIESCE_GPU_SERVICES 的设备清扫也读同一个缺失的输入：清扫只可 TERM/KILL 目标 GPU 上位于受影响 workload cgroup
-内的持有者，受管 Pod 的 scope 一直为空，停训后仍握着 GPU 的训练进程留在 `unswept_device_holders`
+QUIESCE_GPU_SERVICES 的设备清扫也读同一个输入：清扫只可 TERM/KILL 目标 GPU 上位于受影响 workload cgroup
+内的持有者；scope 为空时，停训后仍握着 GPU 的训练进程留在 `unswept_device_holders`
 （`reason=outside_workload_cgroup_and_process_whitelist`），VERIFY_NO_GPU_CLIENTS（以及 reset 自己的预检）
-以 `GPU device clients are still active` 拒绝 reset——fail-closed，不会带着作业进程 reset，只是该恢复的没有恢复。
-现在计划在 QUIESCE 里同样冻结 `workload_container_ids_by_node`，但只在同一计划的 STOP_WORKLOADS 排在该 QUIESCE 之前时才带
+以 `GPU device clients are still active` 拒绝 reset——fail-closed，不会带着作业进程 reset。
+因此计划在 QUIESCE 里同样冻结 `workload_container_ids_by_node`，但只在同一计划的 STOP_WORKLOADS 排在该 QUIESCE 之前时才带
 （清扫只会遇到已停 attempt 的残留进程，绝不碰计划未停的作业）；Agent 在 quiesce 开始、任何服务停止之前用同一解析器解析，
 加进清扫 scope；ID 格式不对（非 64 位十六进制、每节点超过 64 个、不是列表/映射）在武装 fail-safe 和停服务之前就拒绝 quiesce。
 没有进程的容器不贡献 scope（STOP_WORKLOADS 之后这是常态），扫描被截断只加入看到的容器；scope 之外的持有者照旧留给 VERIFY 拒绝。
@@ -415,15 +418,11 @@ bundle 命令带到节点的 `hung_triage_decision` 是线上形式（`hung_bund
 全量判定只在 workflow 记录（bundle step 参数、triage step 执行记录）。节点侧观测请求预算 256 KiB
 （`OBSERVATION_REQUEST_BUDGET_BYTES`），超预算先裁掉仅作上下文的 `hung_triage_decision`（占位写明 `omitted`、字节数、SHA-256，
 manifest/结果的 `observation_request_trimmed` 列键），bundle 照常采集；裁后仍超才拒绝，拒绝带 `error` 消息、
-`failed_component`、`failure_stage`、`worker_started`。真机 `tid_namespace` 曾因 259 KB 全量判定在 5 ms 内整体失败
-（`error="ValueError"`，worker 未启动）。
-worker 交回的单条结果上限 1 MiB（`OBSERVATION_RESULT_BUDGET_BYTES`，含换行）。真机 HyperPod `fr_enabled`（2026-10-25 23:05Z）：
-triage 认全两节点 16 个 rank、每 rank 两次 dump 都在 triage 窗口内写入（PyTorch 日志 32 行 "preparing to dump debug info"，
-16 个 29.5 KB 的 dump 在 `/tmp/nccl_trace_rank_*`），但 8 rank × 2 份 dump × 64 条操作摘要被序列化四份
-（`last_entry`、`last_entries_by_pg`、series 的 `first` 与 `second`），叠在不开 FR 时 8 rank 约 290 KB 的进程/栈序列之上约 1.2 MB，
-worker 把整份结果换成 `{"status":"RESULT_SIZE_LIMIT","ranks":[]}`，两节点的 step `node_failures` 都是
-`ObservationIncomplete: RESULT_SIZE_LIMIT`、`node_results={}`，判定一个进程都没有，验收运行器读到 "sampled no rank process"——
-rank 发现、容器 scope 与 dump 位置都没有问题，任何开 FR 的 8 GPU 节点都会触发。现在 triage 交出结果前先按
+`failed_component`、`failure_stage`、`worker_started`。
+worker 交回的单条结果上限 1 MiB（`OBSERVATION_RESULT_BUDGET_BYTES`，含换行）。开 FR 的 8 GPU 节点上，
+每 rank 两份 dump、每组 64 条操作摘要会被序列化四份（`last_entry`、`last_entries_by_pg`、series 的 `first` 与 `second`），
+叠在进程/栈序列之上即可超过该上限；整份结果若被换成 `{"status":"RESULT_SIZE_LIMIT","ranks":[]}`，
+控制面就读不到任何进程。因此 triage 交出结果前先按
 `operations/triage_budget.bounded_triage_result` 的阶梯压到 `TRIAGE_RESULT_BUDGET_BYTES`（1 MiB 减 64 KiB）以内：
 先无损地把 `last_entries_by_pg` 中 series 快照已带的操作列表换成 `semantic_entries_in` 指针，再去 `unfinished_entries`、
 把每组操作列表缩到前 32/16/8 条（未完成操作在前）、整列去掉（`progress` 水位保留），再把栈/进程序列只留最新一次采样，
@@ -436,9 +435,9 @@ rank 发现、容器 scope 与 dump 位置都没有问题，任何开 FR 的 8 G
 读取器的 `last_entry` 不再重复该组的 `semantic_entries`。只有骨架本身就超线的文档才换成占位，
 占位带 `error`（字节数、预算、最重字段）、`failed_component=observation_worker`、`failure_stage=WORKER_OUTPUT`、`result_bytes`，
 并以 `ranks_summary`（pid、rank、状态，按结果顺序装满 16 KiB 为止）、`ranks_total`、`ranks_summary_truncated` 点名被替换的 rank。
-本地复现：真机 8 rank 形状 1,006 KB → 781 KB（只用无损一级），16 rank 2,003 KB → 875 KB，两者的控制面判定与全量结果相同；
-64 rank 8.85 MB → 369 KB（地板，5.7 KB 一个 rank），FR 时序/快照分支的判定与全量相同。summary 与 bundle 走同一条 worker 结果线，
-但 bundle 结果只是引用（不到 1 KB）、summary 按构造有界（每节点最多 256 行、实测 365 字节一行），都不设地板。
+裁剪不改变控制面判定：8/16 rank 形状只用到前几级，64 rank 形状落到地板时，FR 时序/快照分支的判定仍与全量结果相同
+（`tests/node_agent/test_hung_triage_result_budget.py`、`tests/node_agent/test_hung_triage_skeleton_floor.py`）。summary 与 bundle 走同一条 worker 结果线，
+但 bundle 结果只是引用（不到 1 KB）、summary 按构造有界（每节点最多 256 行），都不设地板。
 hung 包跳过 DCGM diag、bug-report 与 strace；
 FR 文件读取上限 64 MiB，结构遍历有界，环形 pickle 不递归失控。
 20 秒是新版 triage 内部采样预算；生产 Agent 另用隔离只读 worker 约束父进程等待，
@@ -446,19 +445,16 @@ FR 文件读取上限 64 MiB，结构遍历有界，环形 pickle 不递归失�
 有 job/attempt 的 summary/triage/hung诊断包，各允许每节点每 300 秒最多两次新命令，
 使用持久化预算及节点文件锁，Agent 重启不清空限额；命令重试先命中原幂等结果。
 节点同时只准一个 summary/triage/hung诊断包运行，单节点最多 8 个 py-spy。
-该唯一 worker 槽也被每 30 秒的被动通信采样占用：真机 `fr_temporal_completion`（HyperPod，2026-10-26 04:21:31Z）两节点
-在采样 epoch 开始后 1.45 s 收到 triage，槽均被占，各 1.2 s 回 `WORKER_STILL_RUNNING`，无 worker 运行、判定零进程。
-现在控制面命令等待该槽（自身 timeout 的 0.3、至多 10 s 且在 timeout 内；triage 至多 8.4 s、bundle 至多 10 s，不超控制面单节点 30 s），
+该唯一 worker 槽也被每 30 秒的被动通信采样占用；采样 epoch 刚开始时到达的命令会遇到被占的槽。
+因此控制面命令等待该槽（自身 timeout 的 0.3、至多 10 s 且在 timeout 内；triage 至多 8.4 s、bundle 至多 10 s，不超控制面单节点 30 s），
 占槽者为被动采样时抢占它（停整棵子树，下个 epoch 再采），命令间从不互抢；整段等待仍拿不到才回 `WORKER_STILL_RUNNING`，
 且是**可重试**（`worker_started=false`、点名占槽者与等待秒数），survey 适配器在单节点 30 s 内重发。
 worker 拿到槽后按"deadline 在规划时刻所剩时间减 2.5 s"规划 triage 预算（默认 20 s；supervisor 交的是 deadline 本身——
-`CLOCK_MONOTONIC` 读数——guard 与 worker 的启动在训练占满 CPU 时可达数秒，已在其中扣除，早于本修复的 Agent 不扣），等过槽的命令照样把能采的采完；
-8 rank 两份 dump 实测约 4.5 s 配对完（`slot_wait` 0.05 s），远在 20 s 内。triage/bundle 在检查点发部分文档
+`CLOCK_MONOTONIC` 读数——guard 与 worker 的启动在训练占满 CPU 时可达数秒，已在其中扣除；较早版本的 Agent 不扣），等过槽的命令照样把能采的采完。
+triage/bundle 在检查点发部分文档
 （triage：RANKS_DISCOVERED→PROCESS_SERIES_SAMPLED→FIRST_FLIGHT_DUMPS_READ，带 dump 的检查点在副本上走裁剪阶梯；
 bundle：每采完一项发 `BUNDLE_CAPTURING` 带已采/待采/`elapsed_seconds`），supervisor 的 deadline 或抢占落在最终结果前时
-交回最后检查点（`PARTIAL_TIMEOUT`/`PREEMPTED`），慢 triage/bundle 带回已采 rank/dump 与缺项而非空结果；最终结果已到、输出已结束的 worker 树，supervisor 等其退出直至 deadline（原只等 0.1 s，CPU 饥饿时完整结果会被记为 `PARTIAL_TIMEOUT`）。
-真机 `fr_second_missing`（2026-10-26 04:46Z）bundle 仅在共享节点 `hyperpod-i-08d8…`（另载一 lane 的 prewarm/训练 Pod、
-被动采样目标更多）以 `WORKER_STILL_RUNNING` 整体失败、另一节点正常；本修复令其先抢占等待，真超时交回已采清单。
+交回最后检查点（`PARTIAL_TIMEOUT`/`PREEMPTED`），慢 triage/bundle 带回已采 rank/dump 与缺项而非空结果；最终结果已到、输出已结束的 worker 树，supervisor 等其退出直至 deadline，CPU 饥饿时完整结果也不会被记为 `PARTIAL_TIMEOUT`。
 诊断子进程 stdout+stderr 上限 1 MiB，超时后 kill 等待再限 0.2 秒，
 不在 subprocess.run 的无界 wait 上卡死。通信文件读取和 FR 解析使用最多四个
 有界等待的读取槽，超时线程仍占槽直到实际退出，防止故障期间无限创建线程。
@@ -483,8 +479,6 @@ subreaper guard 回收整个工具子树；父进程超时可返回部分证据�
 `diagnostic inconclusive`。超过执行期限后不再启动新步骤，只有交接仍运行；
 超过 lifetime 则按既有路径交给 `ESCALATE_OPERATOR`。计划里一旦含任何改动节点的
 操作（合并后的复位/重启等），仍走原失败语义。普通只读诊断（详细设计 §6.3）不变。
-（HyperPod 真机 GF-GENERAL-LIVE-011：VALIDATE_FABRIC 等满 600 s 后 FAILED，
-`ESCALATE_SUPPORT` 从未执行，没有工单也没有通知。）
 交接通知是专用的 `hung-support-handoff-zh-v1`（`notifications/hung_support.py`，category
 `OPERATOR_REVIEW`，每个 workflow 一封），不是硬件升级邮件：后者写「hardware taken out of service」、节点
 「unschedulable and quarantined」，对只读 hung 诊断都不成立。通知按各步骤自己的记录
@@ -510,9 +504,9 @@ NCCL 在 proxy 线程调用网络插件的 listen/connect/accept（`src/transpor
 的 `recvProxySetup`、`sendProxyConnect`、`recvProxyConnect`），aws-ofi-nccl 按
 调用线程创建 endpoint（`get_ep(domain_key, nccl_net_ofi_gettid())`），EFA QP 随之
 建在 proxy 线程上。Agent 因此把 QP 的线程号经 `/proc/<pid>/task/<tid>` 归到所属
-rank 进程；归不到参与者的线程（其他作业、内核 QP）不计入。早于此修复的 Agent
-在真实 NCCL/EFA 任务上从来匹配不到 rank PID，绑定总是 UNKNOWN
-（`reason=TASK_RDMA_COVERAGE_INCOMPLETE` 为参与者未全覆盖）。
+rank 进程；归不到参与者的线程（其他作业、内核 QP）不计入。较早版本的 Agent 把该 `pid`
+当作进程号，在真实 NCCL/EFA 任务上匹配不到 rank PID，绑定为 UNKNOWN；参与者未全覆盖时
+`reason=TASK_RDMA_COVERAGE_INCOMPLETE`。
 任务端口范围无法确定时（未绑定或绑定无效），只要本 workflow 之后有
 `ESCALATE_SUPPORT`，VALIDATE_FABRIC 立即以显式 UNKNOWN 结束：步骤 SUCCEEDED，
 `details.fabric_status=UNKNOWN`、`fabric_evidence_scope=TASK_SCOPE_UNAVAILABLE`
