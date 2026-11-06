@@ -933,10 +933,11 @@ A GPU metric finding stores `policy_source`, `policy_version`,
   an active finding (the batch re-grades it, clears it, or leaves it undecided on a counter reset) is also kept as `GPU_METRICS` raw
   evidence, once per batch; summaries of healthy nodes are not kept, as before.
 
-The diagnostics for a GPU/HBM temperature warning are not a passive metric read. The control plane generates
-`FREEZE_EVIDENCE -> RUN_DCGM_DIAGNOSTIC -> VALIDATE_GPU`; the Node Agent runs the non-destructive
-`dcgmi diag -r 1 -j` and writes the raw JSON, stderr, SHA-256 and result status to the root-only evidence directory.
-`PASS/WARN` enters cooldown observation; while the warning still exists within
+A GPU/HBM temperature warning takes the read-only diagnostic contract (`DIAGNOSTIC_ONLY`, `health_recovery_contract`):
+the control plane generates `FREEZE_EVIDENCE -> VALIDATE_GPU`, with no DCGM diagnostic and no cordon; only a GPU-class
+warning that is not on that contract's list generates `FREEZE_EVIDENCE -> RUN_DCGM_DIAGNOSTIC -> VALIDATE_GPU` (the Node
+Agent runs the non-destructive `dcgmi diag -r 1 -j` and writes the raw JSON, stderr, SHA-256 and result status to the
+root-only evidence directory). While the warning still exists within
 `GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` (default 120 seconds) validation
 stays `WAITING`, and succeeds once it clears. The grace is the minimum wait, not the verdict: at its end, if no GPU metrics
 batch newer than the current state of a WARNING-level growth finding (`thermal_violation_total_us` and its power /
@@ -952,8 +953,11 @@ the grace end) fails, naming the finding; a cleared one succeeds. The collector 
 and recovery and otherwise one health summary per node on its fixed phase every 270-330 s, so a fixed grace alone would
 read one physical sequence two ways: a summary landing between the confirmed and the recovered reads makes the recovered
 edge a zero delta and validation passes; a recovered edge that re-mints the finding, with the only newer summary inside the
-grace carrying a counter reset that cannot re-judge it, fails validation at the grace end. On `FAIL/INCONCLUSIVE`, or when newer data re-judges the warning as still present
-after the grace, the original workflow fails and idempotently escalates to `DRAIN`: mark unschedulable, stop the affected jobs, isolate the node, collect the full
+grace carrying a counter reset that cannot re-judge it, fails validation at the grace end. When newer data re-judges the warning as still present after the grace, VALIDATE_GPU fails: a read-only contract's
+chain is not escalated and its incident ends RECOVERED "diagnostic inconclusive", while a temperature that reaches the
+device's operating limit opens `ENVIRONMENT_REVIEW` through a new CRITICAL finding (a terminal hold handed to an operator).
+For a warning off that list, `FAIL/INCONCLUSIVE` or a failed VALIDATE_GPU behind it fails the original workflow, which
+idempotently escalates to `DRAIN`: mark unschedulable, stop the affected jobs, isolate the node, collect the full
 diagnostic bundle and validate the GPU. This escalation does not include `RESTORE_SCHEDULING` or `RESTART_WORKLOAD`; recovery is only possible after
 the fault clears and an administrator has handled it.
 

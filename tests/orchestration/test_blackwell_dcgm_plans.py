@@ -6,13 +6,17 @@ containment prefix a ``memoryDiagnostics: OBSERVE`` profile runs before it
 blocks; a pending memory repair hands an operator the reboot; a confirmed
 unhealthy fabric (174/175) takes the full GPU + NVSwitch reset over the node's
 whole inventory, as an untrained one does; and the findings a product window
-raises are that window's to judge. Findings are produced by the real
+raises are that window's to judge. The WARNING diagnostics -- a link recovery
+(1211, 1213) graded like the Hopper NVLink counters, a degraded fabric (174/175)
+-- take the read-only chain and never drain. Findings are produced by the real
 ``GpuMetricsService`` from synthetic, documentation-derived samples.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
+
+import pytest
 
 from gpu_fault.app import default_simulated_profile
 from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
@@ -27,7 +31,12 @@ from gpu_fault.gpu_memory_repair_policy import (
     MEMORY_UNREPAIRABLE,
 )
 from gpu_fault.gpu_metrics import GpuMetricSample, GpuMetricSource, GpuMetricsService
-from gpu_fault.gpu_nvlink5_policy import NVLINK5_COUNTERS, NVLINK5_RECOVERY_FAILED
+from gpu_fault.gpu_nvlink5_policy import (
+    NVLINK5_COUNTERS,
+    NVLINK5_RECOVERY_EVENTS,
+    NVLINK5_RECOVERY_FAILED,
+    NVLINK5_RECOVERY_SUCCESSFUL,
+)
 from gpu_fault.models import (
     CapabilityName,
     IncidentState,
@@ -50,6 +59,7 @@ from tests.orchestration.test_containment_before_compile_block import (
     OBSERVE_PROFILE,
     observe_profile,
 )
+from tests.orchestration.test_dcgm_gap_field_plans import assert_read_only_diagnostic
 
 Op = WorkflowOperation
 CLUSTER = "cluster-a"
@@ -228,3 +238,53 @@ def test_a_product_window_owns_what_its_links_raise():
         Op.RESTART_FABRIC_MANAGER,
         Op.RESTART_NODE,
     } <= FABRIC_MANAGER_OWNED_OPERATIONS
+
+
+@pytest.mark.parametrize(
+    "counter",
+    [NVLINK5_RECOVERY_SUCCESSFUL, NVLINK5_RECOVERY_EVENTS],
+    ids=["1211-recovery-successful", "1213-recovery-events"],
+)
+def test_a_link_recovery_diagnoses_read_only_like_the_hopper_counters(counter):
+    """1211 and 1213 take the NVLink family rule the Hopper ``nvlink_*_error_total``
+    counters take (``gpu_nvlink5_policy``), and with it their read-only chain:
+    no DRAIN for a counter (GF-GENERAL-LIVE-020's NVLink5 member is 1213)."""
+
+    (finding,) = node_findings([[sample(counter, 0)], [sample(counter, 1)]])
+
+    assert_read_only_diagnostic(
+        finding, "a link recovery is graded like the Hopper NVLink counters"
+    )
+
+
+def degraded_fabric_samples(mask: int, summary: int) -> list[GpuMetricSample]:
+    samples = []
+    for gpu in GPUS:
+        degraded = gpu == GPUS[2]
+        samples += [
+            sample(FABRIC_HEALTH_MASK, mask if degraded else 0x11AA, gpu),
+            sample(FABRIC_HEALTH_SUMMARY, summary if degraded else 1, gpu),
+        ]
+        if degraded:
+            samples.append(sample(FABRIC_HEALTH_HELD_SECONDS, 90, gpu))
+    return samples
+
+
+@pytest.mark.parametrize(
+    ("mask", "summary"),
+    [(0x11A9, 1), (0x11AA, 3)],
+    ids=["bandwidth-degraded", "limited-capacity"],
+)
+def test_a_degraded_fabric_diagnoses_read_only_and_never_drains(mask, summary):
+    """A degraded mode the Fabric Manager applied at initialisation is a WARNING
+    and an operator notice (``gpu_fabric_health``); no reset by the product
+    undoes it, and its own VALIDATE_GPU fails while it holds -- so the generic
+    chain's validation failure would always have drained the node."""
+
+    (finding,) = node_findings([degraded_fabric_samples(mask, summary)])
+
+    assert finding.metric_name == FABRIC_HEALTH
+    assert finding.severity.value == "warning", finding.severity
+    assert_read_only_diagnostic(
+        finding, "a degraded fabric is a WARNING and an operator notice"
+    )
