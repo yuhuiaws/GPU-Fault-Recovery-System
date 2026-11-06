@@ -3,9 +3,13 @@
 This acceptance-only safeguard owns one bounded stop of `kubelet.service` or
 `gpu-fault-node-agent.service`. It is not a production recovery operation, a
 generic service probe, or authorization to run DESTR008. Local tests do not
-establish LIVE behavior. EKS-only HyperPod, `NodeRecovery=None`, disabled job
-auto-restart/auto-resume, and the prohibition on provider replacement remain
-unchanged.
+establish LIVE behavior. The provider's own recovery stays off (HyperPod
+`NodeRecovery=None`; plain EKS `eks-managed` node auto repair disabled), job
+auto-restart/auto-resume stays disabled, and the prohibition on provider
+replacement remains unchanged. The window binds the identity the node's Agent
+records (the Node UID on HyperPod, the EC2 instance id parsed from a plain EKS
+node's `providerID`; `node_agent_identity.agent_node_identity`) and refuses a
+node whose provider it cannot tell.
 
 ## Controller API
 
