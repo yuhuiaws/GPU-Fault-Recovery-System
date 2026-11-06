@@ -14,6 +14,7 @@ from gpu_fault.app.periodic_services import (
     identity_registries_now,
 )
 from gpu_fault.env_validation import training_health_monitor_enabled
+from gpu_fault.notification_limits import NOTIFICATION_DISPATCH_BATCH_MAX
 from gpu_fault.store.contracts import WakeupChannel
 
 if TYPE_CHECKING:
@@ -338,6 +339,30 @@ def start_notification_worker(
 ) -> Thread:
     interval = float(os.getenv("GPU_FAULT_NOTIFICATION_POLL_SECONDS", "2"))
     cap = float(os.getenv("GPU_FAULT_NOTIFICATION_THROTTLE_MAX_SECONDS", "300"))
+    reported: set[int] = set()
+
+    def claim_limit(configured: int) -> int:
+        """GPU_FAULT_NOTIFICATION_BATCH_SIZE held to what one cycle claims.
+
+        A role rendered from a record written while the admin config accepted
+        up to 1000 can carry more than ``dispatch_outbox`` takes; refusing it
+        failed every cycle and delivered nothing, so the cycle claims the bound
+        and says so once.
+        """
+
+        if configured <= NOTIFICATION_DISPATCH_BATCH_MAX:
+            return configured
+        if configured not in reported:
+            reported.add(configured)
+            LOGGER.warning(
+                "GPU_FAULT_NOTIFICATION_BATCH_SIZE=%d is above the %d deliveries "
+                "one dispatch cycle claims; claiming %d per cycle until "
+                "spec.notificationDelivery.batchSize is lowered",
+                configured,
+                NOTIFICATION_DISPATCH_BATCH_MAX,
+                NOTIFICATION_DISPATCH_BATCH_MAX,
+            )
+        return NOTIFICATION_DISPATCH_BATCH_MAX
 
     def dispatch() -> None:
         current_delay = 0.0
@@ -346,7 +371,9 @@ def start_notification_worker(
             try:
                 report = context.advisory_notifications.dispatch_outbox(
                     owner,
-                    limit=int(os.getenv("GPU_FAULT_NOTIFICATION_BATCH_SIZE", "25")),
+                    limit=claim_limit(
+                        int(os.getenv("GPU_FAULT_NOTIFICATION_BATCH_SIZE", "25"))
+                    ),
                     lease_seconds=int(
                         os.getenv(
                             "GPU_FAULT_NOTIFICATION_LEASE_SECONDS",

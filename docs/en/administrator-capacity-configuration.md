@@ -304,7 +304,8 @@ complete. When the per-cluster spool depth is off its default, earlier releases 
 (not into the digest of the ingress that reads it); such a record verifies against those earlier role digests and is
 re-digested with the current readers inside the same site operation lock, its content unchanged.
 
-Reading persisted or online-captured state performs only structural validation without applying the empirical floors of §5: an old site below the floors is
+Reading persisted or online-captured state performs only structural validation without applying the empirical floors of §5, nor the notification
+dispatcher's 100-per-cycle bound (`notificationDelivery.batchSize` is read within the earlier 1..1000): an old site below the floors is
 a fact, and refusing to read would only prevent the administrator from loading the state to plan a fix. Every entry point that generates a new desired (file,
 preset, plan) validates fully, and a combination below the floors is refused naming both fields.
 
@@ -583,13 +584,15 @@ The range of each field (the `validate` of each `AdminConfig` section; a value o
 | `processor.*AdmissionFlushConcurrency` and `*Floor` (six) | each 1..1024, the floor at most the ceiling | 96/96, 48/48, 24/12 |
 | `workflow.pollIntervalSeconds` / `dispatcherWorkers` | 0.5..60 / 1..64 | 5 / 8 |
 | `workflow.departedNodeCleanup` | boolean | `true` |
-| `notificationDelivery.batchSize` / `maxAttempts` | 1..1000 / 1..32 | 25 / 8 |
+| `notificationDelivery.batchSize` / `maxAttempts` | 1..100 (what the control-worker's notification dispatcher claims per cycle, the bound it shares with the dispatcher) / 1..32 | 25 / 8 |
 | `evidence.retentionHours` / `maxRecordsPerNode` | 1..8760 / 100..1000000 | 24 / 10000 |
 | `cpuControlPlane.rollingUpdate.mode` / `waitIntervalSeconds` | `rolling` or `unchanged` / 900..3600 | `rolling` / 1800 |
 | `cpuControlPlane.rollbackAlarms.capacity` / `notRestored` | 1..255 letters, digits, `.`, `_` or `-` (first a letter or digit), the two different | see the template |
 
 On top of these, the cross-field empirical floors of the rule table below and the connection budget of §4.7 are
-validated.
+validated. Earlier releases accepted `notificationDelivery.batchSize` up to 1000: such a `desired.json` still reads (the
+reading rule of §4.5), but the next `config` must lower it into 1..100; until then the dispatcher claims at most 100 per
+cycle and logs one warning per process.
 
 The field names in the YAML are the camelCase spelling of the snake_case field names in `desired.json`; both derive from the same
 schema, declared once. Fields absent from the file inherit the currently persisted values. An ordinary code upgrade keeps the current

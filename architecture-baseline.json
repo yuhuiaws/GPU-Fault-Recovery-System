@@ -9,7 +9,7 @@
     "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 978,
     "src/gpu_fault/host_health.py:NodeHealthPolicy": 844,
     "src/gpu_fault/node_agent/quiesce.py:GpuServiceQuiesceManager": 848,
-    "src/gpu_fault/notification_service.py:AdvisoryNotificationService": 1030,
+    "src/gpu_fault/notification_service.py:AdvisoryNotificationService": 1028,
     "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1798,
     "src/gpu_fault/policy/engine.py:GpuFaultPolicyEngine": 1358,
     "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator": 1701,

@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from gpu_fault import notification_limits
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.capacity_evidence import (
     DEFAULT_LARGEST_CLUSTER_NODE_COUNT,
@@ -465,10 +466,17 @@ class NotificationDeliveryConfig(_Section):
     batch_size: int = 25
     max_attempts: int = 8
 
-    def validate(self) -> None:
-        if not 1 <= self.batch_size <= 1000:
+    def validate(self, *, authoring: bool = True) -> None:
+        # A batch is what one dispatch cycle claims (``notification_limits``).
+        # A record from when 1..1000 was accepted still reads, to be lowered.
+        high = (
+            notification_limits.NOTIFICATION_DISPATCH_BATCH_MAX if authoring else 1000
+        )
+        if not 1 <= self.batch_size <= high:
+            why = ": the notification dispatcher claims at most that many per cycle"
             raise AdminConfigError(
-                "spec.notificationDelivery.batchSize must be within 1..1000"
+                f"spec.notificationDelivery.batchSize must be within 1..{high}"
+                + (why if authoring else "")
             )
         if not 1 <= self.max_attempts <= 32:
             raise AdminConfigError(
@@ -575,18 +583,18 @@ class AdminConfig(_Section):
         """Check every field and the cross-object capacity rules.
 
         ``enforce_capacity_evidence=False`` is for reading a recorded or live
-        state: a site that predates the perf-evidence floors really runs what
-        it runs, and refusing to read that fact would leave the administrator
-        unable to load the state at all to plan the fix. Every path that
-        authors a desired config (file, preset, plan) keeps the default and
-        refuses.
+        state: a site that predates the perf-evidence floors (or the shared
+        notification batch bound) really runs what it runs, and refusing to
+        read that fact would leave the administrator unable to load the state
+        at all to plan the fix. Every path that authors a desired config
+        (file, preset, plan) keeps the default and refuses.
         """
 
         self.capacity.validate(enforce_connection_budget=enforce_capacity_evidence)
         self.aurora.validate()
         self.processor.validate()
         self.workflow.validate()
-        self.notification_delivery.validate()
+        self.notification_delivery.validate(authoring=enforce_capacity_evidence)
         self.evidence.validate()
         self.cpu_control_plane.validate()
         capacity = self.capacity

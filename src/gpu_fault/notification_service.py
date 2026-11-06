@@ -18,6 +18,7 @@ from gpu_fault.models import (
     NotificationStatus,
     WorkflowOperation,
 )
+from gpu_fault.notification_limits import require_dispatch_batch
 from gpu_fault.notification_preview import (
     AdvisoryNotApplicableError as AdvisoryNotApplicableError,
 )
@@ -985,8 +986,7 @@ class AdvisoryNotificationService:
         retry_base_seconds: int = 15,
         retry_max_seconds: int = 900,
     ) -> NotificationDispatchReport:
-        if not 1 <= limit <= 100:
-            raise ValueError("dispatch limit must be between 1 and 100")
+        require_dispatch_batch(limit)
         if lease_seconds < 30:
             raise ValueError("notification lease must be at least 30 seconds")
         now = datetime.now(timezone.utc)
@@ -1415,8 +1415,7 @@ class AdvisoryNotificationService:
         )
 
     def dispatch_pending(self, limit: int = 25) -> NotificationDispatchReport:
-        if not 1 <= limit <= 100:
-            raise ValueError("dispatch limit must be between 1 and 100")
+        require_dispatch_batch(limit)
         # Newest-first, then re-ordered oldest-first below, rather than reading
         # the oldest ``dispatch_scan_limit`` rows directly: expired advisories and
         # drills stay pending forever and accumulate at the old end, so an

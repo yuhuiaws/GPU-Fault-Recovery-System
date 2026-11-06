@@ -9220,7 +9220,7 @@ applies only to such sites. The release engine renders the channel and topic int
 | `GPU_FAULT_NOTIFICATION_ASYNC_DELIVERY` | `true`; business requests only write to the Aurora outbox |
 | `GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED` | `true` on all three roles in the regional manifests (with asynchronous delivery the startup guard requires it); the outbox dispatcher thread runs only in the control-worker (`GPU_FAULT_SERVICE_ROLE=worker`) |
 | `GPU_FAULT_NOTIFICATION_LEASE_SECONDS` | dispatcher claim lease, default 120 seconds, at least 30 |
-| `GPU_FAULT_NOTIFICATION_BATCH_SIZE` | Claims per cycle, default 25, from admin-config `spec.notificationDelivery.batchSize`; admin-config accepts 1..1000 but the dispatcher accepts only 1..100, and above 100 every cycle fails and nothing is delivered |
+| `GPU_FAULT_NOTIFICATION_BATCH_SIZE` | Claims per cycle, default 25, from admin-config `spec.notificationDelivery.batchSize` (1..100, the bound it shares with the dispatcher); only the control-worker's dispatcher reads it; a value above 100 in an older record still loads, and the dispatcher claims 100 per cycle and logs one warning until the next `config` lowers it |
 | `GPU_FAULT_NOTIFICATION_POLL_SECONDS` | Dispatcher poll interval, default 2 seconds |
 | `GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS` | Maximum attempts of the exponential backoff, default 8 (admin-config `spec.notificationDelivery.maxAttempts`, 1..32) |
 | `GPU_FAULT_NOTIFICATION_THROTTLE_MAX_SECONDS` | Ceiling of the dispatcher's slow-down while the provider throttles, default 300 seconds |
