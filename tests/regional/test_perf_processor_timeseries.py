@@ -379,7 +379,7 @@ def test_the_drain_starts_at_the_load_stop_beside_the_after_load_collection(
     monkeypatch.setattr(capacity, "postgres_counters", after("postgres-after", {}))
     monkeypatch.setattr(capacity, "collect_logs", after("logs", []))
 
-    _cgroup, _pg, _documents, reference = capacity.collect_after_load(
+    _cgroup, _pg, _documents, reference, metrics = capacity.collect_after_load(
         ["api"], tmp_path, "job", targets=(5.0, 1.0)
     )
 
@@ -396,6 +396,7 @@ def test_the_drain_starts_at_the_load_stop_beside_the_after_load_collection(
     }
     assert "drain_seconds_after_collection" in reference
     assert (tmp_path / "metrics-after.json").is_file(), "the after-load scrape is kept"
+    assert metrics == {}, "and returned for the summary's before/after deltas"
 
 
 def test_a_background_call_returns_its_value_or_raises_its_error() -> None:

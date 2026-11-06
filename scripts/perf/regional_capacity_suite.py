@@ -104,6 +104,7 @@ aggregate = capacity_results.aggregate
 artifact_dir = capacity_results.artifact_dir
 collect_pod_json_logs = capacity_results.collect_pod_json_logs
 drain_targets = capacity_results.drain_targets
+lane_holder_delta = capacity_results.lane_holder_delta
 move_to_aborted = capacity_results.move_to_aborted
 write_status = capacity_results.write_status
 _aurora_window = capacity_database.aurora_window
@@ -371,11 +372,13 @@ def build_job(
 METRIC_PATTERN = re.compile(
     r"pool_checkout|store_io_admission|lane_wait|queue_depth|"
     r"admission_rejections|event_loop_lag|oldest|coalesced|"
-    r"queue_oldest|processor_requests|lane_rows|"
+    r"queue_oldest|processor_requests|lane_rows|lane_holder|"
     r"admission_batch|ingress_lane|request_decode|ingress_backpressure|"
     r"rejections_total|in_flight|processor_claim|store_io_|"
     r"telemetry_spool|queue_bypass|processor_notification|"
-    r"processor_consumer|request_processing|fault_pressure"
+    r"processor_consumer|request_processing|fault_pressure|"
+    # Process health: GC, the listening sockets' accept queues, memory.
+    r"gpu_fault_gc_|gpu_fault_listen_|gpu_fault_process_resident"
 )
 
 
@@ -633,7 +636,7 @@ def start_pg_activity(pods: list[str]) -> Any:
 
 def collect_after_load(
     pods: list[str], artifacts: Path, job: str, *, targets: tuple[float, float]
-) -> tuple[dict, dict, list[dict], dict]:
+) -> tuple[dict, dict, list[dict], dict, dict]:
     """The drain probe from the load stop, beside the after-load collection."""
     drain = capacity_timeseries.Background(
         queue_drain,
@@ -642,8 +645,9 @@ def collect_after_load(
         target_spool_depth=targets[1],
     )
     drain.start()
+    metrics_after = scrape_metrics(pods)
     (artifacts / "metrics-after.json").write_text(
-        json.dumps(scrape_metrics(pods), indent=1) + "\n"
+        json.dumps(metrics_after, indent=1) + "\n"
     )
     cgroup_after = scrape_cgroup(pods)
     (artifacts / "cgroup-after.json").write_text(
@@ -656,7 +660,7 @@ def collect_after_load(
     documents = collect_logs(job, artifacts / "pods")
     collected_at = time.time()
     reference = capacity_timeseries.drain_reference(drain.result(), collected_at)
-    return cgroup_after, pg_after, documents, reference
+    return cgroup_after, pg_after, documents, reference, metrics_after
 
 
 def release_id() -> str:
@@ -834,7 +838,7 @@ def execute_case(
         status = wait_for_job(job, spec["deadline"] + lead_seconds + 120)
         window_end = time.time()
         log(f"job status: {status}")
-        cgroup_after, pg_after, documents, drain = collect_after_load(
+        cgroup_after, pg_after, documents, drain, metrics_after = collect_after_load(
             pods, artifacts, job, targets=(target_queue_depth, target_spool_depth)
         )
         priority_latency = processor_priority_latency(load_created_at)
@@ -886,6 +890,7 @@ def execute_case(
             ),
             "queue_depth_after_collection": drain.get("depth_after_collection"),
             "processor_timeseries": series.summary(),
+            "lane_holder": lane_holder_delta(metrics_before, metrics_after),
             "pg_activity": activity.summary(window_start),
             "cpu_throttling": {
                 pod: {

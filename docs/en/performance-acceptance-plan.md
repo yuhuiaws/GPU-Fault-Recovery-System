@@ -583,6 +583,7 @@ Save at least:
 gpu_fault_processor_queue_depth
 gpu_fault_processor_queue_oldest_age_seconds
 gpu_fault_processor_lane_wait_seconds
+gpu_fault_processor_lane_holder_seconds
 gpu_fault_processor_admission_rejections_by_path_total
 gpu_fault_store_io_admission_wait_seconds
 gpu_fault_postgres_pool_checkout_wait_seconds
@@ -590,7 +591,10 @@ gpu_fault_processor_claim_seconds_sum
 gpu_fault_processor_claim_seconds_max
 gpu_fault_telemetry_spool_depth
 gpu_fault_telemetry_spool_in_flight_bytes
+gpu_fault_telemetry_spool_rejected_by_cluster_total
 gpu_fault_event_loop_lag_seconds
+gpu_fault_listen_accept_queue_connections
+gpu_fault_gc_collection_seconds_max
 gpu_fault_remediation_budget_active_claims
 gpu_fault_remediation_budget_wait_total
 gpu_fault_remediation_budget_waiting_workflows
@@ -1968,8 +1972,11 @@ small and cannot explain second-level latency.
    transaction; pure telemetry/evidence should be separated from node-control by conflict domain.
 5. **Add complete performance evidence for the lane holder.** Artifacts must collect the path
    label of `gpu_fault_processor_lane_holder_seconds` and write the before/after delta into the
-   summary, not only the cumulative lane wait (today the runners' metric snapshot filters that family out and the
-   summary has no such delta).
+   summary, not only the cumulative lane wait: the burst and integrated runners' metric snapshots
+   (`metrics-before/after.json`) keep the family, and `summary.json.lane_holder` gives per path the lane holds the round
+   ended (`holds`) and the seconds they held the lane (`held_seconds`, both summed over every Pod and process slot; a
+   counter that went backwards is a restarted process and counts from zero), the mean hold and the longest hold since
+   the process started (`max_seconds`) (`regional_capacity_results.lane_holder_delta`).
 6. **Continue A/A and A/B on batch delay as a candidate configuration.** The current values
    improve completion p99 but increase rollbacks; repeat at least 3 rounds and check rollback
    causes, pool checkout and admission batch expired before it becomes the production default.
@@ -2052,7 +2059,8 @@ small and cannot explain second-level latency.
     port (probe median 10 ms, max 0.61 s under the same burst), 10 s x 3 probe parameters, `gc.freeze()` (-26% GC
     time, +7% throughput). During acceptance read `gpu_fault_listen_accept_queue_connections`, the
     `gpu_fault_event_loop_lag_seconds` histogram and `gpu_fault_gc_collection_seconds_max` (the runners' metric
-    snapshot keeps only the event loop lag; all three are in the control-plane ADOT keep list and can be queried in
+    snapshots `metrics-before/after.json` keep all three with `gpu_fault_listen_*` and
+    `gpu_fault_process_resident_memory_bytes`; all three are in the control-plane ADOT keep list and can be queried in
     AMP). Setting the flush stub to
     8 ms of CPU per item (i.e. assuming the 81 ms flush is all CPU) gives 583 req/s and 43% 503s, inconsistent with the
     live 1,175 req/s and 0 non-2xx -- the live flush's 81 ms is mostly Aurora round-trip wait.

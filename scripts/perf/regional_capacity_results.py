@@ -19,6 +19,61 @@ def metric_value(snapshot: str, name: str) -> float | None:
     return None
 
 
+LANE_HOLDER = "gpu_fault_processor_lane_holder_seconds_"
+PATH_LABEL = re.compile(r'(?:^|,)path="((?:[^"\\]|\\.)*)"')
+
+
+def lane_holder_delta(
+    before: dict[str, str], after: dict[str, str]
+) -> dict[str, dict[str, float | None]]:
+    """Per normalized path, what the round added to
+    ``gpu_fault_processor_lane_holder_seconds`` between the two snapshots
+    (perf plan §13, item 5): the lane holds that ended (``holds``, from
+    ``_count``) and the seconds they held the lane (``held_seconds``, from
+    ``_sum``), summed over every Pod and process slot -- a counter that went
+    backwards is a restarted process and counts from zero -- their mean, and
+    the longest hold a process has seen since it started (``max_seconds``)."""
+
+    def samples(snapshot: dict[str, str]) -> dict[tuple[str, str, str], float]:
+        values: dict[tuple[str, str, str], float] = {}
+        for pod, text in snapshot.items():
+            for line in text.splitlines():
+                if not line.startswith(LANE_HOLDER) or "{" not in line:
+                    continue
+                name, _, rest = line.partition("{")
+                labels, _, value = rest.rpartition("} ")
+                values[(pod, labels, name[len(LANE_HOLDER) :])] = float(value)
+        return values
+
+    earlier = samples(before)
+    paths: dict[str, dict[str, float]] = {}
+    for (pod, labels, kind), value in samples(after).items():
+        match = PATH_LABEL.search(labels)
+        entry = paths.setdefault(
+            match.group(1) if match else "",
+            {"holds": 0.0, "held_seconds": 0.0, "max_seconds": 0.0},
+        )
+        if kind == "max":
+            entry["max_seconds"] = max(entry["max_seconds"], value)
+        elif kind in {"count", "sum"}:
+            previous = earlier.get((pod, labels, kind), 0.0)
+            added = value - previous if value >= previous else value
+            entry["holds" if kind == "count" else "held_seconds"] += added
+    return {
+        path: {
+            "holds": int(entry["holds"]),
+            "held_seconds": round(entry["held_seconds"], 6),
+            "mean_seconds": (
+                round(entry["held_seconds"] / entry["holds"], 6)
+                if entry["holds"]
+                else None
+            ),
+            "max_seconds": round(entry["max_seconds"], 6),
+        }
+        for path, entry in sorted(paths.items())
+    }
+
+
 def drain_targets(
     metrics: dict[str, str],
 ) -> tuple[float, float]:
