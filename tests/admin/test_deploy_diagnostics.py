@@ -53,6 +53,19 @@ def test_sensitive_failures_preserve_only_known_error_codes():
     assert "sentinel-unlabelled-value" not in output
 
 
+@pytest.mark.parametrize("code", ["UnauthorizedOperation", "AuthFailure"])
+def test_sensitive_failures_name_the_ec2_authorization_codes(code: str):
+    output = diagnostic_text(
+        f"An error occurred ({code}) when calling the DescribeInstances operation: "
+        "sentinel-principal is not authorized",
+        sensitive=True,
+    )
+    assert output.startswith(f"{code}:"), (
+        "an EC2 permission failure must name its error code, not only the redaction"
+    )
+    assert "sentinel-principal" not in output
+
+
 def test_command_arguments_and_json_patches_are_redacted():
     shown = diagnostic_command(
         [

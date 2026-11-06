@@ -34,6 +34,8 @@ _ERROR_CODES = frozenset(
     {
         "AccessDenied",
         "AccessDeniedException",
+        "AuthFailure",
+        "UnauthorizedOperation",
         "Forbidden",
         "Unauthorized",
         "InvalidClientTokenId",
