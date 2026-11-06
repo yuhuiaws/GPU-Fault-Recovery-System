@@ -2,22 +2,23 @@ English edition of `docs/管理员快速部署.md`; the Chinese file remains the
 
 # GPU Fault Handling System Administrator Quick Deploy
 
-This document describes only the successful path of the first site build or application-layer rebuild of the regional production solution. The administrator supplies existing CPU/GPU EKS or HyperPod ARNs, and a single command automatically creates the site AWS resources, builds the signed release and deploys the application. This path does not require administrators to hand-stitch commands following CPU-1 to 9 or REG-1 to 8, nor to write or apply solution Manifests one by one. For object-by-object audit, special handling of shared infrastructure or break-glass, go to the [Deployment and Operations Manual](deployment-and-operations-manual.md); post-go-live upgrades, cluster changes, rotation, troubleshooting and decommissioning uniformly use [Administrator Operations](administrator-operations.md).
+This document describes only the successful path of the first site build or application-layer rebuild of the regional production solution. The administrator supplies the ARNs of an existing CPU HyperPod EKS cluster and GPU EKS/HyperPod clusters, and a single command automatically creates the site AWS resources, builds the signed release and deploys the application. This path does not require administrators to hand-stitch commands following CPU-1 to 9 or REG-1 to 8, nor to write or apply solution Manifests one by one. For object-by-object audit, special handling of shared infrastructure or break-glass, go to the [Deployment and Operations Manual](deployment-and-operations-manual.md); post-go-live upgrades, cluster changes, rotation, troubleshooting and decommissioning uniformly use [Administrator Operations](administrator-operations.md).
 
 ## 1. Scope
 
 The only production form is:
 
 ```text
-Regional CPU EKS control plane + Aurora PostgreSQL + TLS NLB
+Regional CPU control plane (HyperPod EKS) + Aurora PostgreSQL + TLS NLB
                     |
-                    +-- HyperPod EKS GPU cluster A
-                    +-- HyperPod EKS GPU cluster B
+                    +-- GPU cluster A (HyperPod EKS)
+                    +-- GPU cluster B (plain EKS)
                     +-- ...
 ```
 
-Managed GPU HyperPod clusters must be EKS-orchestrated with `NodeRecovery=None`. Generic Kubernetes,
-HyperPod Slurm and the single-cluster all-in-one are not part of the new production deployment path.
+The CPU control plane must be a HyperPod EKS cluster; a managed GPU cluster is an EKS-orchestrated HyperPod (`NodeRecovery=None`) or plain EKS
+(node auto repair off on the GPU managed node groups). Generic Kubernetes, HyperPod Slurm and the single-cluster all-in-one are not part of the new
+production deployment path.
 
 ## 2. Current Administrator Entry Point
 
@@ -32,62 +33,62 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 gpu-fault-admin deploy --state-dir /secure/gpu-fault   # resume / upgrade
 ```
-The command needs nothing but ARNs: the GPU node groups / instance groups must carry the ownership label `gpu-fault.io/control-plane=<site id>` beforehand (the site id is printed by `gpu-fault-admin site-id --cpu-cluster-arn <cpu-eks-or-hyperpod-arn>`); a cluster without a labelled node group, with a label naming another site, or with an instance type outside the GPU inventory is refused before anything is created (Administrator Operations §5.0.0). For a plain EKS `AL2023_x86_64_NVIDIA` node group, `gpu-fault-admin prepare-eks-nodegroup` (a read-only plan by default; `--apply --confirm PREPARE_EKS_NODEGROUP --reference <change id>` runs it) applies the label together with the user data and node auto repair prerequisites (Administrator Operations §5.0.1a). For several GPU clusters repeat `--gpu-cluster-arn`; after the first GPU cluster completes the baseline deployment and verification, the remaining clusters automatically enter
+The command needs nothing but ARNs: the GPU node groups / instance groups must carry the ownership label `gpu-fault.io/control-plane=<site id>` beforehand (the site id is printed by `gpu-fault-admin site-id --cpu-cluster-arn <cpu-eks-or-hyperpod-arn>`); a cluster without a labelled node group, with a label naming another site, or with an instance type outside the GPU inventory is refused before anything is created (Administrator Operations §5.0.0). For a plain EKS `AL2023_x86_64_NVIDIA` node group, `gpu-fault-admin prepare-eks-nodegroup` (a read-only plan by default; `--apply --confirm PREPARE_EKS_NODEGROUP --reference <change id>` with `--state-dir` or `--work-dir` runs it, setting updateStrategy MINIMAL and rolling the node group) applies the label together with the user data and node auto repair prerequisites (Administrator Operations §5.0.1a). For several GPU clusters repeat `--gpu-cluster-arn`; after the first GPU cluster completes the baseline deployment and verification, the remaining clusters automatically enter
 a separate batch join, rolling at the site cluster parallelism `spec.release.upgradeMaxParallelClusters` (default 1, cap 8); a single failure does not undo the successful clusters of the same batch.
-ARNs passed again on an existing site must be the managed set or a superset of it: extra GPU ARNs are joined automatically after the release (join only, no rollout, when the release is unchanged); giving fewer clusters or changing the CPU is
-refused with a hint to use `remove-cluster`. The same command with `--rollback` goes back one step, with `--approve-profile-plan <sha>
+ARNs passed again on an existing site must be the managed set or a superset of it: extra GPU ARNs are joined automatically after the release (join only, no rollout, when the release is unchanged); giving fewer clusters is
+refused with a hint to use `remove-cluster`, and changing the CPU is refused outright. The same command with `--rollback` goes back one step, with `--approve-profile-plan <sha>
 --reference CHG-<id>` approves the Profile plan and continues. Administrators supply no release-ref, artifact, site,
 release-build/release-deploy, bundle or venv path. The command automatically creates or reuses the signing material and
 site-tagged ECR, runs the required gates, pushes and verifies the release, at the same time creates or reuses
-Aurora, AMP/SNS, PKI/IAM and other resources per the dependency graph, and imports `deploy/observability/dashboards/*.json` into Amazon Managed Grafana in the Region of the CPU cluster: taking in turn `--grafana-workspace-id`, the workspace with the site tag, the only ACTIVE workspace in that Region, and creating a new one for the customer when there is none (IAM Identity Center login; uninstall deletes it); a refused creation or failed import only warns and does not block. After the import, deploy finds the corresponding user in IAM Identity Center by the administrator email (`--admin-email`) and grants Grafana ADMIN (the deployment host needs `sso:ListInstances`, `identitystore:GetUserId`, `grafana:ListPermissions`, `grafana:UpdatePermissions`); when that user cannot be found it does not block, and at the end of the deployment prints the dashboard address, the one `aws grafana update-permissions` command to authorise your own login, and what is missing; after adding the user simply rerun deploy; you can also pass `--grafana-viewer <Identity Center user id>` directly to let deploy grant VIEWER on your behalf.
-Steps needing candidate artefacts still have to wait for the build and signature verification to complete. When
-`spec.health.identityCenterRegion` is not pre-set, the deployment host also needs `ec2:DescribeRegions` permission to scan and discover
-the enabled Region where Identity Center lives; with the field pre-set no other Regions are scanned.
+Aurora, AMP/SNS, PKI/IAM and other resources per the dependency graph, and imports `deploy/observability/dashboards/*.json` into Amazon Managed Grafana in the Region of the CPU cluster: taking in turn `--grafana-workspace-id`, the workspace with the site tag, the only ACTIVE workspace in that Region, and creating a new one for the customer when there is none (IAM Identity Center login; uninstall deletes it); a refused creation or failed import only warns and does not block, but several untagged ACTIVE workspaces in the Region, an invalid `--grafana-workspace-id` or a refused `--grafana-viewer` fail the deploy. After the import, deploy finds the corresponding user in IAM Identity Center by the administrator email (`--admin-email`) and grants Grafana ADMIN (the deployment host needs `sso:ListInstances`, `identitystore:GetUserId`, `grafana:ListPermissions`, `grafana:UpdatePermissions`); when that user cannot be found it does not block, and when bootstrap finishes (before the release) it prints on stderr the dashboard address, the one `aws grafana update-permissions` command granting yourself VIEWER (replace `<sso-user-id>`), and what is missing; after adding the user simply rerun deploy; you can also pass `--grafana-viewer <Identity Center user id>` directly to let deploy grant VIEWER on your behalf.
+Steps needing candidate artefacts still have to wait for the build and signature verification to complete. When site.yaml records no
+`spec.health.identityCenterRegion`, the deployment host also needs `ec2:DescribeRegions` permission to scan and discover
+the enabled Region where Identity Center lives; an existing site with the field written scans no other Region (it cannot be pre-set before the first deploy).
 
-The VPC and base routing of EKS/HyperPod themselves are part of the already built clusters. The GPU VPC must already have a usable NAT egress; when the CPU VPC lacks public subnets for the NLB, the script creates two solution-specific `/28` subnets from free CIDR.
+The VPC and base routing of EKS/HyperPod themselves are part of the already built clusters. The GPU VPC must already have a usable NAT egress; the NLB only uses two `/28` public subnets the solution creates itself (in two AZs, each with its own route table, from free CIDR; an Internet Gateway too when the VPC has none) and never reuses existing subnets.
 
 Before deploying, install and activate `gpu-fault-admin` per the offline bundle rules of the [CI Release Process](ci-release-process.md); a development checkout runs
 `make deploy-host-setup-online` to prepare the CLI and the isolated tool environment in parallel, and deploy continues only after both succeed.
-The first command determines the source root from the current trusted checkout; later runs restore it from internal state; the generated site and repository paths do not enter the public parameters.
+Every run takes the checkout of the current directory as the source root (with a notice when it differs from the last run); only a run outside a checkout uses the root recorded in the state; the generated site and repository paths do not enter the public parameters.
 
 The release provides `config/admin-config.example.yaml`; in the deploy-host venv the same template is at `share/gpu-fault/admin-config.example.yaml`. A first site build can apply the administrator-edited configuration directly with
 `deploy --config <0600-admin-config.yaml>`; when not passed, the release defaults are persisted and `<state-dir>/admin-config.yaml` generated.
 On an existing site edit that file and run
-`gpu-fault-admin config --state-dir ... --reference ...`; the complete commands are in
+`gpu-fault-admin config --state-dir ...` (`--reference` optional); the complete commands are in
 [Administrator Capacity Configuration](administrator-capacity-configuration.md). The same file decides how the CPU control
-plane's HyperPod group is updated: `spec.cpuControlPlane`, `mode: rolling` by default. The deploy's last step applies it
+plane's HyperPod group is updated: `spec.cpuControlPlane.rollingUpdate.mode`, `rolling` by default (`unchanged` leaves the group alone). The deploy's last step applies it
 once every api-ha replica is healthy: it creates the two rollback alarms, waits until they are `OK`, then makes the group's
 own schedule roll one instance at a time (Administrator Operations §5.0.5).
 
 | Internal phase | Meaning |
 |---|---|
-| source preparation | Pins the Git identity, prepares or reuses the signed release and the deployment environment |
-| preflight | Read-only checks of AWS identity, clusters, IAM, capacity, Aurora, LBC, ACM and monitoring |
-| bootstrap/upgrade | Without a site, creates in parallel per the dependency graph (monitoring, Node keys and Aurora instance readiness do not wait on each other); with an existing site, verifies cluster identity first, then upgrades |
+| source preparation | Checks the email channel within the first minute; source scan, isolated snapshot, signing material and the deployment environment |
+| preflight | Cluster discovery and the first-deploy refusals complete read-only before any resource is created; the release engine preflight (AWS identity, clusters, IAM, capacity, Aurora, LBC, ACM and monitoring) runs after bootstrap, before the release |
+| bootstrap/upgrade | Without a site, creates in parallel per the dependency graph (monitoring, Node keys and Aurora instance readiness do not wait on each other, and the signed release builds at the same time); with an existing site, verifies cluster identity first, then upgrades |
 | verify/stability | Verifies CPU/GPU, Profile, TLS, Agents, Aurora and the stability window |
 
 ## 3. Pre-Deployment Inputs
 
-**One email confirmation is a prerequisite: the site has exactly one email channel.** The site SNS topic carries both the AMP Alertmanager metric alerts and the fault-handling notifications sent by the control plane itself (incident escalations, GPU count change approvals, mechanical inspection requests, including retries and receipts; plain text, subject <= 100 ASCII characters, sender `no-reply@sns.amazonaws.com`).
-`--admin-email` is the SNS subscription address; deploy sends and checks this confirmation within its first minute, exiting with code 2 and listing the resume command when unconfirmed, or add `--wait-for-email-confirmation <minutes>`. No SES identity needs prior verification; sites needing rich-text email can declare `spec.notifications.channel: ses` in `site.yaml` (which then additionally requires a verified SES sending identity, see the operations manual §8).
+**One email confirmation is a prerequisite: a default (`channel: sns`) site has exactly one email channel.** The site SNS topic carries both the AMP Alertmanager metric alerts and the fault-handling notifications sent by the control plane itself (incident escalations, GPU count change approvals, mechanical inspection requests, including retries and receipts; plain text, the subject turned into one ASCII line cut to 99 characters (the full subject is the first line of the body), sender `no-reply@sns.amazonaws.com`).
+`--admin-email` is the SNS subscription address; deploy sends and checks this confirmation within its first minute, exiting with code 2 and listing the resume command when unconfirmed, or add `--wait-for-email-confirmation <minutes>`. No SES identity needs prior verification; sites needing a full UTF-8 subject or their own sender can declare `spec.notifications.channel: ses` in `site.yaml` (which then additionally requires `emailSender` and a verified SES sending identity; the body is still plain text and AMP alerts still go through SNS, see the operations manual §8).
 
-**Grafana dashboard prerequisites (without them the deployment still succeeds; just nobody can open the dashboards).** After importing the dashboards into Amazon Managed Grafana, deploy grants workspace ADMIN to "the IAM Identity Center user whose email equals `--admin-email`"; Managed Grafana accepts only Identity Center/SAML login, so first satisfy: (1) the account has IAM Identity Center enabled (deploy first looks for an instance in the CPU cluster Region, and if none is found automatically scans the account's other enabled Regions and records the found home Region in `spec.health.identityCenterRegion` of site.yaml; that key can also be pre-set to skip the scan);
+**Grafana dashboard prerequisites (without them the deployment still succeeds; just nobody can open the dashboards).** After importing the dashboards into Amazon Managed Grafana, deploy grants workspace ADMIN to "the IAM Identity Center user whose email equals `--admin-email`"; Managed Grafana accepts only Identity Center/SAML login, so first satisfy: (1) the account has IAM Identity Center enabled (deploy first looks for an instance in the CPU cluster Region, and if none is found automatically scans the account's other enabled Regions and records the found home Region in `spec.health.identityCenterRegion` of site.yaml; an existing site can write that key to skip the scan, which cannot be pre-set before the first deploy);
 (2) Identity Center has a user whose email equals the administrator email and who can already log in (has set a password or completed email verification; this step can only be done in the Identity Center console); (3) the deployment host identity has `grafana:*`, `sso:ListInstances`, `identitystore:GetUserId`, and, when `spec.health.identityCenterRegion` is not pre-set, the `ec2:DescribeRegions` needed to scan enabled Regions.
 
 The first ARN command generates in the state an internal `RegionalSite` with mode `0600` as the source of truth for application topology, identity, artefacts and health checks.
-Administrators do not create, edit or pass in that file by hand. Its internal content includes:
+Administrators do not create or pass in that file by hand and change only the fields this document and the operations manual §8 open up. Its internal content includes:
 
 | Configuration | Requirement |
 |---|---|
-| `spec.awsRegion` | The Region explicitly chosen by the operator |
+| `spec.awsRegion` | The Region of the CPU cluster ARN (every ARN in one account and Region) |
 | `spec.cpu` | kubeconfig, EKS ARN, CPU HyperPod name |
 | `spec.release` | `dist/current-release.json` and the Agent config digest |
 | `spec.runtimeProfile` | Editable template, immutable source snapshot, automatic version and stable registration anchor |
 | `spec.nlb` | NLB name, public subnets, Security Group, ACM certificate ARN |
 | `spec.health` | Aurora, AMP, SNS and health thresholds |
-| `spec.notifications` | Notification channel (`channel: sns` default / `ses`), administrator email, Subject prefix and external alert acknowledgement; `ses` additionally has sender, recipient list and the optional `sesConfigurationSet` |
+| `spec.notifications` | Notification channel (`channel: sns` default / `ses`), administrator email, Subject prefix and external alert acknowledgement; `ses` additionally has sender, recipient list and the optional `sesConfigurationSet` (a deploy regenerating the site keeps only `channel`; sender/recipient are the administrator email) |
 | `spec.clusters[]` | Per-cluster unique ID, context, EKS ARN, HyperPod name, IRSA, namespace allowlist, GPU node subnets `agentEndpointAllowedCidrs` |
-| Administrator configuration | The 22 normalised non-sensitive configuration items and role digests in `state-dir/admin-config/desired.json` |
+| Administrator configuration | The normalised non-sensitive configuration, `config_sha256` and the three role digests in `state-dir/admin-config/desired.json` |
 | Credential references | Per-cluster token files, CA file and the controlled fleet master file |
 
 The CLI refuses layer by layer unknown fields, wrong types, duplicate clusters, cross-Region ARNs, non-HTTPS URLs and leftover
@@ -98,37 +99,39 @@ The current version still references the token, CA and fleet master through cont
 
 ## 4. First-Deployment Gates
 
-1. An existing 3-node CPU EKS/HyperPod cluster whose instance groups' scheduled updates (`ScheduledUpdateConfig`) roll one
-   instance at a time or are switched off: without a rolling batch one window re-images every CPU node at once and takes
-   the whole control plane down for minutes (announced only, see [Administrator Operations](administrator-operations.md)
-   §5.0.5).
-2. At least one existing GPU EKS/HyperPod cluster with `NodeRecovery=None`; the managed instance groups' / node groups'
+1. An existing HyperPod EKS CPU cluster with at least 3 Ready nodes (its HyperPod or EKS ARN; plain EKS cannot host the CPU): a scheduled update
+   (`ScheduledUpdateConfig`) without a rolling batch re-images every CPU node in one window and takes the whole control plane down for minutes, so
+   the deploy's last step (`rolling` by default) turns an existing schedule into a one-instance-at-a-time roll with two rollback alarms and never
+   adds a schedule (see [Administrator Operations](administrator-operations.md) §5.0.5).
+2. At least one existing GPU EKS/HyperPod cluster: HyperPod with `NodeRecovery=None`, plain EKS with node auto repair off (refused otherwise); the GPU
+   clusters of the first deploy share one provider and the CPU cluster's account and Region; the managed instance groups' / node groups'
    automatic updates (HyperPod `ScheduledUpdateConfig` and the like) switched off and done by hand in a maintenance
    window (announced only, see [Administrator Operations](administrator-operations.md) §5.0.5).
 3. The GPU VPC already has a usable NAT egress.
-4. The executing identity has ECR, EC2, RDS, AMP, SNS, EKS, Kubernetes and IAM permissions.
-5. The deployment host has the Python 3.12 project environment installed plus `aws`, `cosign`, Docker Buildx, `kubectl` (>=1.28: the release engine's wait loops use `kubectl wait --for=jsonpath=...` (including value-less field-existence checks) and `kubectl rollout status` instead of fixed-interval sleeps), `helm`, `curl`, `jq`, `openssl`, `sha256sum` and `make`; the ARN entry point verifies these commands before any AWS mutation but does not install system tools automatically.
+4. The executing identity has ECR, EC2, RDS, AMP, SNS, EKS, Kubernetes and IAM permissions, plus SageMaker, ELB, Route53, ACM, CloudWatch, Secrets Manager, S3 and Grafana/Identity Center (see §3).
+5. The deployment host has the Python 3.12 project environment installed plus `aws`, `cosign`, Docker (with a working daemon) and Buildx, `kubectl` (>=1.28: the release engine's wait loops use `kubectl wait --for=jsonpath=...` (including value-less field-existence checks) and `kubectl rollout status` instead of fixed-interval sleeps), `helm`, `curl`, `jq`, `openssl`, `sha256sum` and `make`; the ARN entry point runs each tool's version command before any AWS mutation (the kubectl version itself is not checked) but does not install system tools automatically.
 
 `spec.clusters` of the first application bootstrap must be non-empty; only a completed site can enter an explicit `[]` via the formal
 `remove-cluster`, and an empty list on a new site fails before the first Kubernetes apply.
 
 A dirty working tree and a clean personal commit do not query GitHub; only a clean `HEAD == origin/main` without a local
-signed release attempts to consume the main CI candidate of the same commit. Credential boundaries are in the [CI Release Process](ci-release-process.md).
+signed release and with `GPU_FAULT_GITHUB_TOKEN_FILE` or `GITHUB_TOKEN`/`GH_TOKEN` configured attempts to consume the main CI candidate of the same commit. Credential boundaries are in the [CI Release Process](ci-release-process.md).
 
 The ARN bootstrap creates or reuses, exclusive to the current `site-id`:
 
 - Aurora Serverless v2 writer/reader, subnet group and SG;
 - The immutable runtime ECR and the mutable BuildKit cache ECR repository; the cache repository keeps the current
   `buildcache-linux-amd64`, and untagged historical cache artefacts expire after 7 days;
-- The NLB SG and the GPU egress CIDR whitelist;
-- The AMP workspace, Alertmanager, SNS topic and email subscription;
+- The NLB SG and the GPU egress CIDR whitelist, its own public subnets/routes/IGW, the Route53 private zone, a self-generated CA and the certificate imported into ACM;
+- The AMP workspace, Alertmanager, SNS topic and email subscription; the control-plane/Executor/ADOT IAM roles, the LBC and the Pod Identity Agent, the Grafana workspace and the CPU rollback alarms; the control record archive bucket is shared per account and Region (one prefix per site);
 
 EKS/HyperPod are explicit ARN inputs; VPC/subnets/node CIDRs are discovered from the clusters. The command automatically creates the separate token,
 CA, fleet master and kubeconfig files. When the GPU VPC has no NAT egress the deployment stops without modifying existing routes.
 When an existing cache repository lacks that lifecycle policy the ARN entry point completes it; when an existing policy differs in content the deployment fails closed
 and does not silently widen or rewrite the cleanup scope. The executing identity needs read and write permission on ECR lifecycle policies.
-The ARN entry point is the only writer of site AWS infrastructure in this solution. The source scan, preflight and cluster checks are all run internally by
-the unified command, and no AWS or Kubernetes mutation starts when any required check fails.
+The ARN entry point is the only creator of site base resources. A failing source scan, tool check or cluster discovery (first-deploy refusals
+included) creates no AWS or Kubernetes resource (except the first minute's SNS topic/subscription); the signed release builds in parallel with the
+base resources, and the release engine preflight runs after bootstrap, before the release.
 
 ## 6. Running the Deployment
 
@@ -142,8 +145,8 @@ deploy-host-only only updates the deployment host and runs the read-only preflig
 creates an application release, touches the GPU rollout or waits for the stability window.
 
 When the Runtime Profile policy changes, this deploy writes out
-`<state-dir>/release-deploy/profile-plan.json` before applying the release and stops; the stop message directly prints the fields of the table below and the resume command with the real
-`plan_sha256`, with no `jq` needed. Complete operation, evidence and exception branches are in
+`<state-dir>/release-deploy/profile-plan.json` before applying the release and stops; the stop message directly prints the fields of the table below (`site_identity_sha256` and `source_sha256` are only in that file) and the resume
+command with the real `plan_sha256`, with no `jq` needed. Complete operation, evidence and exception branches are in
 [Runtime Profile Change Approval](administrator-profile-change-approval.md).
 
 | Field | What the administrator checks |
@@ -178,7 +181,7 @@ stability and commit succeed the active approval is consumed once. Do not edit
 `deploy` runs the live preflight again, avoiding drift of the environment after the check, then:
 1. Runs the first bootstrap when there is no release state.
 2. With existing release state, compares the wheels/bundle, rendered Manifests,
-   renderer/dependency lock, image digests, schema, protocols, Profile, endpoint and cluster set in Manifest v3.
+   renderer/dependency lock, image digests, schema, protocols, Profile, endpoint and cluster set in the Manifest (schema v4).
    The four change kinds are summaries only; the component DAG chooses the actual path; the CPU maintains separate ingress, worker and
    spool Manifest digests, and a single-role change waits only for that role. finalize rolls the CPU only when pins actually change.
    The Profile is compared by the canonical policy digest; a path-only or YAML-order-only change does not trigger `FULL`.
@@ -201,9 +204,9 @@ stability and commit succeed the active approval is consumed once. Do not edit
 13. bootstrap/quick evidence is reused only when bound to the current release state and within ten minutes (including quick evidence of a deploy completed but not committed), and reruns otherwise. verify runs in parallel with the stability window; only `GpuFaultStoreIoRejected` may wait up to 420 seconds, after which the 120 to 300 second stability window is still
     observed (a `CONTROL_PLANE_ONLY` release rolling only the control plane ends as early as 60 seconds after two clean samples and all control-plane Deployments converged); queue trends are judged by relative growth, and Collector-type criticals within 600 seconds after the data plane just converged do not count.
 
-`plan/status` shows the next deployment classification: `NOOP` does only one parallel read-only verification; `CONTROL_PLANE_ONLY`
+The `next deploy` line of `status` shows the next deployment classification: `NOOP` does only one parallel read-only verification; `CONTROL_PLANE_ONLY`
 rolls only the CPU; `DATA_PLANE_COMPATIBLE` rolls only the changed data plane, serial across GPU clusters by default; `FULL` keeps the two-phase
-pins. The `plan` output directly writes out the cluster parallelism in effect for this site; batch join uses the same configuration, 1-way by default.
+pins. The cross-cluster parallelism is `spec.release.upgradeMaxParallelClusters`; batch join uses the same configuration, 1-way by default.
 When an upgrade fails, rerunning the same `deploy` reuses the persisted diff plan: the same
 release still in `failed` resumes from its checkpoint; a `rolled-back` state that has completed and verified automatic rollback opens a new transaction from the current online baseline,
 so a new release produced after fixing the code does not wrongly continue the old release ID.
@@ -254,18 +257,18 @@ Only after both training runs are correctly observed by the Watcher may destruct
 
 ### 7.1 Opening the Grafana Dashboards
 
-At the end deploy prints the workspace address and `Grafana ADMIN granted to <email> (Identity Center user <id>)`: log in with that Identity Center user; on the left, Dashboards -> the `GPU Fault Recovery` folder holds the 8 dashboards (overview, recovery-outcome, orchestration-invariants, remote-command, collector-health, telemetry-pipeline, control-plane-capacity, policy-coverage), with the data source `GPU Fault AMP (<region>)`; when the rules change the next deploy re-imports automatically.
-To grant colleagues permission choose any one of: `deploy --state-dir X --grafana-viewer <Identity Center user ID>` (grants VIEWER; the ID is a UUID, found under "User ID" on the user detail page of the Identity Center console or via `aws identitystore list-users --identity-store-id <d-xxxx>`), the Grafana UI Administration -> Users, or running the `aws grafana update-permissions …` command deploy printed.
-When the automatic grant did not succeed deploy prints `Grafana ADMIN was not granted automatically: <reason>`: no user with that email -> add it in Identity Center, complete the first login and rerun deploy (the read-only probe completes the grant without rerunning the installation); `no IAM Identity Center instance is visible from <region> or the N other enabled regions scanned` -> the account has not enabled Identity Center yet; enable it and rerun (if you know the home Region and the scan cannot reach it, write `spec.health.identityCenterRegion` and rerun); `AccessDenied` -> add the deployment host permissions. Details are in the Grafana section of the Deployment and Operations Manual.
+When bootstrap finishes (before the release) deploy prints on stderr `Grafana dashboards: <address>` and `Grafana ADMIN granted to <email> (Identity Center user <id>)`: log in with that Identity Center user; on the left, Dashboards -> the `GPU Fault Recovery` folder holds the 8 dashboards (overview, recovery-outcome, orchestration-invariants, remote-command, collector-health, telemetry-pipeline, control-plane-capacity, policy-coverage), with the data source `GPU Fault AMP (<region>)`; when the rules change the next deploy re-imports automatically.
+To grant colleagues permission choose any one of: `deploy --state-dir X --grafana-viewer <Identity Center user ID>` (grants VIEWER; the ID is a UUID, found under "User ID" on the user detail page of the Identity Center console or via `aws identitystore list-users --identity-store-id <d-xxxx>`), the Grafana UI Administration -> Users, or running the `aws grafana update-permissions …` printed when no automatic grant happened (grants VIEWER; replace `<sso-user-id>`).
+When the automatic grant did not succeed deploy prints `Grafana ADMIN was not granted automatically: <reason>`: no user with that email -> add it in Identity Center, complete the first login and rerun deploy (only the Grafana step runs again: re-import and grant); `no IAM Identity Center instance is visible from <region> or the N other enabled regions scanned` -> the account has not enabled Identity Center yet; enable it and rerun (if you know the home Region and the scan cannot reach it, write `spec.health.identityCenterRegion` and rerun); `AccessDenied` -> add the deployment host permissions. Details are in the "Amazon Managed Grafana dashboards" paragraph of §5.1 of the Deployment and Operations Manual.
 
 ## 8. Failure Handling
 
 | Scenario | Handling |
 |---|---|
-| Email unconfirmed (exit code 2, within the first minute) | Click the link in the SNS confirmation email (sites with `channel: ses` also click the SES verification email), and rerun the printed command as is; or add `--wait-for-email-confirmation <minutes>` |
+| Email unconfirmed (exit code 2, within the first minute) | Click the link in the SNS confirmation email (sites with `channel: ses` also click the SES verification email), and rerun the printed command (it carries only the ARNs, state-dir and email; add any other option yourself); or add `--wait-for-email-confirmation <minutes>` |
 | Internal preflight fails | Fix the source, credentials or shared infrastructure per the check name without modifying the clusters; retirement of old HMA producers must be approved separately per the operations manual §7.4 |
 | ARN bootstrap fails | Keep the private state directory and rerun `deploy --state-dir`; completed resources are skipped |
-| release build fails | Only the created ECR is kept; fix the source/gates/credentials and rerun the same command |
+| release build fails | The site resources already created (ECR, and the Aurora, network, PKI, IAM and others created in parallel with the build) are kept and reused on rerun; fix the source/gates/credentials and rerun the same command |
 | First application deployment fails | Look at the release state; after the automatic fail-closed fix the cause, then rerun `gpu-fault-admin deploy` |
 | verify/stability fails | Do not enter production traffic or the destructive capability phases; fix and rerun `deploy --state-dir` |
 | Prompted to add `--supersede-failed-transaction`/`--accept-schema-change` | Refused as soon as the build finishes; after confirming, add that parameter to the same deploy and rerun (the parameter takes precedence over leftover environment variables) |
