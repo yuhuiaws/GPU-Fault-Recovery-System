@@ -822,11 +822,14 @@ The site-wide cleanup first publishes `CLUSTERS_DRAINING` in bulk, then stops pr
 until the strict zero-count drain completes, after which the consumers are stopped first, then the ingress, the GPU Executors,
 `NODE_RUNTIMES_STOPPED`, the auxiliary components and object cleanup. The node phase only consumes the fleet and Node UID inventory saved in the original journal;
 it does not query the database after the CPU consumers have stopped, nor does it release nodes through bulk orphan SQL.
-When PREFLIGHT collects the node targets, a missing node of an ACTIVE Agent still fails closed by default; only when the node name
-`hyperpod-<instance-id>` is absent from both the GPU EKS and the HyperPod node lists (`aws sagemaker list-cluster-nodes`, collected once per
-cluster and written with a SHA-256 into the journal's `provider_nodes`) is it judged departed, recorded in `departed_fleet_nodes` and left out of
-the node targets. A plain EKS cluster has no such provider proof: a missing node of an ACTIVE Agent is refused outright (`node name does not
-identify a HyperPod instance`); retire that Agent record first through the control plane's departed-node cleanup or
+When PREFLIGHT collects the node targets, a missing node of an ACTIVE Agent still fails closed by default; only when the provider proves its
+instance gone (the rule of the control plane's departed-node cleanup) is it judged departed: on HyperPod the instance in the node name
+`hyperpod-<instance-id>` is absent from the HyperPod node list (`aws sagemaker list-cluster-nodes`, collected once per cluster); on a plain EKS
+cluster the EC2 instance id the fleet recorded for the node (the Agent record's `node_instance_id`, taken from `spec.providerID`) is
+`terminated` or unknown to `aws ec2 describe-instances` (each instance read once). The provider's answer is written with a SHA-256 into the
+journal's `provider_nodes`, the node is recorded in `departed_fleet_nodes` and left out of the node targets. An instance the provider still has,
+an unknown instance identity (no HyperPod instance id in the node name, no EC2 instance id recorded) or a failed lookup is refused outright
+(`an active fleet node is missing` with the reason); retire that Agent record first through the control plane's departed-node cleanup or
 `gpu-fault-admin workflow-reconcile --retire-departed-agents`, then rerun. A replacement node carrying only `gpu-fault.io/installer-*`
 annotations (`installer-state` `Failed`, `Installing`, `Retrying` or `WaitingForKey`), no `gpu-fault.io/` label or taint besides the node-group
 declarations, and no fleet record of any state is recorded in `orphaned_installer_nodes`, and the reset phase deletes only those installer

@@ -1248,7 +1248,8 @@ capture_preflight() {
 
 log_node_capture_exceptions() {
     # Nodes the capture proved safe to leave out of the fleet targets: agents
-    # whose spot instance HyperPod no longer lists, and replacement nodes that
+    # whose instance the provider no longer has (HyperPod no longer lists it,
+    # or EC2 reports it terminated or unknown), and replacement nodes that
     # carry only unfinished installer annotations. Both are journaled in the
     # state file; this only surfaces them in the run output.
     local line
@@ -1260,10 +1261,15 @@ import sys
 
 document = json.load(open(sys.argv[1], encoding="utf-8"))
 for entry in document.get("departed_fleet_nodes") or []:
+    instance = entry.get("node_instance_id")
+    gone = (
+        f"EC2 instance {instance} is {entry.get('ec2_state')}"
+        if entry.get("provider") == "eks-managed"
+        else f"instance {instance} left HyperPod"
+    )
     print(
         f"{entry.get('cluster_id')}: departed fleet node {entry.get('node_id')} "
-        f"(instance {entry.get('node_instance_id')} left HyperPod); "
-        "not a node cleanup target"
+        f"({gone}); not a node cleanup target"
     )
 for context, nodes in sorted((document.get("orphaned_installer_nodes") or {}).items()):
     for name in sorted(nodes):

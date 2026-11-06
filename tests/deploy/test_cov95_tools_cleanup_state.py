@@ -505,3 +505,33 @@ def test_provider_node_listing_is_digested_and_verified(
                 instance_ids=instance_ids,
             )
     assert "gpu-b" not in cleanup_state["provider_nodes"]
+
+
+def test_ec2_instance_states_are_digested_and_verified(
+    cleanup_state: dict[str, Any],
+) -> None:
+    record = STATE.attach_ec2_instance_states(
+        cleanup_state,
+        "gpu-a",
+        region="us-west-2",
+        states={"i-0b": "terminated", "i-0a": "not-found"},
+    )
+    assert cleanup_state["provider_nodes"]["gpu-a"] is record
+    assert (record["provider"], record["region"]) == ("eks-managed", "us-west-2")
+    assert list(record["instance_states"]) == ["i-0a", "i-0b"], "sorted"
+    assert STATE.verify_ec2_instance_states(record) == {
+        "i-0a": "not-found",
+        "i-0b": "terminated",
+    }, "the journaled answer reads back as captured"
+    tampered = {**record, "instance_states": {"i-0a": "terminated"}}
+    for invalid in (tampered, {**record, "provider": "hyperpod"}, None, {}):
+        with pytest.raises(STATE.CleanupStateError, match="states are invalid"):
+            STATE.verify_ec2_instance_states(invalid)
+    with pytest.raises(STATE.CleanupStateError, match="listing is invalid"):
+        STATE.verify_provider_nodes(record)
+    for states in ({}, {"i-0c": ""}, {"": "running"}):
+        with pytest.raises(STATE.CleanupStateError, match="empty or invalid"):
+            STATE.attach_ec2_instance_states(
+                cleanup_state, "gpu-b", region="us-west-2", states=states
+            )
+    assert "gpu-b" not in cleanup_state["provider_nodes"], "a refusal journals nothing"

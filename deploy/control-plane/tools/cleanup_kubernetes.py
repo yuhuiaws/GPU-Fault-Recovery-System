@@ -34,14 +34,17 @@ from cleanup_state import (
     PHASE_INDEX,
     CleanupStateError,
     atomic_write,
+    attach_ec2_instance_states,
     attach_provider_nodes,
     completed_phases,
     read_state,
     required_phases,
     validate_request,
+    verify_ec2_instance_states,
     verify_provider_nodes,
 )
 
+from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_removal_rbac import (
     delete_recorded_workload_namespace_rbac,
 )
@@ -50,6 +53,16 @@ from gpu_fault.admin.execution import (
     deployment_deadline,
     remaining_timeout,
     run_command,
+)
+from gpu_fault.admin.workflow_reconcile_departed_nodes import ec2_instance_states
+from gpu_fault.cluster_scope import ClusterProvider, cluster_provider
+from gpu_fault.departed_nodes import (
+    DEPARTED_EC2_STATES,
+    NO_HYPERPOD_INSTANCE_BLOCKER,
+    NO_RECORDED_INSTANCE_BLOCKER,
+    NOT_FOUND,
+    provider_identity,
+    recorded_instance_id,
 )
 
 
@@ -621,9 +634,6 @@ def delete_workload_rbac(
     return removed
 
 
-# HyperPod names every EKS node ``hyperpod-<instance-id>``; the fleet agent
-# record carries the same instance id (``gpu_fault.hyperpod`` aliases).
-HYPERPOD_NODE_PREFIX = "hyperpod-"
 # One of the node-installer-reconciler's annotations, which all share
 # ``INSTALLER_ANNOTATION_PREFIX`` (``cleanup_node_patch``).
 INSTALLER_STATE_ANNOTATION = "gpu-fault.io/installer-state"
@@ -636,13 +646,13 @@ ORPHANED_INSTALLER_STATES = frozenset(
 )
 
 
-def hyperpod_target(
+def cleanup_cluster(
     config: dict[str, Any] | None, context: str, cluster_id: str
-) -> tuple[str, str]:
-    """The HyperPod cluster name and Region bound to this cleanup cluster."""
+) -> dict[str, Any]:
+    """The bound config entry of this cleanup cluster."""
 
     if config is None:
-        raise CleanupStateError("cluster is not HyperPod-managed")
+        raise CleanupStateError("cleanup cluster has no bound config")
     members = [
         item
         for item in config.get("clusters") or []
@@ -650,13 +660,28 @@ def hyperpod_target(
     ]
     if len(members) != 1 or members[0].get("context") != context.removeprefix("gpu:"):
         raise CleanupStateError("cleanup cluster is outside the bound config scope")
-    name = members[0].get("hyperpod_cluster_name")
-    region = members[0].get("region") or config.get("aws_region")
+    return members[0]
+
+
+def cluster_region(config: dict[str, Any], member: dict[str, Any], kind: str) -> str:
+    region = member.get("region") or config.get("aws_region")
+    if not isinstance(region, str) or not region:
+        raise CleanupStateError(f"{kind} cluster has no bound Region")
+    return region
+
+
+def hyperpod_target(
+    config: dict[str, Any] | None, context: str, cluster_id: str
+) -> tuple[str, str]:
+    """The HyperPod cluster name and Region bound to this cleanup cluster."""
+
+    if config is None:
+        raise CleanupStateError("cluster is not HyperPod-managed")
+    member = cleanup_cluster(config, context, cluster_id)
+    name = member.get("hyperpod_cluster_name")
     if not isinstance(name, str) or not name:
         raise CleanupStateError("cluster is not HyperPod-managed")
-    if not isinstance(region, str) or not region:
-        raise CleanupStateError("HyperPod cluster has no bound Region")
-    return name, region
+    return name, cluster_region(config, member, "HyperPod")
 
 
 def hyperpod_instances(
@@ -716,18 +741,64 @@ def hyperpod_instances(
     return set(verify_provider_nodes(record))
 
 
+def provider_command(
+    arguments: list[str], *, timeout_seconds: float
+) -> subprocess.CompletedProcess[str]:
+    """``run_command`` for a provider read, bounded like the HyperPod listing."""
+
+    return run_command(
+        arguments, timeout_seconds=remaining_timeout(min(45, timeout_seconds))
+    )
+
+
+def ec2_instance_state(
+    config: dict[str, Any],
+    document: dict[str, Any],
+    member: dict[str, Any],
+    cluster_id: str,
+    instance_id: str,
+) -> str:
+    """EC2's state of one recorded instance (``not-found`` when EC2 has none),
+    read once per run and journaled under ``provider_nodes``."""
+
+    cached = (document.get("provider_nodes") or {}).get(cluster_id)
+    states = verify_ec2_instance_states(cached) if cached is not None else {}
+    if instance_id not in states:
+        region = cluster_region(config, member, "eks-managed")
+        try:
+            found = ec2_instance_states(
+                region, [instance_id], run_command=provider_command
+            )
+        except BootstrapError as exc:
+            raise CleanupStateError(str(exc)) from exc
+        except OSError as exc:
+            raise CleanupStateError(
+                f"EC2 instance lookup failed ({type(exc).__name__})"
+            ) from exc
+        states[instance_id] = found.get(instance_id, NOT_FOUND)
+        record = attach_ec2_instance_states(
+            document, cluster_id, region=region, states=states
+        )
+        states = verify_ec2_instance_states(record)
+    return states[instance_id]
+
+
 def departed_fleet_node(
     config: dict[str, Any] | None,
     document: dict[str, Any],
     context: str,
     agent: dict[str, Any],
 ) -> dict[str, Any]:
-    """Prove an ACTIVE agent's node left the cluster with its spot instance.
+    """Prove an ACTIVE agent's node left the cluster with its instance.
 
-    The node is already absent from Kubernetes. It is DEPARTED only when its
-    name identifies a HyperPod instance that the provider no longer lists;
-    every other outcome (not HyperPod-managed, listing failed, instance still
-    listed, unrecognized name) keeps the original refusal, with the reason.
+    The node is already absent from Kubernetes. It is DEPARTED only when the
+    provider no longer has the instance the shared departed-node rule names
+    (``gpu_fault.departed_nodes.provider_identity``): on HyperPod the one in
+    the node name ``hyperpod-<instance-id>``, not in ``list-cluster-nodes``
+    (the record's ``node_instance_id`` is the Node UID there, compared only
+    when it is an EC2 id); on eks-managed the record's ``node_instance_id``
+    (the ``spec.providerID`` instance), ``terminated`` or unknown to EC2.
+    Every other outcome keeps the original refusal, with the reason.
     """
 
     name = str(agent["node_id"])
@@ -736,11 +807,34 @@ def departed_fleet_node(
     def refuse(reason: str) -> CleanupStateError:
         return CleanupStateError(f"an active fleet node is missing: {name}; {reason}")
 
-    instance_id = name.removeprefix(HYPERPOD_NODE_PREFIX)
-    if not name.startswith(HYPERPOD_NODE_PREFIX) or not instance_id:
-        raise refuse("node name does not identify a HyperPod instance")
-    recorded_instance = agent.get("node_instance_id")
-    if recorded_instance not in (None, "", instance_id):
+    try:
+        member = cleanup_cluster(config, context, cluster_id)
+        provider = cluster_provider(member.get("provider"))
+    except (CleanupStateError, ValueError) as exc:
+        raise refuse(str(exc)) from exc
+    recorded = agent.get("node_instance_id")
+    instance_id = provider_identity(provider.value, name, recorded)
+    entry = {
+        "cluster_id": cluster_id,
+        "node_id": name,
+        "node_instance_id": instance_id,
+        "provider": provider.value,
+    }
+    if provider is ClusterProvider.EKS_MANAGED:
+        if instance_id is None:
+            raise refuse(NO_RECORDED_INSTANCE_BLOCKER)
+        try:
+            state = ec2_instance_state(
+                cast(dict[str, Any], config), document, member, cluster_id, instance_id
+            )
+        except CleanupStateError as exc:
+            raise refuse(str(exc)) from exc
+        if state not in DEPARTED_EC2_STATES:
+            raise refuse(f"EC2 instance {instance_id} is {state}")
+        return {**entry, "ec2_state": state}
+    if instance_id is None:
+        raise refuse(NO_HYPERPOD_INSTANCE_BLOCKER)
+    if recorded_instance_id(recorded) not in (None, instance_id):
         raise refuse("agent instance identity differs from the node name")
     try:
         members = hyperpod_instances(config, document, context, cluster_id)
@@ -748,11 +842,7 @@ def departed_fleet_node(
         raise refuse(str(exc)) from exc
     if instance_id in members:
         raise refuse(f"HyperPod still lists instance {instance_id}")
-    return {
-        "cluster_id": cluster_id,
-        "node_id": name,
-        "node_instance_id": instance_id,
-    }
+    return entry
 
 
 def orphaned_installer_node(

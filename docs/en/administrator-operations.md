@@ -198,16 +198,24 @@ nor does it change `NodeRecovery=None` or the provider replace prohibition.
   (with its failure) are written into `installation_registry_sync` of `uninstall/state.json` and the field of the same name in
   the command output. A refusal leaves no journal, so `deploy` is not blocked by "uninstall in progress"; a resume of an
   uninstall already started keeps the verdict it started on and is not judged again.
-- Every ACTIVE Agent in the fleet still has its node in the GPU EKS, or the node left HyperPod with a spot replacement (the
-  control plane's departed-node cleanup has usually set such a record `REVOKED` already, see §10.1.1;
-  `workflow-reconcile --retire-departed-agents` does it by hand, see §10.2; `REVOKED` records take no part in the gate).
-  PREFLIGHT lets a missing ACTIVE node pass in one case only: the node name `hyperpod-<instance-id>` is absent both from
-  Kubernetes and from the `aws sagemaker list-cluster-nodes` result (captured once per cluster and recorded with its SHA-256
-  under `provider_nodes` in `kubernetes-cleanup.json`). Such a node is recorded in `departed_fleet_nodes` and is no longer
-  a node-cleanup target; when HyperPod still lists the instance, the cluster is not HyperPod-managed, the AWS call fails or
-  the node name carries no instance id, PREFLIGHT still refuses with `an active fleet node is missing` and the reason. A
-  departed ACTIVE record of an eks-managed cluster does not qualify (its node name carries no instance id): the
-  departed-node cleanup or `--retire-departed-agents` must retire it first. A replacement node that carries only
+- Every ACTIVE Agent in the fleet still has its node in the GPU EKS, or the node left with its instance (a spot reclaim,
+  scale-in or provider replacement, on HyperPod or eks-managed; the control plane's departed-node cleanup has usually set
+  such a record `REVOKED` already, see §10.1.1; `workflow-reconcile --retire-departed-agents` does it by hand, see §10.2;
+  `REVOKED` records take no part in the gate).
+  PREFLIGHT lets a missing ACTIVE node pass only when the provider proves its instance gone, by the departed-node
+  cleanup's rule (§10.1.1): on HyperPod the instance in the node name `hyperpod-<instance-id>` is absent from the
+  `aws sagemaker list-cluster-nodes` result (captured once per cluster; a HyperPod record's `node_instance_id` is the
+  Kubernetes Node UID and is compared with the name only when it is an EC2 instance id); on an eks-managed cluster the EC2
+  instance id the fleet recorded for the node (the Agent record's `node_instance_id`, taken from the Node's
+  `spec.providerID` at install) is `terminated` or unknown to `aws ec2 describe-instances` in the cluster's Region (each
+  instance read once). The provider's answer is recorded with its SHA-256 under `provider_nodes` in
+  `kubernetes-cleanup.json`, the node in `departed_fleet_nodes`, and it is no longer a node-cleanup target. When HyperPod
+  still lists the instance, EC2 reports it `pending`/`running`/`stopping`/`stopped`/`shutting-down`, the instance is
+  unknown (no instance id in a HyperPod node name, no EC2 instance id recorded for an eks-managed node), a recorded EC2 id
+  differs from the HyperPod node name, the cluster is not in the bound config or the AWS call fails, PREFLIGHT still
+  refuses with `an active fleet node is missing` and the reason; retire such a record first through the departed-node
+  cleanup or `--retire-departed-agents`. The eks-managed proof needs `ec2:DescribeInstances` for the executing identity.
+  A replacement node that carries only
   `gpu-fault.io/installer-*` annotations, with `installer-state` `Failed`/`Installing`/`Retrying`/`WaitingForKey` and
   no Agent record in the fleet, does not block either: it is recorded in `orphaned_installer_nodes`, and the reset removes
   just those installer annotations with a patch preconditioned on the Node UID/resourceVersion; any other `gpu-fault.io/*`
@@ -1518,7 +1526,8 @@ Semantics and boundaries of `eks-managed`:
   its node group ARNs -- no `sagemaker:*` at all; the role name derives from the `cluster_id`. The deploy-host
   identity running `workflow-reconcile` additionally needs `ec2:DescribeInstances` (the departed-node EC2 proof); the
   operator identity running `remove-cluster`/`uninstall` additionally needs `eks:UpdateNodegroupConfig` (eks-managed) /
-  `sagemaker:UpdateCluster` (HyperPod) to release the ownership label (the "release" row of §5.0.0), and
+  `sagemaker:UpdateCluster` (HyperPod) to release the ownership label (the "release" row of §5.0.0),
+  `ec2:DescribeInstances` (eks-managed: PREFLIGHT's proof that a missing ACTIVE node's instance is gone, §3), and
   `iam:GetOpenIDConnectProvider`, `iam:ListOpenIDConnectProviderTags`, `iam:ListRoles` and
   `iam:DeleteOpenIDConnectProvider` to delete a solution-created Executor OIDC provider on its double proof (§5); the
   operator identity running `join-cluster`/`deploy`/`status --full`/`node-scope` also reads

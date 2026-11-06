@@ -1294,6 +1294,80 @@ def test_a_node_status_update_inside_the_reset_is_retried_and_the_journal_comple
     )
 
 
+FAKE_AWS_EC2 = r"""#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+with Path(os.environ["FAKE_AWS_LOG"]).open("a") as stream:
+    stream.write(json.dumps(sys.argv[1:]) + "\n")
+if sys.argv[1:3] != ["ec2", "describe-instances"]:
+    raise SystemExit("unexpected aws command")
+print("[]")
+"""
+
+
+def test_a_reset_leaves_out_a_departed_eks_node_ec2_no_longer_knows(
+    tmp_path: Path,
+) -> None:
+    """A reclaimed plain EKS node whose ACTIVE Agent record outlived it: EC2
+    no longer knows the instance the fleet recorded, so PREFLIGHT journals
+    the departure, the run output says so, and the reset completes."""
+
+    harness = _reset_harness(tmp_path)
+    config = json.loads(harness.config.read_text())
+    config["aws_region"] = "us-west-2"
+    config["clusters"][0].update(provider="eks-managed", region="us-west-2")
+    harness.config.write_text(json.dumps(config))
+    departed = "ip-10-0-33-205.us-west-2.compute.internal"
+    api = json.loads(harness.api.read_text())
+    api["interrupt_node"] = False
+    api["fleet"].append(
+        {
+            "cluster_id": "gpu-a",
+            "node_id": departed,
+            "node_instance_id": "i-00000000000000002",
+            "lifecycle_state": "ACTIVE",
+            "installed_unit_inventory": {"units": ["gpu-fault-node-agent.service"]},
+        }
+    )
+    harness.api.write_text(json.dumps(api))
+    aws = tmp_path / "bin" / "aws"
+    aws.write_text(FAKE_AWS_EC2, encoding="utf-8")
+    aws.chmod(0o755)
+    aws_log = tmp_path / "aws.jsonl"
+    harness.env["FAKE_AWS_LOG"] = str(aws_log)
+
+    result = harness.run()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        f"gpu-a: departed fleet node {departed} (EC2 instance i-00000000000000002 "
+        "is not-found); not a node cleanup target"
+    ) in result.stdout, result.stdout
+    document = json.loads(harness.state.read_text())
+    assert document["departed_fleet_nodes"] == [
+        {
+            "cluster_id": "gpu-a",
+            "node_id": departed,
+            "node_instance_id": "i-00000000000000002",
+            "provider": "eks-managed",
+            "ec2_state": "not-found",
+        }
+    ], document.get("departed_fleet_nodes")
+    assert document["provider_nodes"]["gpu-a"]["instance_states"] == {
+        "i-00000000000000002": "not-found"
+    }, "the EC2 answer is bound in the journal"
+    assert [json.loads(line)[:2] for line in aws_log.read_text().splitlines()] == [
+        ["ec2", "describe-instances"]
+    ], "one EC2 read for the one departed node"
+    assert (document["phase"], document["status"]) == (
+        "CLEANUP_COMPLETED",
+        "COMPLETED",
+    ), document["history"]
+
+
 def test_a_refused_node_patch_names_its_reason_and_a_rerun_resumes_the_reset(
     tmp_path: Path,
 ) -> None:

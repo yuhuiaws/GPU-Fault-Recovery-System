@@ -841,6 +841,7 @@ def test_departed_hyperpod_node_is_journaled_and_left_out_of_targets(
             "cluster_id": "gpu-a",
             "node_id": DEPARTED_NODE,
             "node_instance_id": DEPARTED_INSTANCE,
+            "provider": "hyperpod",
         }
     ]
     record = state["provider_nodes"]["gpu-a"]
@@ -889,7 +890,7 @@ def test_missing_active_node_still_listed_by_hyperpod_fails_closed(
 @pytest.mark.parametrize(
     "variant,reason",
     [
-        ("no-config", "not HyperPod-managed"),
+        ("no-config", "cleanup cluster has no bound config"),
         ("no-hyperpod-name", "not HyperPod-managed"),
         ("no-region", "no bound Region"),
         ("other-context", "outside the bound config scope"),
@@ -899,7 +900,7 @@ def test_missing_active_node_still_listed_by_hyperpod_fails_closed(
         ("not-json", "not JSON"),
         ("no-instance-id", "lacks instance identities"),
         ("empty-listing", "empty or ambiguous"),
-        ("foreign-name", "does not identify a HyperPod instance"),
+        ("foreign-name", "node name carries no HyperPod instance id"),
         ("instance-mismatch", "differs from the node name"),
     ],
 )

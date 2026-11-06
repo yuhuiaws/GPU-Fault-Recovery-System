@@ -433,6 +433,66 @@ def verify_provider_nodes(record: object) -> list[str]:
     return cast(list[str], record["instance_ids"])
 
 
+def ec2_instance_states_digest(states: dict[str, str]) -> str:
+    encoded = json.dumps(states, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _valid_states(states: object) -> bool:
+    return (
+        isinstance(states, dict)
+        and bool(states)
+        and all(
+            isinstance(key, str) and key and isinstance(value, str) and value
+            for key, value in states.items()
+        )
+    )
+
+
+def attach_ec2_instance_states(
+    document: dict[str, Any],
+    cluster_id: str,
+    *,
+    region: str,
+    states: dict[str, str],
+) -> dict[str, Any]:
+    """Journal what EC2 said about an eks-managed cluster's missing nodes.
+
+    The eks-managed counterpart of :func:`attach_provider_nodes`: a plain EKS
+    cluster has no provider node list, so the proof is the EC2 state of the
+    instance id the fleet recorded for each missing node (``not-found`` when
+    EC2 no longer knows it). Each instance is read once per run;
+    ``node_targets`` reads the answers back through
+    :func:`verify_ec2_instance_states`.
+    """
+
+    if not _valid_states(states):
+        raise CleanupStateError("EC2 instance states are empty or invalid")
+    ordered = dict(sorted(states.items()))
+    record = {
+        "provider": "eks-managed",
+        "region": region,
+        "instance_states": ordered,
+        "captured_at": now(),
+        "sha256": ec2_instance_states_digest(ordered),
+    }
+    document.setdefault("provider_nodes", {})[cluster_id] = record
+    return record
+
+
+def verify_ec2_instance_states(record: object) -> dict[str, str]:
+    states = record.get("instance_states") if isinstance(record, dict) else None
+    if (
+        not isinstance(record, dict)
+        or record.get("provider") != "eks-managed"
+        or not _valid_states(states)
+        or record.get("sha256")
+        != ec2_instance_states_digest(cast(dict[str, str], states))
+    ):
+        raise CleanupStateError("captured EC2 instance states are invalid")
+    return dict(cast(dict[str, str], states))
+
+
 def transition(
     document: dict[str, Any],
     *,
