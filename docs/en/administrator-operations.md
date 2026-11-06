@@ -212,10 +212,15 @@ nor does it change `NodeRecovery=None` or the provider replace prohibition.
   no Agent record in the fleet, does not block either: it is recorded in `orphaned_installer_nodes`, and the reset removes
   just those installer annotations with a patch preconditioned on the Node UID/resourceVersion; any other `gpu-fault.io/*`
   label, taint or ownership annotation, or `installer-state=Succeeded`, still fails closed as `unregistered node runtime`.
-  The node-group ownership label `gpu-fault.io/control-plane` (§5.0.0) is such a label itself: on a cluster selected by the
-  label convention a GPU node without an Agent record (a replacement still installing, or one whose install failed) is
-  currently refused as `unregistered node runtime` as well, and becomes an ordinary cleanup target once its Agent
-  registers. Do not scale the reconciler to 0 for this: a PREFLIGHT resume then refuses with `original resource state
+  The two labels an administrator declares on the node group are not solution state: the ownership label
+  `gpu-fault.io/control-plane` (§5.0.0) and the DCGM host engine label `gpu-fault.io/dcgm-hostengine` reach every node from
+  its node group, the product never writes them on a Node and the Kubernetes cleanup leaves them alone (`OWNERSHIP_RELEASED`
+  releases the ownership label from the node groups). On a cluster selected by the label convention a node without an Agent
+  record and without any other `gpu-fault.io/*` metadata (a replacement the reconciler has not reached yet) is therefore
+  neither a cleanup target nor a blocker, a replacement with only unfinished installer annotations is an orphaned installer
+  node as above, and a cluster whose join failed before its node runtime rollout is an empty, proven target set (node
+  cleanup `SKIPPED`); the same keys as an annotation or a taint are still solution state. Do not scale the reconciler to 0
+  for this: a PREFLIGHT resume then refuses with `original resource state
   changed during capture: deployment gpu-fault-system/gpu-fault-node-installer-reconciler replicas 1 -> 0`; restore the
   original replica count and rerun.
 

@@ -20,9 +20,13 @@ from cleanup_node_patch import (
     NodeConverged,
     NodePatch,
     NodePlan,
+    carries_product_state,
     clear_node,
     orphan_converged,
     orphan_node_patch,
+    product_annotations,
+    product_labels,
+    product_taints,
     target_converged,
     target_node_patch,
 )
@@ -758,18 +762,16 @@ def orphaned_installer_node(
 
     Anything else of ours on the node (labels, quarantine taint, ownership or
     other annotations, ``installer-state=Succeeded``) or any fleet agent record
-    for the node keeps it a blocker.
+    for the node keeps it a blocker. The node-group declarations
+    (``cleanup_node_patch.NODE_GROUP_DECLARATION_LABELS``) are not ours: every
+    node of a label-convention node group, a replacement too, carries them.
     """
 
     metadata = node["metadata"]
-    labels = metadata.get("labels") or {}
     annotations = metadata.get("annotations") or {}
-    taints = (node.get("spec") or {}).get("taints") or []
-    if any(key.startswith("gpu-fault.io/") for key in labels) or any(
-        str(taint.get("key", "")).startswith("gpu-fault.io/") for taint in taints
-    ):
+    if product_labels(node) or product_taints(node):
         return False
-    owned = [key for key in annotations if key.startswith("gpu-fault.io/")]
+    owned = product_annotations(node)
     if not owned or any(
         not key.startswith(INSTALLER_ANNOTATION_PREFIX) for key in owned
     ):
@@ -829,11 +831,7 @@ def node_targets(
             raise CleanupStateError("node cleanup target disappeared or changed UID")
     orphaned: dict[str, str] = {}
     for name, node in by_name.items():
-        metadata = node["metadata"]
-        keys = set(metadata.get("labels") or {}) | set(
-            metadata.get("annotations") or {}
-        )
-        if name in recorded or not any(key.startswith("gpu-fault.io/") for key in keys):
+        if name in recorded or not carries_product_state(node):
             continue
         if orphaned_installer_node(node, agents, cluster_id):
             orphaned[name] = object_identity(node)[3]
@@ -852,22 +850,18 @@ def nothing_installed(
 
     A join that failed before its node runtime rollout (live 2026-10-04: the
     eks-managed join of gpu-eks-cluster stopped at the profile registration)
-    leaves no fleet record for the cluster and no ``gpu-fault.io/`` label or
-    annotation on any node. That is an empty, proven target set, not missing
-    proof: a fleet record of any lifecycle, or installer metadata on a node,
-    keeps the "no proven fleet targets" refusal.
+    leaves no fleet record for the cluster and nothing of ours on any node: no
+    ``gpu-fault.io/`` label, annotation or taint -- the node-group
+    declarations aside, which a label-convention join requires on every GPU
+    node before it starts (``cleanup_node_patch.carries_product_state``). That
+    is an empty, proven target set, not missing proof: a fleet record of any
+    lifecycle, or anything of ours on a node, keeps the "no proven fleet
+    targets" refusal.
     """
 
     if any(agent.get("cluster_id") == cluster_id for agent in agents):
         return False
-    for node in nodes:
-        metadata = node.get("metadata") or {}
-        keys = set(metadata.get("labels") or {}) | set(
-            metadata.get("annotations") or {}
-        )
-        if any(key.startswith("gpu-fault.io/") for key in keys):
-            return False
-    return True
+    return not any(carries_product_state(node) for node in nodes)
 
 
 def clear_node_metadata(

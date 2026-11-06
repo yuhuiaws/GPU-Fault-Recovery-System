@@ -828,9 +828,12 @@ cluster and written with a SHA-256 into the journal's `provider_nodes`) is it ju
 the node targets. A plain EKS cluster has no such provider proof: a missing node of an ACTIVE Agent is refused outright (`node name does not
 identify a HyperPod instance`); retire that Agent record first through the control plane's departed-node cleanup or
 `gpu-fault-admin workflow-reconcile --retire-departed-agents`, then rerun. A replacement node carrying only `gpu-fault.io/installer-*`
-annotations (`installer-state` `Failed`, `Installing`, `Retrying` or `WaitingForKey`), no `gpu-fault.io/` label or taint at all, and no fleet record
-of any state is recorded in `orphaned_installer_nodes`, and the reset phase deletes only those installer annotations, with Node UID/resourceVersion
-preconditions; any other `gpu-fault.io/*` metadata (the node group ownership label `gpu-fault.io/control-plane` included) still blocks with
+annotations (`installer-state` `Failed`, `Installing`, `Retrying` or `WaitingForKey`), no `gpu-fault.io/` label or taint besides the node-group
+declarations, and no fleet record of any state is recorded in `orphaned_installer_nodes`, and the reset phase deletes only those installer
+annotations, with Node UID/resourceVersion preconditions. The node-group declarations are the ownership label `gpu-fault.io/control-plane` and the
+DCGM host engine label `gpu-fault.io/dcgm-hostengine`: the administrator declares them on the node group and the product never writes them on a
+Node, so they are not solution state and a node carrying only them is neither a cleanup target nor a blocker; any other `gpu-fault.io/*` metadata
+(any other label, annotation or taint) still blocks with
 `unregistered node runtime` when the node has no fleet Agent. When an original replica count was changed between two PREFLIGHT runs, the error
 names the resource and the old and new values (`... replicas 1 -> 0`); restore it before resuming.
 The cleanup journal is schema-v2, and `phase_order` in the hashed content must exactly equal the current `PHASES`.

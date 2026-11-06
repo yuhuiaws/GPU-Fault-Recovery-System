@@ -50,6 +50,7 @@ from cleanup_failure import CleanupCommandError
 from cleanup_state import CleanupStateError
 
 from gpu_fault.admin.node_patch_retry import NodePatchRetry, guarded, pointer
+from gpu_fault.cluster_scope import DCGM_HOSTENGINE_LABEL, OWNERSHIP_LABEL
 
 NODE_METADATA_RETRY = NodePatchRetry(
     subject="node metadata cleanup",
@@ -57,6 +58,17 @@ NODE_METADATA_RETRY = NodePatchRetry(
     refuse=CleanupStateError,
 )
 OWNED_PREFIX = "gpu-fault.io/"
+#: The labels an administrator declares on a node group (EKS managed node
+#: group ``labels``, HyperPod instance group ``KubernetesConfig.Labels``,
+#: Karpenter NodePool template labels) and every node of the group carries:
+#: the site's membership claim (``cluster_scope.OWNERSHIP_LABEL``, released
+#: from the node groups by ``OWNERSHIP_RELEASED``) and the node image's host
+#: DCGM declaration (``cluster_scope.DCGM_HOSTENGINE_LABEL``). The product
+#: reads them and never writes them on a Node, and the node cleanup leaves
+#: them alone, so they are no installed state: a node of a label-convention
+#: cluster carries them whether or not anything was ever installed on it. As
+#: labels only -- the same key as an annotation or a taint is ours.
+NODE_GROUP_DECLARATION_LABELS = frozenset({OWNERSHIP_LABEL, DCGM_HOSTENGINE_LABEL})
 # Node annotations the node-installer-reconciler writes while (or after) it
 # tries to install a node; ``gpu-fault.io/node-key-*`` ownership annotations
 # are deliberately not in this family.
@@ -92,6 +104,44 @@ def owned_keys(inventory: dict[str, Any]) -> tuple[tuple[str, list[str]], ...]:
     return (
         ("annotations", inventory["node_annotations"]),
         ("labels", inventory["node_labels"]),
+    )
+
+
+def product_labels(node: dict[str, Any]) -> list[str]:
+    """Our label keys on ``node``, the node-group declarations excepted."""
+
+    labels = (node.get("metadata") or {}).get("labels") or {}
+    return [
+        key
+        for key in labels
+        if key.startswith(OWNED_PREFIX) and key not in NODE_GROUP_DECLARATION_LABELS
+    ]
+
+
+def product_annotations(node: dict[str, Any]) -> list[str]:
+    annotations = (node.get("metadata") or {}).get("annotations") or {}
+    return [key for key in annotations if key.startswith(OWNED_PREFIX)]
+
+
+def product_taints(node: dict[str, Any]) -> list[str]:
+    taints = (node.get("spec") or {}).get("taints") or []
+    return [
+        key
+        for taint in taints
+        if (key := str(taint.get("key", ""))).startswith(OWNED_PREFIX)
+    ]
+
+
+def carries_product_state(node: dict[str, Any]) -> bool:
+    """Whether the product set anything on ``node``: any ``gpu-fault.io/``
+    label but the node-group declarations, any such annotation or taint.
+
+    A key nobody knows counts too, so state a later release adds blocks the
+    cleanup until it is known instead of being left behind.
+    """
+
+    return bool(
+        product_labels(node) or product_annotations(node) or product_taints(node)
     )
 
 
@@ -167,21 +217,13 @@ def orphan_node_patch(
     ``still_orphaned`` re-judges the node (``orphaned_installer_node``): only
     unfinished installer annotations of ours and no fleet Agent. A node that
     gained anything else of ours is the refusal the capture would raise; one
-    with nothing of ours left needs no patch.
+    with nothing of ours left (the node-group declarations do not count)
+    needs no patch.
     """
 
-    metadata = node["metadata"]
-    if metadata.get("uid") != uid:
+    if node["metadata"].get("uid") != uid:
         raise CleanupStateError("orphaned installer node changed UID")
-    keys = [
-        *(metadata.get("labels") or {}),
-        *(metadata.get("annotations") or {}),
-        *(
-            str(taint.get("key", ""))
-            for taint in (node.get("spec") or {}).get("taints") or []
-        ),
-    ]
-    if not any(key.startswith(OWNED_PREFIX) for key in keys):
+    if not carries_product_state(node):
         return None
     if not still_orphaned(node):
         raise CleanupStateError(
