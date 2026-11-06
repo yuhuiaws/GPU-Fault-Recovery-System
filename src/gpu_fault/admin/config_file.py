@@ -14,6 +14,7 @@ from pathlib import Path
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.admin.capacity_evidence import spool_cluster_depth_guidance
 from gpu_fault.admin.config import (
     ADMIN_CONFIG_API_VERSION,
     ADMIN_CONFIG_KIND,
@@ -73,7 +74,17 @@ def load_admin_config_file(
             "(detailed design 9.5). Remove the field(s) from the file.",
             file=sys.stderr,
         )
-    return apply_patch(base, spec)
+    desired = apply_patch(base, spec)
+    spool = desired.capacity.telemetry_spool
+    guidance = spool_cluster_depth_guidance(
+        telemetry_spool_enabled=spool.enabled,
+        max_cluster_depth=spool.max_cluster_depth,
+        largest_cluster_node_count=desired.capacity.largest_cluster_node_count,
+    )
+    if guidance:
+        # Printed by the config plan and its apply alike; nothing is refused.
+        print(f"WARNING: admin config {source}: {guidance}", file=sys.stderr)
+    return desired
 
 
 def admin_config_file_path(state_dir: Path) -> Path:

@@ -26,6 +26,7 @@ from gpu_fault.admin.config import (
     admin_config_history_path,
     admin_config_pending_path,
     begin_admin_config_apply,
+    default_admin_config,
     load_desired_admin_config,
     load_pending_admin_config_apply,
 )
@@ -34,7 +35,7 @@ from gpu_fault.admin.config_file import (
     initialize_desired_admin_config,
     load_admin_config_file,
 )
-from gpu_fault.admin.config_patch import preset_admin_config
+from gpu_fault.admin.config_patch import apply_patch, preset_admin_config
 from gpu_fault.admin.cpu_rolling_update import record_last_run
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.admin.site import SiteConfigError
@@ -219,6 +220,105 @@ def test_config_dry_run_is_local_and_prints_the_change_plan(
         "dry-run wrote a pending apply"
     )
     assert not (tmp_path / "admin-config/history").exists(), "dry-run wrote history"
+
+
+# The default site with the telemetry spool switched on (the connection budget
+# leaves room for it at five control-worker replicas, as in the 32-enabled preset).
+SPOOL_ON = {
+    "capacity": {
+        "controlWorkerReplicas": 5,
+        "telemetrySpool": {"enabled": True, "replicas": 3},
+    }
+}
+
+
+def _spool(depth: int) -> dict[str, object]:
+    return {
+        "capacity": {
+            "controlWorkerReplicas": 5,
+            "telemetrySpool": {
+                "enabled": True,
+                "replicas": 3,
+                "maxClusterDepth": depth,
+            },
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("spec", "warned"),
+    [
+        ({}, False),
+        ({"capacity": {"telemetrySpool": {"maxClusterDepth": 64}}}, False),
+        (SPOOL_ON, True),
+        (_spool(2047), True),
+        (_spool(2048), False),
+    ],
+    ids=["default-site", "spool-off-shallow", "spool-on", "below-4x", "at-4x"],
+)
+def test_config_plan_warns_when_an_enabled_spool_is_shallower_than_4x_the_largest_cluster(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    spec: dict[str, object],
+    warned: bool,
+) -> None:
+    """性能压测验收方案 §13.4 is guidance for the spool depth, not a floor: the
+    plan says what would satisfy it and is never refused or changed by it."""
+
+    site_file(tmp_path)
+    config = _yaml(tmp_path / "capacity.yaml", spec)
+
+    assert admin_cli.run(_arguments(tmp_path, "--file", str(config), "--dry-run")) == 0
+
+    captured = capsys.readouterr()
+    plan = json.loads(captured.out)
+    desired = apply_patch(default_admin_config(), spec)
+    assert plan["status"] == "DRY_RUN", "the warning never refuses the plan"
+    assert plan["desired_config_sha256"] == desired.sha256(), (
+        "the plan is the config as written"
+    )
+    if not warned:
+        assert "WARNING" not in captured.err, captured.err
+        return
+    depth = desired.capacity.telemetry_spool.max_cluster_depth
+    assert captured.err.count("WARNING: ") == 1, captured.err
+    for part in (
+        f"spec.capacity.telemetrySpool.maxClusterDepth {depth} is below 4 x "
+        "spec.capacity.largestClusterNodeCount 512 = 2048 with the telemetry spool",
+        "性能压测验收方案 §13.4",
+        "Set maxClusterDepth to at least 2048",
+        "guidance only",
+    ):
+        assert part in captured.err, f"the warning lacks {part!r}: {captured.err}"
+
+
+def test_config_apply_warns_about_the_spool_depth_and_applies_it_as_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    site_file(tmp_path)
+    mock_live_release(monkeypatch)
+    initialize_desired_admin_config(tmp_path)
+    config = _yaml(tmp_path / "spool.yaml", SPOOL_ON)
+    stubs = Stubs(monkeypatch)
+    capsys.readouterr()
+
+    assert admin_cli.run(_arguments(tmp_path, "--file", str(config))) == 0
+
+    captured = capsys.readouterr()
+    output = json.loads(captured.out)
+    desired = apply_patch(default_admin_config(), SPOOL_ON)
+    assert output["status"] == "APPLIED", "the warning never refuses the apply"
+    assert output["affected_roles"] == ["ingress", "spool", "worker"], (
+        "the roles roll for the spool switch and the worker replicas only"
+    )
+    assert stubs.events == ["verify", "release"], "the release ran as usual"
+    assert captured.err.count("WARNING: ") == 1, captured.err
+    assert "Set maxClusterDepth to at least 2048" in captured.err, captured.err
+    persisted = json.loads(admin_config_desired_path(tmp_path).read_text())
+    assert persisted["config"] == desired.as_dict(), "applied as written"
+    assert persisted["role_sha256"] == desired.role_sha256(), (
+        "the warning leaves every role digest alone"
+    )
 
 
 def test_config_applies_with_a_default_reference_and_records_the_approver(

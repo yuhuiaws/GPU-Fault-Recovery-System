@@ -6,7 +6,9 @@ Every constant here is a measurement from ``docs/性能压测验收方案.md``:
   1024 produced 243 HTTP 429 from
   ``gpu_fault_telemetry_spool_rejected_total{scope="cluster"}``; raising the
   depth to 4096 produced 0. Four requests of depth per node is the ratio that
-  held.
+  held. The processor queue depth is held to it; the spool's own per-cluster
+  depth, which that run measured, is only advised to it
+  (``spool_cluster_depth_guidance``).
 * section 13.3 -- 32-50 clusters x 256 nodes (about 12,800 nodes) against an
   Aurora ``0.5/96 low-start`` produced 3076 HTTP 503; pre-provisioning
   Min ACU at about 124-128 produced 0. One ACU per hundred managed nodes is
@@ -61,6 +63,33 @@ def aurora_min_acu_floor(managed_node_count: int) -> float:
 
 def minimum_cluster_queue_depth(largest_cluster_node_count: int) -> int:
     return MAX_CLUSTER_QUEUE_DEPTH_PER_NODE * largest_cluster_node_count
+
+
+def spool_cluster_depth_guidance(
+    *,
+    telemetry_spool_enabled: bool,
+    max_cluster_depth: int,
+    largest_cluster_node_count: int,
+) -> str | None:
+    """The administrator warning for a spool shallower than the section 13.4 ratio.
+
+    Advice, never a refusal: the evidence is one 1000-node cluster, and the
+    default depth (1024) is already below the ratio for the default 512-node
+    cluster. A disabled spool admits nothing, so its depth has no effect.
+    """
+
+    advised = minimum_cluster_queue_depth(largest_cluster_node_count)
+    if not telemetry_spool_enabled or max_cluster_depth >= advised:
+        return None
+    return (
+        f"spec.capacity.telemetrySpool.maxClusterDepth {max_cluster_depth} is below "
+        f"{MAX_CLUSTER_QUEUE_DEPTH_PER_NODE} x spec.capacity.largestClusterNodeCount "
+        f"{largest_cluster_node_count} = {advised} with the telemetry spool enabled; "
+        "a cluster that fills its spool depth gets the reserved HTTP 429 for its "
+        "routine telemetry (性能压测验收方案 §13.4: one 1000-node cluster, 243 HTTP "
+        f"429 at depth 1024, none at 4096). Set maxClusterDepth to at least {advised}; "
+        "this is guidance only and the config is accepted as written"
+    )
 
 
 def legacy_largest_cluster_node_count(max_cluster_queue_depth: int) -> int:

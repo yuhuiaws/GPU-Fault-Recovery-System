@@ -20,7 +20,8 @@ Administrators can currently configure:
   `maxClusterDepth` (64..65536, default 1024; beyond that depth a single cluster's routine telemetry receives reserved 429.
   Per the 1000-node single cluster of Performance Acceptance Plan §13.4: the priority-only model at 1024 got 243 429s on its
   3000 routine telemetry requests; the complete model at 4096 got 202 for all 6500 requests with P0 and evidence unchanged.
-  4096 is recommended when a single cluster has >= 512 nodes; the default 1024 corresponds to the preset 256-node cluster
+  With the spool enabled it is advised to be at least `4 x largestClusterNodeCount`, and below that `config` prints one
+  WARNING line (§5), never a refusal; the default 1024 corresponds to the preset 256-node cluster
   model; the ingress's spool admission reads the value, and §7 says what a change of it alone rolls);
 - Aurora Serverless v2 Min/Max ACU;
 - Processor total queue, single-cluster queue, client backoff, persistent retry, completed record retention and the
@@ -627,6 +628,15 @@ regional and per cluster, 90% regional, and critical once a cluster reaches its 
 (Administrator Operations §8). When rollback captures the online AdminConfig, it
 reads only the node counts actually present in the ConfigMap; when production declares none, it infers from the captured depth per the legacy record rule above,
 without filling in the release default.
+
+The per-cluster spool depth is not in the table: §13.4 measured exactly that depth, but the evidence is a single 1000-node
+cluster, and the default depth 1024 is already below the 2048 the same ratio gives the default 512-node topology, so it is
+guidance, not a floor. With the telemetry spool enabled and `telemetrySpool.maxClusterDepth < 4 x largestClusterNodeCount`,
+the `config` plan (`--dry-run`) and the apply (and a first deployment that reads the config file) print one `WARNING:` line on
+stderr that cites §13.4 and names the smallest value that satisfies the guidance, `4 x largestClusterNodeCount`; the config is
+accepted as written, and the digests and the rendered output stay unchanged. A disabled spool does not use the depth and gets
+no warning: the default site (512 nodes, depth 1024, spool disabled) prints nothing, and the same site with the spool enabled
+prints the warning.
 
 ### 5.1 Declared Topology Against the Registered GPU Fleet
 
