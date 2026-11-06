@@ -2,13 +2,15 @@
 
 English edition of `docs/components/postgres-state-tables.md`; the Chinese file remains the source of record until both are maintained together.
 
-This document preserves the 2026-09-07 Store F2 table-split design and records the implementation constraints that followed. The original draft came from
-the ignored `docs/review/fragments/` in the `store-review-fixes` worktree; the original file is left untouched.
-This file lives in the normal documentation tree and no longer depends on that worktree's lifecycle.
+This document preserves the original table-split design of Store review item F2 (see "Original F2 Design") and records the current implementation and its constraints.
+The original draft existed only as a review draft; this file lives in the normal documentation tree and is the one retained copy of that design.
 
 This implementation appends v15 (remote_command) and v16 (workflow) after schema v14, keeping the original wake-up semantics.
 The later v17 fixes the conditional-delete compatibility between the raw JSON and the dedicated-table projection during the dual phase.
 v18 fixes the lock order of the non-authoritative copy cleanup from legacy to dual, keeping the read/write protocol and the two-phase migration boundary.
+The later v19–v23 (hot-table storage parameters and HOT indexes, the processor counter ledger, the edge-triggered processor/spool wake-ups,
+the detached processor-queue layout) change neither the two state tables' structure nor their mode protocol or wake-up semantics; the latest is v23
+(`schema_migrations.POSTGRES_SCHEMA_MIGRATIONS`).
 The v12, index counts and source line numbers in the original draft below are historical design background, not current implementation facts.
 New DDL must be appended as consecutive migrations; the checksums of historical migrations are never rewritten.
 
@@ -28,6 +30,11 @@ control-record view does not contain that state. Use a reviewed native PostgreSQ
 backup/restore for such databases; do not purge data or change production modes
 to bypass the refusal. Imported legacy hot-state records are backfilled into
 their dedicated tables in the same destination transaction before success.
+The state-table operations below never construct a `PostgresStore`: they run in
+`state_table_migrate.state_table_maintenance`, an autocommit session that holds the
+shared schema barrier. The index build, schema preflight and hot-layout switch
+likewise use a plain connection, because opening a Store would validate (and refuse)
+the very schema they inspect or change.
 
 The first phase adds v15: `gpu_fault_remote_commands`, the database migration-mode record, the read view,
 dual writes and the old-writer barrier. The default mode is `legacy`. An ordinary deploy only has the independent schema Job
@@ -165,8 +172,9 @@ repeatedly scanning the same prefix. Each call still keeps the head and the agin
 while continuing the search it also checks earlier ready STRICT predecessors, preventing retries of the same lane from being skipped.
 The window and claim limits do not grow, and there is no unbounded rescan within one call; each Store keeps at most 64 discardable progress hints
 for filter scopes, updated only after commit, while leases and fencing are still adjudicated by the database.
-The scope intersection predicate is aligned with the existing GIN expression, avoiding per-scope path scans; whether GIN is chosen still depends on
-maintenance state, the pending list and optimiser cost, and a local EXPLAIN cannot be taken as Aurora's fixed plan or as a latency promise.
+The scope intersection predicate is aligned with schema v23's partial GIN on the `scope_keys` column (predicate `cardinality(scope_keys) > 0`,
+`fastupdate = off`, no pending list), avoiding per-scope path scans; whether GIN is chosen still depends on
+maintenance state and optimiser cost, and a local EXPLAIN cannot be taken as Aurora's fixed plan or as a latency promise.
 Archive candidates exclude open remote commands and external successors before the LIMIT, so that stable old records
 do not block and exhaust each round's quota; the post-upload SERIALIZABLE re-verification is kept. The archive withheld count is the number of
 refusals after an actual attempt and does not include records already excluded in the candidate SQL.
@@ -203,7 +211,7 @@ and keeps only the immutable part in the payload. This is a schema migration wit
 legacy/dual/dedicated tri-state, hot-state's `--backfill-hot-state`) it needs: new-table DDL,
 dual writes, a backfill CLI, a status CLI, start-up validation, rewritten read/write paths for three backends, EXPLAIN regression tests,
 and rewrites of every script that reads `kind='workflow'` / `kind='remote_command'` directly.
-The original draft's inventory of read sites (counted 2026-09-07):
+The original draft's inventory of read sites (counts as of that draft):
 
 | File | workflow references | remote_command references |
 |---|---|---|
@@ -289,6 +297,8 @@ the actual implementation must check every field and its mutability against the 
 1. Add the empty dedicated tables and column indexes; online indexes are created CONCURRENTLY by the index-build Job.
 2. `GPU_FAULT_WORKFLOW_STATE_MODE` / `GPU_FAULT_REMOTE_COMMAND_STATE_MODE`:
    from legacy (read and write objects) to dual (dual write, read the dedicated table, fall back when missing) and then to dedicated.
+   (The draft's idea; the implementation has no such environment variables: the mode lives only in the database table
+   `gpu_fault_control_state_modes`; during dual the authoritative write stays on the old table and a trigger mirrors it, see "Migration Implementation" above.)
 3. Provide backfill/status CLIs that UPSERT in batches; switching to dedicated is allowed only once missing or inconsistent rows reach zero,
    and start-up validation uses EXISTS rather than every process repeatedly counting the whole table.
 4. After dedicated has been stable for one release cycle, clean up the old rows and old partial indexes under supervision.

@@ -1,12 +1,14 @@
 # Workflow And Remote Command State Tables
 
-本文保全 2026-09-07 Store F2 拆表设计，并记录后续实现约束。原稿来自
-`store-review-fixes` 工作树中被忽略的 `docs/review/fragments/`；原文件保留不动。
-本文件位于正常文档树，不再依赖该工作树的生命周期。
+本文保全 Store 审阅项 F2 的拆表原始设计（见“Original F2 Design”），并记录当前实现及其约束。
+原稿原本只存在于一份审阅草稿中；本文件位于正常文档树，是该设计唯一保留的版本。
 
 本次实现从 schema v14 追加 v15（remote_command）与 v16（workflow），保留原有唤醒语义。
 后续 v17 修复 dual 期间原始 JSON 与专表投影之间的条件删除兼容性。
 v18 修复 legacy 到 dual 的非权威副本清理锁序，保留读写协议与两阶段迁移边界。
+之后的 v19–v23（热表存储参数与 HOT 索引、processor 计数账本、processor/spool 边沿唤醒、
+processor 队列 detached 布局）不改两类状态表的表结构、模式协议与唤醒语义；当前最新为 v23
+（`schema_migrations.POSTGRES_SCHEMA_MIGRATIONS`）。
 以下原稿的 v12、索引数量和源码行号属于历史设计背景，不是当前实现事实。
 新增 DDL 必须追加连续 migration，不改写历史 migration 的 checksum。
 
@@ -26,6 +28,11 @@ control-record view does not contain that state. Use a reviewed native PostgreSQ
 backup/restore for such databases; do not purge data or change production modes
 to bypass the refusal. Imported legacy hot-state records are backfilled into
 their dedicated tables in the same destination transaction before success.
+The state-table operations below never construct a `PostgresStore`: they run in
+`state_table_migrate.state_table_maintenance`, an autocommit session that holds the
+shared schema barrier. The index build, schema preflight and hot-layout switch
+likewise use a plain connection, because opening a Store would validate (and refuse)
+the very schema they inspect or change.
 
 第一阶段新增 v15：`gpu_fault_remote_commands`、数据库迁移模式记录、读视图、
 双写与旧 writer 屏障。默认模式为 `legacy`。普通 deploy 只由独立 schema Job
@@ -163,8 +170,9 @@ Processor认领窗口满但被观测/租约阻塞时，后续调用以索引tupl
 继续查找时也检查更早的已就绪STRICT前驱，防止越过同lane的重试。
 窗口和claim限额不增加，不在一次调用里无界重扫；每Store最多保存64个过滤作用域的
 可丢弃进度提示，提交后才更新，租约与fencing仍由数据库裁决。
-scope交集谓词与已有GIN表达式对齐，避免逐scope的路径扫描；是否选择GIN仍取决于
-维护状态、pending list及优化器成本，不能把本机EXPLAIN当作Aurora固定计划或时延承诺。
+scope交集谓词与 schema v23 在 `scope_keys` 列上的部分GIN对齐（谓词
+`cardinality(scope_keys) > 0`，`fastupdate = off`，不经pending list），避免逐scope的路径扫描；
+是否选择GIN仍取决于维护状态及优化器成本，不能把本机EXPLAIN当作Aurora固定计划或时延承诺。
 归档候选在 LIMIT 之前排除开放的 remote command 与外部后继，避免稳定的旧记录
 阻塞用完每轮配额；上传后的 SERIALIZABLE 复验仍保留。归档 withheld 计数表示实际
 尝试后遭拒绝的次数，不包含在候选 SQL 中已被排除的记录。
@@ -201,7 +209,7 @@ payload 只留不变部分。这是一次带数据回填的 schema 迁移，按�
 legacy/dual/dedicated 三态，hot-state 的 `--backfill-hot-state`）需要：新表 DDL、
 双写、回填 CLI、状态 CLI、启动校验、三种后端的读写路径改写、EXPLAIN 回归测试、
 以及所有直接读 `kind='workflow'` / `kind='remote_command'` 的脚本改写。
-原稿的读点清单（2026-09-07 统计）：
+原稿的读点清单（原稿统计时的计数）：
 
 | 文件 | workflow 引用 | remote_command 引用 |
 |---|---|---|
@@ -287,6 +295,8 @@ snapshot 用来保留 step、workflow、incident、restart authorization 等大�
 1. 新增空专表和列索引；在线索引由 index-build Job CONCURRENTLY 创建。
 2. `GPU_FAULT_WORKFLOW_STATE_MODE` / `GPU_FAULT_REMOTE_COMMAND_STATE_MODE`：
    legacy（读写 objects）到 dual（双写，读专表，缺失回退）再到 dedicated。
+   （原稿设想；实现没有这两个环境变量，模式只记录在数据库 `gpu_fault_control_state_modes`；
+   dual 的权威写入在旧表、由触发器镜像到专表，见上文“Migration Implementation”。）
 3. 提供 backfill/status CLI，分批 UPSERT；缺失或不一致归零才允许切 dedicated，
    启动校验使用 EXISTS，而不是每个进程重复 count 全表。
 4. dedicated 稳定一个发布周期后，受检清理旧行和旧 partial indexes。
