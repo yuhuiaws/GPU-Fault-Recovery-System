@@ -9747,9 +9747,10 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
       critical single replicas on the target node; choose an idle node that will not stop a
       controller or an executor arbiter replica. Start the host sampler detached from the Pod
       cgroup before injecting.
-  2. Inject an XID that maps to `RESET_GPU` on the isolated node (using the vendor-approved
-     method from `docs/en/fault-simulation-test-manual.md`, §7.8 "Driving a real XID",
-     or replay in kmsg format to verify the software chain).
+  2. Inject an XID that maps to `RESET_GPU` on the isolated node by kmsg-format replay, which
+     verifies the software chain (the repository has no method that makes the GPU or driver
+     produce a real XID; see `docs/en/fault-simulation-test-manual.md`, §7.8 "Real Hardware
+     Fault Injection Is Not Implemented").
   3. Observe the workflow step sequence:
      `FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUIESCE_GPU_SERVICES
      → VERIFY_NO_GPU_CLIENTS → RESET_GPU → RESTORE_GPU_SERVICES

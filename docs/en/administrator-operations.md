@@ -1022,8 +1022,9 @@ finalize re-seeds the shards under the advisory lock and the queue table lock, a
 repeated retries. After the switch every process reads the new mode within at most 0.25 seconds and the metric flips accordingly; if some replica does not flip for a long time, check its
 `gpu_fault_periodic_job_errors_total` first; do not restart it to "refresh".
 
-The rollback direction is `--restore-legacy-processor-counters`, likewise requiring an empty queue, and it must precede rolling back to an old wheel that does not
-understand priority shards.
+The rollback direction is `--restore-legacy-processor-counters`. The command itself does not check that the queue is empty: it re-seeds the legacy
+counter from the `PENDING/LEASED` rows present under the same lock. The procedure still runs it while the queue is 0, and it must precede rolling back
+to an old wheel that does not understand priority shards.
 
 ### 4.6 Aurora Parameter Group and Log Export: deploy Aligns Automatically, Only the Restart Window Remains Manual
 
