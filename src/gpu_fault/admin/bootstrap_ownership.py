@@ -2,12 +2,17 @@
 
 A site manages the nodes of the node groups that carry
 ``cluster_scope.OWNERSHIP_LABEL`` with the site id as the value -- an EKS
-managed node group's ``labels``, a HyperPod instance group's
-``KubernetesConfig.Labels`` (``CurrentLabels`` once applied), a Karpenter
-NodePool's template labels. The label sits on the group so that every
-replacement node the group creates is born owned, and the administrator
-declares ownership once, up front, with the id ``gpu-fault-admin site-id``
-prints; ``deploy`` and ``join-cluster`` then need nothing but ARNs.
+managed node group's ``labels`` or a HyperPod instance group's
+``KubernetesConfig.Labels`` (``CurrentLabels`` once applied); those are the
+only groups discovery reads. A Karpenter NodePool whose template labels carry
+the id hands the label to its nodes, so the recorded selector selects them,
+but no NodePool is read here: a plain EKS cluster joins only with at least one
+labelled managed node group (NodePools are read by the automatic node updates
+advisory and the ownership-label release only). The label sits on the group
+so that every replacement node the group creates is born owned, and the
+administrator declares ownership once, up front, with the id
+``gpu-fault-admin site-id`` prints; ``deploy`` and ``join-cluster`` then need
+nothing but ARNs.
 
 Both providers resolve through the same function and fail closed the same
 way: a group labelled for another site, a labelled group whose instance type
