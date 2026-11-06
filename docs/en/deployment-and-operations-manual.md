@@ -3233,8 +3233,9 @@ priority 100 × 128 writer shards
 
 Different priorities no longer update the same counter row, so routine/evidence transactions cannot hold
 the row lock needed by priority 0. The 40 PostgreSQL/Store I/O slots of ingress are split, with spool disabled, into
-general 28, evidence 4, fault 8; with spool enabled the spool admission slots must additionally be carved out of general,
-and the role verifier checks that the total does not exceed the pool max.
+general 28, evidence 4, fault 8; with spool enabled (admin-config `spec.capacity.telemetrySpool.enabled`) the renderer moves the
+pool to min 16/max 48, gives general up to 24 and adds spool admission 8, and the role verifier checks that the total does not exceed
+the pool max.
 
 ##### CPU-4U. Counter Shards Upgrade for an Already Deployed Environment
 
@@ -5954,7 +5955,7 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
   -o yaml > "${RELEASE_AUDIT_DIR}/gpu-deployments.yaml"
 
 kubectl --context "${GPU_EKS_CONTEXT}" get nodes \
-  -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}" \
+  -l "${GPU_NODE_SELECTOR:-sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}}" \
   -o custom-columns='NAME:.metadata.name,UID:.metadata.uid,STATE:.metadata.annotations.gpu-fault\.io/installer-state,ARTIFACT:.metadata.annotations.gpu-fault\.io/installer-artifact-sha256,CONFIG:.metadata.annotations.gpu-fault\.io/installer-config-digest' \
   > "${RELEASE_AUDIT_DIR}/node-release.txt"
 ```
@@ -6003,8 +6004,8 @@ one mutating engine process at a time, dry-run neither reads nor writes, and the
 The formal entry point is one command, replacing the former 8 steps / about 14 manual commands (`kubectl exec` to read the generation,
 `openssl rand`, `jq` rewriting the registry Secret, rolling the CPU roles, patching the GPU Secret,
 `rollout restart`, the REG-10 DaemonSet rewriting node env, two log greps, file cleanup).
-The 2026-09-04 release incident happened precisely because the manual procedure did not include the deployment host's own
-`secure/<cluster-id>.token`, leaving an expired file behind.
+The manual procedure easily misses the deployment host's own `secure/<cluster-id>.token`, leaving an expired file behind that the
+next release publishes again.
 
 ```bash
 gpu-fault-admin rotate-token \
@@ -6122,10 +6123,12 @@ migration, no longer for token rotation.
 
 `deploy/migrations/gpu-node-collector-endpoint-migration.yaml` is a one-shot
 DaemonSet for switching existing GPU nodes that already have the collector/Node Agent installed to the regional control
-plane in bulk, or for rewriting node credentials in bulk after a token rotation. It does four things: installs the CA at
-`/etc/gpu-fault/control-plane-ca.crt`, reinstalls the host wheel, rewrites `collector.env` and `node-agent.env` with `upsert_env`,
-disables `gpu-fault-log-collector` and restarts the other five
-services.
+plane or a new CA in bulk (cluster token rotation is done by `rotate-token` of REG-9, which reinstalls the Agents in fleet waves, not
+by this DaemonSet). It does four things: installs the CA at `/etc/gpu-fault/control-plane-ca.crt`, installs the wheel with
+`--no-deps --force-reinstall` into the host's `/opt/gpu-fault/venv` (in the current install layout a compatibility link to the
+runtime slot's venv), rewrites `collector.env` and `node-agent.env` with `upsert_env`, disables `gpu-fault-log-collector` and restarts
+the other five services. The manifest's `nodeSelector` is fixed to the HyperPod label `sagemaker.amazonaws.com/cluster-name`; on an
+eks-managed cluster change that key to the node selector the site records.
 
 It runs `chroot /host` directly with `privileged: true`, should only run inside a maintenance window, and must first be validated on a single node
 (limit the scope with a `nodeSelector` plus a temporary label). Brand-new nodes do not need it -- they go through
@@ -6264,30 +6267,32 @@ keeps `GPU_FAULT_TELEMETRY_SPOOL=false` by default with that Deployment at 0 rep
 the 32-cluster stress test still does not simultaneously satisfy full acceptance and a 60-second drain. For explicit experiments scale to 3 replicas; each
 Pod is fixed at a single uvicorn process (port **8082**; when switching spool from enabled to disabled the role rollout script
 reads that value from the Pod's `http` container port to probe the drain, and a Pod not yet answering just keeps polling), 8 replay
-threads; when all three backlog classes exist they are scheduled inventory/GPU metrics/Host telemetry
+threads (`GPU_FAULT_TELEMETRY_SPOOL_WORKERS`); when all three backlog classes exist they are scheduled inventory/GPU metrics/Host telemetry
 `1:2:1`, and when one class is empty the others may borrow its slots. It does not start the processor main queue,
 the workflow dispatcher or the managed observer.
 
 The spool-worker calls the in-process telemetry batch core functions directly; it no longer opens a loopback TCP connection per batch
-or re-enters the ASGI Store I/O queue. When a priority 0 backlog
-exists, each Pod automatically drops to 1 replay worker. On the ingress side, 64 consecutive submissions in order are assigned
-to the same spool admission stripe, then rotated across the 8 stripes; each stripe is serial internally,
-but one batch can span several clusters. The ingress per-process PostgreSQL pool has max 40 and min 2,
-with connections growing on demand. Store I/O threads are configured independently as general 28, evidence 4, fault 8, spool admission 8,
-sharing the same connection pool; enabling spool does not subtract 8 from the general thread count, nor does it mean every thread holds a connection.
+or re-enters the ASGI Store I/O queue. When a fault-tier (priority 0/10) backlog
+exists, each Pod automatically drops to `GPU_FAULT_TELEMETRY_SPOOL_FAULT_PRESSURE_WORKERS` (default 1) replay workers. On the ingress
+side, 64 consecutive submissions in order are assigned to the same spool admission stripe, then rotated across the 8 stripes; each
+stripe is serial internally, but one batch can span several clusters. With spool disabled the ingress per-process PostgreSQL pool has
+max 40 and min 2, with connections growing on demand, and Store I/O threads general 28, evidence 4, fault 8 (spool admission 8 exists
+but is not in use); with spool enabled the renderer switches to pool min 16, max 48 and general 24, plus spool admission 8. The role
+verifier requires the pool max to be at least general + fault + evidence (plus spool admission when spool is on); none of this means
+every thread holds a connection.
 Check the connection budget, the runtime demand ratio and checkout waits separately; do not treat the thread cap as a connection partition.
 `threshold:*`, `sustained:*`, candidate, counter, EFA changes and any
 `collection_errors` still enter the priority 50 main queue, and XID/SXID remain priority 0.
 
-The release order when experimenting again must be:
+To experiment again, set `spec.capacity.telemetrySpool.enabled: true` and `replicas` (1-32 when enabled, for example 3) in the
+admin-config and apply it with `gpu-fault-admin config`. For the enable transition the apply script rolls ingress first as usual (its
+surge slot) and then the consumers one at a time: the spool is a durable table, so what ingress writes before the consumers are up waits
+there and is not lost; after the roll confirm `gpu_fault_telemetry_spool_consumer_running=1`, and verify that depth/bytes can fall back
+and `dropped/rejected/errors` do not grow before widening the stress test.
 
-1. First apply and wait for all `gpu-fault-telemetry-spool-worker` Pods to be Ready, confirming
-   `gpu_fault_telemetry_spool_consumer_running=1`.
-2. Then roll ingress so that `GPU_FAULT_TELEMETRY_SPOOL=true` starts writing to the spool.
-3. Verify that depth/bytes can fall back and `dropped/rejected/errors` do not grow before widening the stress test.
-Rollback is in the reverse order: first disable ingress admission, wait until
-`gpu_fault_telemetry_spool_depth` and `leased_bytes` are both 0, then scale down or delete the
-spool-worker. Do not stop the consumer first, or ingress keeps accepting with nobody consuming.
+The apply script fixes the disable transition in the reverse order: it rolls ingress first to close admission, then control-worker,
+waits until every queued and leased spool row has drained (`gpu_fault_telemetry_spool_depth` and `leased_bytes` at 0), and only then
+scales the spool-worker to 0. Do not stop the consumer first, or ingress keeps accepting with nobody consuming.
 
 The component digests are also the criterion of `make artifact-check`: it deletes `dist/`, rebuilds,
 then asserts that the three wheels each equal their own source dependency closure and that the wheel inside the bundle equals the Node
@@ -6450,6 +6455,7 @@ sed \
   -e "s/REPLACE_WITH_EXECUTOR_ARTIFACT_SHA256/${NEW_WHEEL_SHA}/" \
   -e "s/REPLACE_WITH_EXECUTOR_COMPATIBILITY_DIGEST/${NEW_COMPATIBILITY_DIGEST}/" \
   -e "s#public.ecr.aws/docker/library/python:3.12-slim#${GPU_FAULT_RUNTIME_IMAGE}#g" \
+  -e "s/REPLACE_WITH_AWS_REGION/${AWS_REGION}/g" \
   -e "s#REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN#${EXECUTOR_IRSA_ROLE_ARN}#" \
   deploy/dataplane/cluster-action-executor.yaml \
   > /tmp/gpu-fault-cluster-action-executor.yaml
@@ -6620,6 +6626,12 @@ gpu-fault-admin uninstall \
   --aurora-final-snapshot retain \
   --confirm DELETE_CPU_CONTROL_PLANE
 ```
+
+Use `--aurora-final-snapshot skip` only when regulation requires immediate physical destruction. The last step of the command releases
+the ownership label `gpu-fault.io/control-plane=<site-id>` from every GPU cluster's node groups (`--keep-ownership-label` keeps it and
+records it as retained); when the last installation registry sync failed, is not recorded or is unreadable, the command refuses to
+start unless `--accept-unsynchronized-registry` is given (only what the registry records is deleted, recorded in the uninstall
+journal). After an interruption rerun the same command to resume.
 
 The steps below are only for old deployments, item-by-item regulatory audit, or break-glass when the unified CLI cannot run. They must
 meet the same standards of registry export, GPU preservation and residue verification as the unified command.
