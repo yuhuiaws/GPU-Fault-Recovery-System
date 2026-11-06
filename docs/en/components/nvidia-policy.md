@@ -409,8 +409,14 @@ the artifact `src/gpu_fault/data/nvidia-fabric-manager-sxid-2025-11-14.yaml` pin
 - fatal access link: the access scope must come from a trusted NVSwitch port topology (`TRUSTED_NVSWITCH_TOPOLOGY`) or the
   HGX H100/H200 product invariant (`NVIDIA_PRODUCT_INVARIANT`), otherwise `BLOCKED_MISSING_EVIDENCE` + QUARANTINE; with a
   non-empty participating GPU set the node is cordoned, the job stopped and that group reset (`RESET_PARTICIPATING_GPUS`),
-  with an empty one it blocks. The set is the port's GPU from the trusted topology; without one, every GPU of the node's
-  active jobs (plus the GPUs in the NVSwitch's PCI slot) -- the two are never merged.
+  with an empty one it blocks. The set is the union of the port's GPU from the trusted topology, the GPUs in the
+  NVSwitch's PCI slot and every GPU of the node's active managed jobs -- the jobs the same workflow stops; without a named
+  GPU the affected job cannot be told from the others. Evidence: Fabric Manager User Guide, "Runtime NVSwitch and GPU
+  Errors" > "NVSwitch SXid Errors" > "Fatal SXid Errors" (page "Last updated on Oct 07, 2026"),
+  `https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html#fatal-sxid-errors`: "When a fatal SXid
+  error is reported on a NVSwitch port that connects a GPU and an NVSwitch, the corresponding error will be propagated to
+  the GPU. The CUDA jobs that are running on that GPU will be aborted" and "Reset the specified GPU and all the
+  participating GPUs in the affected workload" (pinned by `tests/app_services/test_access_link_sxid_scope.py`).
 - fatal trunk and 10003/19084: require fabric_partition and the complete node GPU inventory; when both are present
   `RESET_ALL_GPUS_AND_NVSWITCHES` is executed (Node Agent `fabricReset` capability, multi-node barrier);
   if either is missing the result is `BLOCKED_MISSING_EVIDENCE`, and it never degrades to a single-GPU reset.

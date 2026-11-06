@@ -375,8 +375,13 @@ SXID 恢复依据 Fabric Manager User Guide（`https://docs.nvidia.com/datacente
 - non-fatal：catalog 中 IGNORE 的码与表外的 non-fatal 码为信息性，保持监控；non-fatal 的 19084、11004/12028 与 20012 按下面各自的规则。
 - fatal access link：access 范围须来自可信 NVSwitch 端口拓扑（`TRUSTED_NVSWITCH_TOPOLOGY`）或 HGX H100/H200 的产品不变量
   （`NVIDIA_PRODUCT_INVARIANT`），否则 `BLOCKED_MISSING_EVIDENCE` + QUARANTINE；参与 GPU 集合非空时 cordon、停止任务并 reset
-  该组 GPU（`RESET_PARTICIPATING_GPUS`），为空时阻塞。集合取可信拓扑给出的端口 GPU；没有拓扑给出时取节点上活动任务的
-  全部 GPU（另加与 NVSwitch PCI 地址同槽的 GPU）——两者不合并。
+  该组 GPU（`RESET_PARTICIPATING_GPUS`），为空时阻塞。集合是可信拓扑给出的端口 GPU、与 NVSwitch PCI 地址同槽的 GPU
+  与节点上活动受管任务的全部 GPU 三者之并——这些任务由同一 workflow 停止；没有点名的 GPU 时无法从中分出受影响的任务。
+  依据：Fabric Manager User Guide，"Runtime NVSwitch and GPU Errors" > "NVSwitch SXid Errors" > "Fatal SXid Errors"
+  （页面 "Last updated on Oct 07, 2026"），`https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html#fatal-sxid-errors`：
+  "When a fatal SXid error is reported on a NVSwitch port that connects a GPU and an NVSwitch, the corresponding error
+  will be propagated to the GPU. The CUDA jobs that are running on that GPU will be aborted" 与 "Reset the specified GPU
+  and all the participating GPUs in the affected workload"（由 `tests/app_services/test_access_link_sxid_scope.py` 钉住）。
 - fatal trunk 与 10003/19084：要求 fabric_partition 和完整节点 GPU inventory，齐备时
   执行 `RESET_ALL_GPUS_AND_NVSWITCHES`（Node Agent `fabricReset` 能力，多节点 barrier），
   缺一即 `BLOCKED_MISSING_EVIDENCE`，不会退化成单 GPU reset。完整指恰为节点声明的预期

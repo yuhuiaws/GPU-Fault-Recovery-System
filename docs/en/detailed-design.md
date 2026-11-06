@@ -455,7 +455,8 @@ is still handled along the compatibility path, but production collectors must re
 
 The SXID Catalog action mapping is as follows:
 
-- Ordinary `FATAL`: a trusted `ACCESS` executes a reset of the participating GPU, a trusted `TRUNK` executes a full
+- Ordinary `FATAL`: a trusted `ACCESS` executes a reset of the participating GPUs (the port's GPU and every GPU of the
+  node's active managed jobs), a trusted `TRUNK` executes a full
   GPU/NVSwitch reset of this node; when the scope is untrusted, isolate.
 - `10003/19084`: independent of the log scope, requires a complete inventory/partition and then executes a full
   GPU/NVSwitch reset of this node.

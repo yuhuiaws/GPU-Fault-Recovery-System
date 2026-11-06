@@ -57,6 +57,22 @@ LOGGER = logging.getLogger(__name__)
 JOINED_RECOVERED_INCIDENT_ACTOR = "xid-ingest:joined-recovered-incident"
 #: Who retires the marker of an incident ingest recorded RECOVERED (b238).
 RECORDED_INCIDENT_ACTOR = "fault-ingest:recorded-incident"
+#: NVIDIA Fabric Manager User Guide, "Runtime NVSwitch and GPU Errors" >
+#: "NVSwitch SXid Errors" > "Fatal SXid Errors" (page "Last updated on Oct 07,
+#: 2026"), verbatim: the scope of a fatal SXID on an access link, the NVSwitch
+#: port of one GPU (``_enrich_sxid_scope``).
+NVIDIA_FM_FATAL_SXID_REFERENCE = (
+    "https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/"
+    "index.html#fatal-sxid-errors"
+)
+NVIDIA_FM_FATAL_ACCESS_SXID_QUOTE = (
+    "When a fatal SXid error is reported on a NVSwitch port that connects a GPU "
+    "and an NVSwitch, the corresponding error will be propagated to the GPU. "
+    "The CUDA jobs that are running on that GPU will be aborted"
+)
+NVIDIA_FM_FATAL_ACCESS_SXID_RECOVERY_QUOTE = (
+    "Reset the specified GPU and all the participating GPUs in the affected workload"
+)
 
 #: Every kind ``unresolved_reason_kind`` can return. A provider signal that
 #: carries no unresolved reason clears the episode of each one, so a kind that
@@ -490,13 +506,18 @@ class FaultIngestionService:
         if (
             event.classification.value == "FATAL"
             and event.link_scope.value == "ACCESS"
-            and not event.participating_gpu_uuids
             and not (
                 catalog_rule is not None
                 and catalog_rule.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES"
             )
         ):
-            participants = set(context.gpu_uuids)
+            # NVIDIA_FM_FATAL_ACCESS_SXID_RECOVERY_QUOTE: the specified GPU --
+            # the one the trusted port topology names, the one in the
+            # NVSwitch's PCI slot -- and every GPU of the node's active managed
+            # jobs, which the same workflow stops (without a named GPU the
+            # affected job cannot be told from the others). Merged: the port's
+            # GPU alone left the job's other GPUs unreset and uncontained.
+            participants = set(event.participating_gpu_uuids) | set(context.gpu_uuids)
             if event.pci_bdf and inventory_snapshot is not None:
                 event_slot = self._pci_slot(event.pci_bdf)
                 for device in inventory_snapshot.devices:
