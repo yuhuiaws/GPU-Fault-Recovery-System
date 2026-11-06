@@ -81,8 +81,8 @@ from a live base of the other family, the plan reads `regional-hyperpod-<digest1
 A GPU cluster whose provider the site profile cannot reboot (a plain EKS cluster on a HyperPod site, or
 the reverse) is pinned to its own profile version, recorded on `spec.clusters[].runtimeProfile`
 (`version`, `source`, `templateSource`, `agentConfigDigest`). Its first version is the provider's declared
-one (`eks-v1` / `hyperpod-v1`) and is reviewed by `join-cluster` (`change_kind: CLUSTER_PROFILE_NEW`,
-`registration_cluster_id: <cluster>`). The snapshot `profiles/<version>.yaml` is immutable: a version never
+one (`eks-v1` / `hyperpod-v1`; `regional-<provider>-<digest12>` when that declared snapshot already exists with another
+policy) and is reviewed by `join-cluster` (`change_kind: CLUSTER_PROFILE_NEW`, `registration_cluster_id: <cluster>`). The snapshot `profiles/<version>.yaml` is immutable: a version never
 names two policies.
 
 The `changes` line of a first version names the cluster's `nodeReboot` owner and what the snapshot's `nodeReplace`
@@ -105,11 +105,11 @@ and stops before the release bundle and its gates:
 Runtime Profile policy changed; the deploy stopped for review.
 Review /secure/gpu-fault/release-deploy/profile-plan.json:
   ...
-  cluster: gpu-eks-cluster
+  cluster: eks-gpu-a
   version: eks-v1 -> regional-eks-8e51b0c2a7f3 (this cluster only)
   change_kind: CLUSTER_PROFILE_NEW
   changes:
-    - cluster gpu-eks-cluster (eks-managed) moves from its own Runtime Profile eks-v1 to regional-eks-8e51b0c2a7f3: ...
+    - cluster eks-gpu-a (eks-managed) moves from its own Runtime Profile eks-v1 to regional-eks-8e51b0c2a7f3: ...
   plan_sha256: <plan_sha256>
 Record plan_sha256 on the change request; once it is approved, rerun:
   gpu-fault-admin deploy --state-dir /secure/gpu-fault --approve-profile-plan <plan_sha256> --reference CHG-<id>
@@ -214,6 +214,9 @@ The stop message has already printed the fields the administrator must review; f
 | `policy_digest` | The canonical target policy digest |
 | `source_sha256` | Digest of the developer template's original content |
 | `snapshot_sha256` | Digest of the immutable Profile snapshot about to be released |
+| `current_policy_digest` | The canonical policy digest of the live baseline; empty when the baseline cannot be proven |
+| `active_source_sha256` | Digest of the site's current `source` file; with `live_profile_sha256` it proves the baseline |
+| `approval_required` | Only a plan with `true` can be approved |
 | `plan_sha256` | The binding value of the whole reviewed plan; must be written into the change ticket and passed unchanged to `--approve-profile-plan` |
 
 Meaning of `change_kind`:
@@ -228,6 +231,12 @@ Meaning of `change_kind`:
 
 `UNCHANGED` does not generate a Profile change awaiting approval.
 
+`plan_sha256` covers every field of the table above but itself, plus `schema_version`; the file's `template_source`,
+`active_source` and `snapshot_file` are paths only and are not part of the digest. In a `CLUSTER_PROFILE_NEW` plan of a
+cluster's own version, `registration_cluster_id` is the smallest cluster id among the plan's clusters, `current_version`
+lists the versions those clusters move from, and `live_profile_sha256` and `active_source_sha256` are empty; the stop
+message of such a plan adds the `cluster:` / `clusters:` line and prints no `live_profile_sha256` line.
+
 A deployment that changes only the template, with code and site unchanged, generates a plan just the same: before judging `UNCHANGED`, the staging layer first compares
 the template with the online Profile using `plan_runtime_profile`, and when a change awaiting approval exists it goes straight down the complete
 application release path.
@@ -240,9 +249,13 @@ application release path.
 - When the passed value does not match the pending plan's digest the command refuses to run and gives the current pending digest in the error;
   no active approval is written.
 - Once the same plan is approved it cannot be overwritten with a different `--reference`, so confirm the change ticket number is correct before running.
+- `--approve-profile-plan` requires `--reference` (3 to 128 letters, digits or `. _ : / -`, the first a letter or digit)
+  and a 64-hex digest; a plan whose `approval_required` is not `true` is refused as well.
 
-The approval completes inside the same file lock, recording the approver identity (STS caller ARN), change ticket number, approval time and site
-identity, and then the same process continues the release. The releaser recomputes the site identity, Profile target and live baseline,
+The approval completes inside the same file lock, recording the approver identity (STS caller ARN, `user@host` when it
+cannot be read), change ticket number, approval time and site identity, prints `gpu-fault-admin: Runtime Profile plan
+<plan_sha256> approved at <time> by <approver> (reference <ref>); continuing the deploy`, and then the same process
+continues the release. The releaser recomputes the site identity, Profile target and live baseline,
 and only when all match does it generate the immutable snapshot, update the internal site and perform deploy, verify, stability and commit.
 
 If the template, target policy or live baseline changes again between approval and release, the old approval is archived as
@@ -264,7 +277,11 @@ After a successful release it automatically adds:
 consumed.json
 ```
 
-On plan drift it automatically adds:
+`consumed.json` records the `release_id` (`join-<cluster-id>` when a cluster's join consumed it), the approver, the
+reference and the `relation`: `EXACT` (released as reviewed), `PREPARED_RESUME` (an interrupted prepared release
+resumed) or `ALREADY_APPLIED` (the release had completed and only the archival was left).
+
+On plan drift it automatically adds (recording `replacement_plan_sha256` and the reason):
 
 ```text
 superseded.json
@@ -303,6 +320,7 @@ Success criteria:
 | Message that an approval or release is in progress | Wait for the current process to finish; do not delete the lock file |
 | GPU cluster join or deregistration | Use the formal join/remove commands; the GPU set does not change the stable Profile approval identity |
 | Under an earlier release a new cluster's join was resumed with `deploy --approve-profile-plan`: the approval was archived as `SUPERSEDED`, the join stopped again with the same digest and approving it again was refused (`archived Profile approval differs from the active approval`) | Approve the same `plan_sha256` again with the current release (the printed `join-cluster ... --approve-profile-plan`) and continue; the earlier round stays under `profile-approvals/<plan_sha256>.1/` (1.2). Do not edit, move or delete the archive by hand |
+| deploy refused with `registration cluster <id> is not among the managed GPU clusters` | The registration anchor's cluster left the site and the anchor was not moved (an earlier release removed the anchor cluster so): run the printed `gpu-fault-admin deploy --state-dir <state-dir> --registration-cluster <remaining cluster of the same provider> --reference <CHG>` to move the anchor and continue (the move is journaled in `registration-anchor/journal.json`); with no cluster of that provider left, `join-cluster` one first, which takes the anchor over |
 | `approved Runtime Profile snapshot ... has a different policy than ...` on a cluster-owned version | The template policy changed under a pinned version; rerun `deploy` -- it plans the successor `regional-<provider>-<digest12>` (section 1.1) and prints the resume command. Do not remove the pinned snapshot |
 
 ## 8. Forbidden Operations

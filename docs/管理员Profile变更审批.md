@@ -64,8 +64,8 @@ gpu-fault-admin deploy \
 该命令先在同一state-dir上完成审批，再继续原部署直到verify、stability和commit结束。
 没有第三步。
 
-站点 Profile 的版本名跟随注册集群 provider 的家族：策略等于该家族示例模板、且已有的声明快照
-（`profiles/eks-v1.yaml` / `profiles/hyperpod-v1.yaml`）携带同一策略时，回到声明版本 `eks-v1` / `hyperpod-v1`
+站点 Profile 的版本名跟随注册集群 provider 的家族：策略等于该家族示例模板、且声明快照
+（`profiles/eks-v1.yaml` / `profiles/hyperpod-v1.yaml`）不存在或携带同一策略时，回到声明版本 `eks-v1` / `hyperpod-v1`
 并原样复用快照（活基线属于另一家族时，计划显示为 `regional-hyperpod-<digest12> -> eks-v1`）；否则为
 `regional-<provider>-<digest12>`。模板的 `nodeReboot` owner 属于另一 provider 的 adapter 时，`deploy` 直接拒绝而不出计划。
 
@@ -73,8 +73,8 @@ gpu-fault-admin deploy \
 
 站点 Profile 无法重启其 provider 的 GPU 集群（HyperPod 站点上的纯 EKS 集群，或反之）pin 在自己的 Profile 版本上，
 记录在 `spec.clusters[].runtimeProfile`（`version`、`source`、`templateSource`、`agentConfigDigest`）。首个版本是
-provider 声明的版本（`eks-v1` / `hyperpod-v1`），由 `join-cluster` 审核（`change_kind: CLUSTER_PROFILE_NEW`，
-`registration_cluster_id: <cluster>`）。快照 `profiles/<version>.yaml` 不可变：一个版本永不对应两种策略。
+provider 声明的版本（`eks-v1` / `hyperpod-v1`；该声明快照已存在且策略不同时为 `regional-<provider>-<digest12>`），由
+`join-cluster` 审核（`change_kind: CLUSTER_PROFILE_NEW`，`registration_cluster_id: <cluster>`）。快照 `profiles/<version>.yaml` 不可变：一个版本永不对应两种策略。
 
 首个版本的 `changes` 行写明该集群的 `nodeReboot` owner，以及快照里 `nodeReplace` 实际做什么（从模板读出，不是固定文字）。
 两个示例 Profile 都把 `nodeReplace` OWN 为 warm-spare 交接（`warm-spare-v1`），该行写
@@ -93,11 +93,11 @@ pin 之后 provider 示例 Profile 的策略变化（`templateSource` 与已 pin
 Runtime Profile policy changed; the deploy stopped for review.
 Review /secure/gpu-fault/release-deploy/profile-plan.json:
   ...
-  cluster: gpu-eks-cluster
+  cluster: eks-gpu-a
   version: eks-v1 -> regional-eks-8e51b0c2a7f3 (this cluster only)
   change_kind: CLUSTER_PROFILE_NEW
   changes:
-    - cluster gpu-eks-cluster (eks-managed) moves from its own Runtime Profile eks-v1 to regional-eks-8e51b0c2a7f3: ...
+    - cluster eks-gpu-a (eks-managed) moves from its own Runtime Profile eks-v1 to regional-eks-8e51b0c2a7f3: ...
   plan_sha256: <plan_sha256>
 Record plan_sha256 on the change request; once it is approved, rerun:
   gpu-fault-admin deploy --state-dir /secure/gpu-fault --approve-profile-plan <plan_sha256> --reference CHG-<id>
@@ -187,6 +187,9 @@ release 把新版本注册在正在加入的集群名下。已存的 Profile 原
 | `policy_digest` | 规范化目标策略摘要 |
 | `source_sha256` | 开发者模板原始内容摘要 |
 | `snapshot_sha256` | 将要发布的不可变Profile快照摘要 |
+| `current_policy_digest` | 线上基线的规范化策略摘要；基线不可证明时为空 |
+| `active_source_sha256` | 当前站点`source`文件内容摘要；与`live_profile_sha256`一起证明基线 |
+| `approval_required` | 只有为`true`的计划才能审批 |
 | `plan_sha256` | 整份审核计划的绑定值，必须写入变更单并原样传给`--approve-profile-plan` |
 
 `change_kind`含义：
@@ -201,6 +204,11 @@ release 把新版本注册在正在加入的集群名下。已存的 Profile 原
 
 `UNCHANGED`不会生成待审批Profile变更。
 
+`plan_sha256`覆盖上表除它自己以外的全部字段与`schema_version`；文件里的`template_source`、`active_source`与`snapshot_file`
+只是路径，不进入摘要。集群自有版本的`CLUSTER_PROFILE_NEW`计划里，`registration_cluster_id`是计划所含集群中
+cluster id最小者，`current_version`列出这些集群迁出的版本，`live_profile_sha256`与`active_source_sha256`为空；
+这类计划的停止信息另打印`cluster:`/`clusters:`行，不打印`live_profile_sha256`行。
+
 只修改模板、代码与site不变的部署同样会生成计划：staging层在判定`UNCHANGED`前先用
 `plan_runtime_profile`把模板与线上Profile比对，存在待审批变更时直接走完整的
 application release路径。
@@ -213,9 +221,12 @@ application release路径。
 - 传入值与待审批计划摘要不一致时命令拒绝执行，并在错误里给出当前待审批的摘要；
   不写任何活动审批。
 - 同一计划已审批后不能用不同`--reference`覆盖，因此执行前必须确认变更单号正确。
+- `--approve-profile-plan`必须带`--reference`（3到128个字母、数字或`. _ : / -`，首字符为字母或数字），值必须是
+  64位十六进制摘要；计划的`approval_required`不是`true`时同样拒绝。
 
-审批在同一文件锁内完成，记录审批人身份（STS调用者ARN）、变更单号、审批时间和站点
-身份，随后同一进程继续发布。发布器重新计算站点身份、Profile目标和live baseline，
+审批在同一文件锁内完成，记录审批人身份（STS调用者ARN，取不到时为`user@host`）、变更单号、审批时间和站点
+身份，打印`gpu-fault-admin: Runtime Profile plan <plan_sha256> approved at <时间> by <审批人> (reference <ref>);
+continuing the deploy`，随后同一进程继续发布。发布器重新计算站点身份、Profile目标和live baseline，
 全部匹配后才生成不可变快照、更新内部site并执行deploy、verify、stability和commit。
 
 若审批和发布之间模板、目标策略或live baseline又发生变化，旧审批被归档为
@@ -237,7 +248,10 @@ application release路径。
 consumed.json
 ```
 
-计划漂移时自动增加：
+`consumed.json`记录`release_id`（集群加入消费时为`join-<cluster-id>`）、审批人、reference与`relation`：`EXACT`
+（按所审计划发布）、`PREPARED_RESUME`（已准备的发布中断后续跑）或`ALREADY_APPLIED`（发布已完成，只差归档）。
+
+计划漂移时自动增加（记录`replacement_plan_sha256`与原因）：
 
 ```text
 superseded.json
@@ -275,6 +289,7 @@ superseded.json
 | 提示审批或发布正在进行 | 等待当前进程结束；不删除lock文件 |
 | GPU集群加入或注销 | 使用正式join/remove命令；GPU集合不改变稳定Profile审批身份 |
 | 较早版本下新增集群的接入用 `deploy --approve-profile-plan` 续跑后审批归档为 `SUPERSEDED`，join 再次停下并打印同一摘要，再次审批被拒（`archived Profile approval differs from the active approval`） | 用当前版本再审批同一 `plan_sha256`（停止信息打印的 `join-cluster ... --approve-profile-plan`）并续跑；上一轮保留在 `profile-approvals/<plan_sha256>.1/`（1.2）。不要手工编辑、移动或删除归档 |
+| deploy 以 `registration cluster <id> is not among the managed GPU clusters` 拒绝 | 注册锚点集群已离开站点而锚点没有迁移（较早版本移除锚点集群时留下）：按错误提示执行 `gpu-fault-admin deploy --state-dir <state-dir> --registration-cluster <剩余同 provider 集群> --reference <CHG>` 迁移锚点并继续（迁移记入 `registration-anchor/journal.json`）；没有同 provider 集群时先 `join-cluster` 一个，它会接过锚点 |
 | 集群自有版本上出现 `approved Runtime Profile snapshot ... has a different policy than ...` | 模板策略在已 pin 版本下变化；重跑 `deploy`——它会规划后继版本 `regional-<provider>-<digest12>`（第 1.1 节）并打印续跑命令。不要删除已 pin 的快照 |
 
 ## 8. 禁止操作
