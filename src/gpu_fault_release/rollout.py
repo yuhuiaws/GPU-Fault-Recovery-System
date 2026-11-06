@@ -293,7 +293,6 @@ from gpu_fault_release.regional_runtime_profile import (
 )
 
 ROOT = repository_root()
-FAST_ROLLOUT_TIMEOUT = "5m"
 SLOW_COMMAND_SECONDS = 15.0
 SLOW_COMMAND_LABEL_LIMIT = 160
 SENSITIVE_CONFIG_MARKERS = (
@@ -1307,28 +1306,6 @@ class RegionalRelease(RegistryDrainContext):
 
     def rollback_cluster(self, cluster_id: str) -> None:
         purge_failed_join(self, self._target(cluster_id))
-
-    def _roll_cpu_for_registry(self) -> None:
-        for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
-            self.runner.run(
-                self._cpu(
-                    "-n",
-                    self.config.namespace,
-                    "rollout",
-                    "restart",
-                    f"deployment/{deployment}",
-                )
-            )
-            self.runner.run(
-                self._cpu(
-                    "-n",
-                    self.config.namespace,
-                    "rollout",
-                    "status",
-                    f"deployment/{deployment}",
-                    f"--timeout={FAST_ROLLOUT_TIMEOUT}",
-                )
-            )
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
