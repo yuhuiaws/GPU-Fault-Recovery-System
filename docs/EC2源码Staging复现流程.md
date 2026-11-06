@@ -17,19 +17,20 @@ release-build、release-deploy、bundle或venv路径。
 
 ## 1. 前提
 
-- 已有至少3个Ready节点的CPU EKS或HyperPod EKS集群。
-- 已有至少一个GPU HyperPod EKS集群，且`NodeRecovery=None`。
+- 已有至少3个Ready节点的HyperPod EKS CPU集群（没有HyperPod编排的普通EKS不能作为CPU控制面）。
+- 已有至少一个GPU集群：HyperPod EKS（`NodeRecovery=None`）或普通EKS（GPU托管节点组关闭node auto repair）；
+  GPU节点组/实例组已带归属标签`gpu-fault.io/control-plane=<站点ID>`（`gpu-fault-admin site-id`打印）。
 - GPU VPC已有NAT出口。
 - EC2执行身份具有staging bootstrap所需的AWS、EKS和Kubernetes权限。
-- EC2已安装Python 3.12、Git、Make、Docker/Buildx、AWS CLI、Cosign、kubectl、Helm、
-  curl、jq、OpenSSL和sha256sum。
+- EC2已安装Python 3.12、Git、Make、Docker（daemon可用）/Buildx、AWS CLI、Cosign、kubectl、Helm、
+  curl、jq、OpenSSL和sha256sum；统一部署在任何AWS mutation前按`src/gpu_fault/data/deploy-host-tools.json`核对这些工具。
 - 不需要预先安装签名deploy-host bundle：按§2的`make deploy-host-setup-online`建立源码开发venv，
   统一部署命令会在`STATE_DIR/deployer-venv`内自行构建、验签并绑定本站点的受信deploy-host（见§8）；
   签名离线bundle只用于生产部署机，见[CI 发布流程](CI发布流程.md)。
 - CPU/GPU集群ARN属于同一账号和Region。
 
-state目录必须位于Git仓库外。本流程不执行GPU reset、节点reboot、warm-spare切换或
-fault injection。
+state目录必须位于Git仓库外（位于仓库内时直接拒绝）。首次部署在`STATE_DIR/release-signing/`自动生成cosign
+密钥对与随机口令。本流程不执行GPU reset、节点reboot、warm-spare切换或fault injection。
 
 ## 2. 克隆和初始化
 
@@ -92,6 +93,9 @@ gpu-fault-admin deploy \
 ## 6. 内部状态机
 
 ```text
+任一次部署
+  -> 首分钟核对邮件通道（新站点在此创建SNS订阅并发送确认邮件；未确认即退出码2并打印续跑命令）
+
 state中不存在站点
   -> 扫描并固定当前源码身份
   -> 发现CPU/GPU集群
@@ -107,6 +111,8 @@ state中已有站点
   -> 首次多GPU接入未完成时，验证原目标未变且当前成员是其单调子集
   -> 原目标全部纳管或有完整已完成移除证明后，要求CPU不变且请求的GPU集合是纳管集合或其超集，多出的集群在发布后自动join
   -> 扫描并固定当前源码身份
+  -> Profile待审批、线上release事务未提交（failed/rolled-back/进行中），或有只有release才能修复的漂移
+     （可观测性、Aurora凭据刷新、DCGM hostengine声明）: 一律走application release
   -> 应用身份未变:
        -> deploy-host变化: 更新deploy-host并执行影响门禁和只读preflight
        -> 仅测试/文档变化: 只执行影响门禁
@@ -116,7 +122,7 @@ state中已有站点
   -> upgrade -> verify -> stability
 ```
 
-`deploy`可接受纳管集合的超集，发布后通过独立受检join事务接入新增集群（`join-cluster`是其别名）。
+`deploy`可接受纳管集合的超集，发布后通过独立受检join事务接入新增集群（`join-cluster`走同一join事务，但只接入、不发布release）。
 未完成的多目标首次部署仍绑定原目标及顺序；不能以部分site解除承诺。
 少给受管集群或更换CPU仍拒绝，移除必须使用受检`remove-cluster`流程。
 
@@ -174,13 +180,13 @@ clean源码只有同时满足以下条件时才访问GitHub Actions：
 
 dirty工作区、个人clean commit或本地`origin/main`未指向当前commit时不查询GitHub，
 直接使用本地影响门禁或完整门禁；实现不会自动`git fetch`。下载候选后会在任何AWS/ECR
-动作前验证main run、commit/tree/repository、CI gate、unit gate、六个shard签名和完整
-artifact清单。没有凭据、没有候选或API临时不可用时回退本地门禁；已经下载的候选若身份
+动作前验证main run、commit/tree/repository、CI gate、unit gate、12个coverage shard签名（runtime 3、deployment 4、
+fault runner 1、PostgreSQL 4）和完整artifact清单。没有凭据、没有候选或API临时不可用时回退本地门禁；已经下载的候选若身份
 或签名不匹配则fail closed。
 
-本地production回退把静态/契约、普通pytest和PostgreSQL stress放在三个隔离cache目录中：
-先单独运行约1分钟的静态门禁，失败即停止、不再启动另外两个；静态通过后普通pytest与
-PostgreSQL stress并行，按CPU容量自适应为1至3路执行，可用
+本地production回退由`scripts/run_release_gates.py`执行，每个门禁使用独立的临时cache目录：
+先单独运行约1分钟的静态门禁，失败即停止、不再启动其余门禁；静态通过后PostgreSQL stress、普通pytest与
+`artifact-check`并行，按CPU容量自适应为1至3路执行，可用
 `GPU_FAULT_RELEASE_GATE_PARALLELISM=1..3`进一步收口。任一并行门禁失败会终止其余门禁，
 并在进度输出之后以`release-gates: first failing gate: <name>`重印该门禁最后约20行。
 `release-build: release_source=…`在构建开头说明本次走的是本地完整门禁还是main CI候选。
@@ -189,12 +195,14 @@ PostgreSQL stress并行，按CPU容量自适应为1至3路执行，可用
 static分支内部继续把Ruff、mypy、compile、架构、代码契约、安全、部署配置、文档、
 YAML和Shell拆成最多10路；`GPU_FAULT_STATIC_GATE_PARALLELISM=1..10`可主动收口。
 
-门禁的mypy/ruff/pytest缓存目录位于`state-dir`下，dirty与clean路径都会复用。每次成功部署后
+mypy与ruff缓存位于`state-dir/tool-caches/`（pytest cache在每轮门禁的临时目录中），dirty与clean路径都会复用；
+public scan的通过结论记在`state-dir/public-release-verdict.json`，同一内容的快照不再重复匹配。每次成功部署后
 按保留规则清理`state-dir/source-snapshots/<fingerprint>/`与`state-dir/.deployer-venv.versions/*`：
 被`source-deploy.json`、`source-deploy-success.json`引用的快照、当前部署的快照以及最新
-`GPU_FAULT_SOURCE_SNAPSHOT_RETAINED`个（默认5，不要低于2）保留；venv版本保留当前激活、state绑定、
-`.deployer-venv.previous`所指以及最新`GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED`个（默认3）。
-同一次deploy只在站点锁内收集一次部署前live evidence，部署成功后再收集一次作为成功记录。
+`GPU_FAULT_SOURCE_SNAPSHOT_RETAINED`个（默认5，须为正整数，建议不低于2）保留；venv版本保留当前激活版本、
+`.deployer-venv.previous`所指的激活备份以及最新`GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED`个（默认3）。
+同一次deploy只在站点锁内读取一次部署前live evidence：`UNCHANGED`直接以它记录成功，application release用发布引擎
+自己写出的`release-summary.json`与COMPLETED状态记录成功，只有deploy-host-only和quality-only在执行后再读一次。
 
 任何签名、commit、平台、摘要、集群身份或资源状态不确定时均fail closed。
 snapshot中的content-addressed release Manifest与签名材料会随site持续保留；
@@ -246,8 +254,8 @@ git status --short
 的staging-only attestation；个人commit执行本地production门禁，只有
 `HEAD == origin/main`时才尝试消费同commit签名main CI候选。
 
-真实Runtime Profile变化仍必须经过独立审批。首次四参数命令会写出
-`STATE_DIR/release-deploy/profile-plan.json`并停止；审核计划和变更单后，在同一条deploy
+真实Runtime Profile变化仍必须经过独立审批。检测到变化的那次部署命令会写出
+`STATE_DIR/release-deploy/profile-plan.json`并停止（停止信息打印计划字段和带真实`plan_sha256`的续跑命令）；审核计划和变更单后，在同一条deploy
 上带审批参数重跑：
 
 ```bash
@@ -266,9 +274,10 @@ Profile baseline，只通过这一个显式参数进入。发布失败且计划�
 ## 10. 成功和失败
 
 应用release发生变化时，命令成功返回前已经完成部署、verify、稳定窗口和release
-summary。仅deploy-host变化时只更新部署机环境、执行影响门禁和只读preflight，不生成
-应用release、不访问GPU rollout也不等待稳定窗口；仅测试/文档变化或源码完全未变时记录
-NOOP，不执行AWS/Kubernetes mutation。操作者不需要再提供内部site路径执行第二条部署命令。
+summary。仅deploy-host变化时只更新部署机环境（并把site的`repositoryRoot`指向新快照）、执行影响门禁和只读
+preflight，不生成应用release、不访问GPU rollout也不等待稳定窗口；仅测试/文档变化时只执行影响门禁，源码完全未变时
+不执行任何门禁，两者都只记录签名的成功授权（`QUALITY_ONLY`/`UNCHANGED`），不执行AWS/Kubernetes mutation。
+操作者不需要再提供内部site路径执行第二条部署命令。
 
 失败时：
 

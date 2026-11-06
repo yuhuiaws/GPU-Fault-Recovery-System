@@ -19,19 +19,21 @@ release-build, release-deploy, bundle or venv paths.
 
 ## 1. Prerequisites
 
-- An existing CPU EKS or HyperPod EKS cluster with at least 3 Ready nodes.
-- At least one existing GPU HyperPod EKS cluster with `NodeRecovery=None`.
+- An existing HyperPod EKS CPU cluster with at least 3 Ready nodes (a plain EKS cluster without a HyperPod orchestrator cannot host the CPU control plane).
+- At least one existing GPU cluster: HyperPod EKS (`NodeRecovery=None`) or plain EKS (node auto repair off on the GPU managed node groups);
+  the GPU node groups/instance groups carry the ownership label `gpu-fault.io/control-plane=<site id>` (printed by `gpu-fault-admin site-id`).
 - The GPU VPC already has a NAT egress.
 - The EC2 execution identity holds the AWS, EKS and Kubernetes permissions required by the staging bootstrap.
-- The EC2 instance has Python 3.12, Git, Make, Docker/Buildx, AWS CLI, Cosign, kubectl, Helm,
-  curl, jq, OpenSSL and sha256sum installed.
+- The EC2 instance has Python 3.12, Git, Make, Docker (with a working daemon)/Buildx, AWS CLI, Cosign, kubectl, Helm,
+  curl, jq, OpenSSL and sha256sum installed; before any AWS mutation the unified deploy checks these tools against
+  `src/gpu_fault/data/deploy-host-tools.json`.
 - No pre-installed signed deploy-host bundle is required: build the source development venv with `make deploy-host-setup-online` per §2;
   the unified deploy command builds, verifies the signature of and binds this site's trusted deploy-host by itself inside `STATE_DIR/deployer-venv` (see §8);
   the signed offline bundle is only for production deploy hosts, see [CI Release Process](ci-release-process.md).
 - The CPU/GPU cluster ARNs belong to the same account and Region.
 
-The state directory must be located outside the Git repository. This process performs no GPU reset, node reboot, warm-spare switch or
-fault injection.
+The state directory must be located outside the Git repository (one inside it is refused). The first deploy generates the cosign key pair and a
+random password under `STATE_DIR/release-signing/`. This process performs no GPU reset, node reboot, warm-spare switch or fault injection.
 
 ## 2. Clone and initialize
 
@@ -94,6 +96,10 @@ The same command applies to:
 ## 6. Internal state machine
 
 ```text
+every deploy
+  -> within the first minute, check the email channel (a new site creates the SNS subscription and sends the confirmation mail here;
+     unconfirmed: exit status 2 with the rerun command)
+
 no site exists in state
   -> scan and pin the current source identity
   -> discover the CPU/GPU clusters
@@ -109,6 +115,8 @@ a site already exists in state
   -> while the first multi-GPU join is incomplete, verify the original targets are unchanged and the current members are a monotonic subset of them
   -> once all original targets are managed or a complete finished removal proof exists, require the CPU unchanged and the requested GPU set to be the managed set or a superset of it; extra clusters auto-join after the release
   -> scan and pin the current source identity
+  -> a Profile change awaiting approval, a live release transaction that is not committed (failed/rolled-back/in flight), or drift only a
+     release can repair (observability, Aurora credential refresh, a DCGM hostengine declaration): always an application release
   -> application identity unchanged:
        -> deploy-host changed: update the deploy-host and run the impact gates and the read-only preflight
        -> tests/docs only changed: run only the impact gates
@@ -118,7 +126,7 @@ a site already exists in state
   -> upgrade -> verify -> stability
 ```
 
-`deploy` accepts a superset of the managed set and joins the added clusters after the release through an independent checked join transaction (`join-cluster` is its alias).
+`deploy` accepts a superset of the managed set and joins the added clusters after the release through an independent checked join transaction (`join-cluster` runs the same join transaction but only joins and publishes no release).
 An incomplete multi-target first deploy stays bound to the original targets and order; the commitment cannot be released with a partial site.
 Passing fewer managed clusters or replacing the CPU is still refused; removal must use the checked `remove-cluster` process.
 
@@ -176,13 +184,13 @@ Clean source accesses GitHub Actions only when all of the following conditions h
 
 A dirty working tree, a personal clean commit, or a local `origin/main` that does not point at the current commit does not query GitHub and
 directly uses the local impact gates or full gates; the implementation never runs `git fetch` automatically. After downloading a candidate, before any AWS/ECR
-action it verifies the main run, commit/tree/repository, CI gate, unit gate, the six shard signatures and the full
-artifact inventory. With no credentials, no candidate, or a temporarily unavailable API it falls back to the local gates; an already downloaded candidate whose identity
+action it verifies the main run, commit/tree/repository, CI gate, unit gate, the 12 coverage shard signatures (3 runtime, 4 deployment,
+1 fault runner, 4 PostgreSQL) and the full artifact inventory. With no credentials, no candidate, or a temporarily unavailable API it falls back to the local gates; an already downloaded candidate whose identity
 or signature does not match fails closed.
 
-The local production fallback places static/contract, ordinary pytest and PostgreSQL stress in three isolated cache directories:
-the static gate, about 1 minute, runs alone first, and on failure stops without starting the other two; after static passes, ordinary pytest and
-PostgreSQL stress run in parallel, adaptively at 1 to 3 ways according to CPU capacity, and can be
+The local production fallback is run by `scripts/run_release_gates.py`, every gate with its own temporary cache directory:
+the static gate, about 1 minute, runs alone first, and on failure stops without starting the others; after static passes, the PostgreSQL stress,
+ordinary pytest and `artifact-check` run in parallel, adaptively at 1 to 3 ways according to CPU capacity, and can be
 narrowed further with `GPU_FAULT_RELEASE_GATE_PARALLELISM=1..3`. Any failing parallel gate terminates the remaining gates,
 and after the progress output reprints the last roughly 20 lines of that gate as `release-gates: first failing gate: <name>`.
 `release-build: release_source=…` at the start of the build states whether this run takes the local full gates or a main CI candidate.
@@ -191,12 +199,14 @@ The gate set is the same as the original `make check` plus stress; it does not l
 Inside the static branch, Ruff, mypy, compile, architecture, code contracts, security, deployment configuration, docs,
 YAML and Shell are still split into up to 10 ways; `GPU_FAULT_STATIC_GATE_PARALLELISM=1..10` can narrow it deliberately.
 
-The mypy/ruff/pytest cache directories of the gates live under `state-dir` and are reused by both the dirty and clean paths. After each successful deploy,
-`state-dir/source-snapshots/<fingerprint>/` and `state-dir/.deployer-venv.versions/*` are cleaned per the retention rules:
+The mypy and ruff caches live under `state-dir/tool-caches/` (the pytest cache sits in each gate run's temporary directory) and are reused by both the
+dirty and clean paths; the public scan records its pass in `state-dir/public-release-verdict.json`, so a snapshot of the same content is not matched
+again. After each successful deploy, `state-dir/source-snapshots/<fingerprint>/` and `state-dir/.deployer-venv.versions/*` are cleaned per the retention rules:
 snapshots referenced by `source-deploy.json` and `source-deploy-success.json`, the snapshot of the current deploy and the latest
-`GPU_FAULT_SOURCE_SNAPSHOT_RETAINED` (default 5, do not go below 2) are kept; venv versions keep the currently activated one, the state-bound one,
-the one pointed to by `.deployer-venv.previous` and the latest `GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED` (default 3).
-One deploy collects the pre-deploy live evidence once inside the site lock, and collects it once more after a successful deploy as the success record.
+`GPU_FAULT_SOURCE_SNAPSHOT_RETAINED` (default 5; a positive integer, preferably not below 2) are kept; venv versions keep the currently activated one,
+the activation backup `.deployer-venv.previous` points to, and the latest `GPU_FAULT_DEPLOY_HOST_VENV_VERSIONS_RETAINED` (default 3).
+One deploy reads the pre-deploy live evidence once inside the site lock: `UNCHANGED` records its success from that reading, an application release
+from the release engine's own `release-summary.json` and COMPLETED state, and only deploy-host-only and quality-only read the site again afterwards.
 
 Whenever any signature, commit, platform, digest, cluster identity or resource state is uncertain, it fails closed.
 The content-addressed release Manifest and signing material in the snapshot are retained along with the site;
@@ -248,8 +258,8 @@ Once the working tree becomes clean, repeat the same four-parameter command agai
 staging-only attestation; a personal commit runs the local production gates, and only when
 `HEAD == origin/main` does it try to consume the same-commit signed main CI candidate.
 
-A real Runtime Profile change must still go through independent approval. The first four-parameter command writes
-`STATE_DIR/release-deploy/profile-plan.json` and stops; after reviewing the plan and the change ticket, rerun on the same deploy
+A real Runtime Profile change must still go through independent approval. The deploy command that detects the change writes
+`STATE_DIR/release-deploy/profile-plan.json` and stops (the stop message prints the plan fields and the rerun command with the real `plan_sha256`); after reviewing the plan and the change ticket, rerun on the same deploy
 with the approval parameter:
 
 ```bash
@@ -268,9 +278,10 @@ succeed.
 ## 10. Success and failure
 
 When the application release changes, the deploy, verify, stability window and release
-summary are already complete before the command returns successfully. When only the deploy-host changes, only the deploy host environment is updated and the impact gates and read-only preflight run; no
-application release is generated, the GPU rollout is not accessed and no stability window is waited for; when only tests/docs change or the source is completely unchanged, a
-NOOP is recorded and no AWS/Kubernetes mutation is executed. The operator no longer needs to provide the internal site path to run a second deploy command.
+summary are already complete before the command returns successfully. When only the deploy-host changes, only the deploy host environment is updated
+(and the site's `repositoryRoot` points at the new snapshot) and the impact gates and read-only preflight run; no application release is generated, the
+GPU rollout is not accessed and no stability window is waited for; when only tests/docs change only the impact gates run, and when the source is
+completely unchanged no gate runs; both only record the signed success authorization (`QUALITY_ONLY`/`UNCHANGED`) and execute no AWS/Kubernetes mutation. The operator no longer needs to provide the internal site path to run a second deploy command.
 
 On failure:
 
