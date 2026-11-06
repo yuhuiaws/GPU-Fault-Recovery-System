@@ -81,10 +81,6 @@ NVIDIA_ROW_REMAP_RMA_REFERENCE = (
     "rma-policy-thresholds-for-row-remapping.html"
 )
 THERMAL_CLOCK_THROTTLE_MASK = 0x20 | 0x40
-# One minute of violation per minute, plus a margin for sampling skew. A
-# violation-duration counter cannot exceed this without meaning something other
-# than microseconds spent in violation.
-MAX_PLAUSIBLE_VIOLATION_US_PER_MINUTE = 60_000_000 * 1.05
 
 
 class GpuMetricSource(StrEnum):
