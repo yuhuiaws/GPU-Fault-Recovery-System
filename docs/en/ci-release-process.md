@@ -36,7 +36,7 @@ The current main chain is split into two segments, main CI and Release promotion
 
 ```text
 main push
-  -> static, artifact, 5 non-PG coverage shards and 1 PG shard run in parallel
+  -> static, artifact, 8 non-PG coverage shards, 4 PG shards and 4 shuffled-order jobs run in parallel
   -> each coverage shard:
        -> compute the domain content identity
        -> hit: a signed gate with the same identity from a historical successful main CI: verify the signature and reuse the evidence
@@ -47,7 +47,7 @@ main push
        -> merge pytest results, generate the fault report and the duration summary
        -> generate and sign the aggregated unit gate
   -> artifact: source-only canonical component artifacts + unsigned deploy-host bundle
-  -> test: validate the unit domain gate, summarise this run's static/artifact, generate and sign the commit CI gate
+  -> test: validate the unit domain gate, summarise this run's static/unit/shuffle/artifact, generate and sign the commit CI gate
   -> upload gpu-fault-ci-candidate
 
 workflow_dispatch or v* tag
@@ -55,18 +55,21 @@ workflow_dispatch or v* tag
   -> resolve the successful main CI run for that commit
   -> download the candidate and verify the CI gate signature, source identity and full file inventory
   -> obtain temporary AWS identity through GitHub OIDC and log in to ECR
+  -> make ci-supply-chain-tools (the pinned supply-chain tools, SBOM generator included)
   -> make release-build-promoted
        -> verify the CI gate again
        -> build or reuse the immutable Runtime Image from the candidate component artifacts
-       -> generate the deployable Manifest v4 and the attestation bound to the CI gate
-       -> run the final artifact consistency check and sign the attestation
+       -> generate the deployable Manifest v4
+       -> run the final artifact consistency check
+       -> make sbom: one CycloneDX SBOM per shipped lock
+       -> generate the attestation bound to the CI gate and the SBOMs, and sign it
   -> make deploy-host-sign
        -> only sign the deploy-host archive already built by CI; do not rebuild
   -> upload dist/ as the gpu-fault-release artifact
 ```
 
-PRs also run the same twelve fresh shards, the unified coverage floor, PostgreSQL stress, `static` and
-`artifact`, but the shards are not signed with main trust, no deploy-host bundle is built, and no signed candidate that Release
+PRs also run the same twelve fresh shards, the unified coverage floor, PostgreSQL stress, the four `shuffled-order` jobs,
+`static` and `artifact`, but the shards are not signed with main trust, no deploy-host bundle is built, and no signed candidate that Release
 could download across runs is generated. The final job is still named `test` so that branch protection keeps a single aggregated status.
 
 The Release workflow only accepts the clean commit obtained from checkout, and requires its candidate to come from a successful push CI on
@@ -148,13 +151,16 @@ artifact inventory must still match the current checkout exactly.
 
 ### 2.2 GitHub Permissions
 
-Both workflows declare only:
+`ci.yml` grants only `contents: read` at workflow level and adds the rest per job: the coverage and PostgreSQL
+shard jobs also get `actions: read` (cross-run restore of a signed shard on push) and `id-token: write` (signing the shard gate),
+`unit` and `test` only add `id-token: write`, and `static`, `shuffled-order` and `artifact` get nothing more.
+`release.yml` declares the three permissions below at workflow level:
 
 | Permission | Purpose |
 |---|---|
-| `actions: read` | Release downloads the trusted CI candidate across runs |
+| `actions: read` | Release downloads the trusted CI candidate across runs; CI coverage/PostgreSQL shards restore a signed shard across runs |
 | `contents: read` | checkout of the source |
-| `id-token: write` | keyless signing of the CI gate, release attestation and deploy-host archive, plus AWS OIDC for Release |
+| `id-token: write` | keyless signing of the coverage shard gates, unit domain gate, CI gate, release attestation and deploy-host archive, plus AWS OIDC for Release |
 
 The GitHub workflows do not configure `COSIGN_SIGNING_KEY`, so keyless `cosign sign-blob` is used.
 Before requesting an AWS identity, Release pins the CI gate certificate identity to
@@ -179,8 +185,8 @@ CI tests also support the following optional repository variables:
 
 | Name | Default | Role |
 |---|---|---|
-| `CI_TEST_RUNNER` | `ubuntu-latest` | Configured larger/self-hosted Runner label used by the coverage and PostgreSQL shards |
-| `CI_PYTEST_WORKERS` | `4` | xdist worker count for non-PostgreSQL shards; should match the Runner CPU/IO capacity |
+| `CI_TEST_RUNNER` | `ubuntu-latest` | Configured larger/self-hosted Runner label used by the coverage and PostgreSQL shards and the `shuffled-order` jobs |
+| `CI_PYTEST_WORKERS` | `4` | xdist worker count for the non-PostgreSQL shards and the `shuffled-order` jobs; should match the Runner CPU/IO capacity |
 
 When no larger runner is configured, a non-existent label must not be entered. A change in the worker count enters the shard protocol identity; CI always
 uses `--dist=worksteal` to reduce the long tail, but does not substitute more workers for slow-test analysis.
@@ -211,7 +217,7 @@ install the project test extras. The CI execution units are as follows:
 
 | job | Main responsibility |
 |---|---|
-| `static` | Ruff, mypy strict, compileall, architecture, deployment contracts, documentation and CI tool tests, configuration, YAML, Shell and artifact security checks |
+| `static` | Ruff, mypy strict, compileall, architecture, deployment contracts, documentation and CI tool tests, configuration, YAML, Shell and artifact security checks, plus the pinned pip-audit, the promtool behaviour tests, the Grafana dashboard and NVIDIA XID policy generation checks; a PR also gets the documentation impact check |
 | `coverage-runtime_0..2` | Ordinary Runtime pytest split into three parts by a stable nodeid hash, each collecting branch coverage and duration evidence |
 | `coverage-deployment_0..3` | Release, regional orchestration and deploy-host administrator pytest split into four parts by a stable nodeid hash, each collecting the corresponding coverage |
 | `coverage-fault_runner` | fault scheduler/runner tests and duration evidence |
@@ -229,8 +235,8 @@ physical shards while fault_runner stays a single shard, twelve in total:
 | shard | Test boundary | Content identity highlights |
 |---|---|---|
 | `runtime_0..2` | Ordinary tests other than the static, deployment, fault runner and PostgreSQL entry points; each concrete nodeid enters exactly one part by SHA-256 modulo | dependencies, Runtime source, Runtime tests, shared fixtures, partition total and index |
-| `deployment_0..3` | `tests/admin/`, executable regional tests and the release/deploy/artifact root tests; each concrete nodeid enters exactly one part by SHA-256 modulo | dependencies, shared Runtime source, deployment/deploy-host-only source, deployment tests, partition total and index |
-| `fault_runner` | `tests/test_case_scheduler.py`; the full catalog contract is still run by static | dependencies, shared Runtime source, testcases, runner/scheduler and runner tests |
+| `deployment_0..3` | `tests/admin/`, `tests/deploy/`, executable regional tests and the release/deploy/artifact root tests; each concrete nodeid enters exactly one part by SHA-256 modulo | dependencies, shared Runtime source, deployment/deploy-host-only source, deployment tests, partition total and index |
+| `fault_runner` | the explicit `tests.fault_runner_files` list (scheduler, fault result completeness, cov95 evidence and runner, pytest reporter contract, scenario coverage and scenario test evidence); the full catalog contract is still run by static | dependencies, shared Runtime source, testcases, runner/scheduler and runner tests |
 | `postgres_0..3` | The complete explicit inventory in `tests.postgres_files`; each concrete nodeid enters exactly one part by SHA-256 modulo, and the contract and stress passes use the same part | dependencies, shared Runtime source, PostgreSQL tests, actual PostgreSQL image, partition total and index |
 
 The entry point of the PostgreSQL shard is governed by `tests.postgres_files` in `config/ci-unit-gate.json`
@@ -262,9 +268,9 @@ A Each shard's pytest command line comes from `shard_arguments` in `scripts/ci_c
 whose test files belong to this shard (other shards' files below it at most one fifth) is passed as a directory
 argument, the few exceptions are excluded with `--ignore=`, and the remaining files are listed individually. pytest
 re-collects a file argument's whole parent directory for every file argument (`Session.collect` bypasses its
-collection cache for bare file paths), so naming the 843 files under `tests/regional` one by one builds about 800k
-Module nodes and makes collection alone three times slower than the directory form (190 s against 63 s, measured
-2026-10-03). The receipt's `selection.targets` records the actual arguments while `collected_files` must still equal
+collection cache for bare file paths), so naming every file under `tests/regional` one by one builds Module nodes on the
+order of the file count squared (about 800k for the 843 files when directory arguments were introduced) and makes
+collection alone about three times slower than the directory form (190 s against 63 s measured then). The receipt's `selection.targets` records the actual arguments while `collected_files` must still equal
 the shard's file inventory exactly, so a wrong argument set fails the shard gate instead of running the wrong tests;
 `tests/test_ci_unit_gate.py` proves for every shard that the argument set collects exactly the target files.
 
@@ -305,7 +311,7 @@ The PostgreSQL stress must also provide a complete receipt with no skips. The so
 first-execution producer of the original receipt are all preserved. The schema-2 aggregated report records the current
 validation subject in `validated_source_identity` and does not rewrite a historical execution as a new session of the current source. Shard gates use schema 2, the aggregated
 unit gate uses schema 3, and old formats must not bypass the newly added gates.
-`make fault-test-cases-ci` maps these results directly onto the 64 unit/component fault cases without
+`make fault-test-cases-ci` maps these results directly onto every unit/component-level fault case of `testcases/fault-scenarios.yaml` without
 starting pytest again. The documentation/CI contract tests are run by the `static` job of the current commit, so docs or `.github/`
 changes can reuse every shard but cannot skip the current static and artifact gates.
 
@@ -329,7 +335,7 @@ not a fixed SLA:
 | `adcaadff` / `37124211673` | Six shards + a single shuffled job (after the suite grew) | 39 min 14 s | `shuffled-order` 39 min; `coverage-deployment` 36 min; `coverage-postgres` 30 min | unit not run |
 | `453b0dcb` / `37139294375` | Twelve shards + four shuffled shards (PR run, all fresh) | 16 min 42 s | `coverage-postgres_1` 14 min 30 s; `coverage-deployment_2` 11 min 48 s; `shuffled-order-2` 11 min 36 s; `coverage-runtime_2` 10 min 54 s; static 8 min 18 s | unit 2 min (combine 93 s) |
 
-Before the 2026-10-03 re-sharding the suite had grown to about 43,000 nodeids: the single shuffled job, the single
+Before the re-sharding the suite had grown to about 43,000 nodeids: the single shuffled job, the single
 deployment shard and the serial PostgreSQL shard each needed 30-40 minutes, and even in parallel they held the whole
 pipeline at 40-45 minutes. Re-sharding only changes which slice each job receives, not the test set, the coverage floors,
 the signing protocol or the shuffled order itself (see the partition proofs in `tests/test_ci_unit_gate.py` and
@@ -358,7 +364,7 @@ workflow to sign after the candidate's signature verification succeeds.
 
 ### 3.2 Generating the Trusted CI Candidate
 
-The aggregation job `test` depends on three jobs and requires `success` from each of them. On a main push it:
+The aggregation job `test` depends on four jobs, `static`, `unit`, `shuffle` (`shuffled-order-0..3`) and `artifact`, and requires `success` from each of them. On a main push it:
 
 1. downloads the complete `dist/` generated by the artifact job;
 2. downloads the aggregated signed gate generated by the unit job in this run, verifies the signature again, and checks the twelve shard gates,
@@ -505,7 +511,10 @@ The attestation binds:
 - the Git commit and the clean working tree state;
 - `release_tier=production`;
 - the SHA-256 of `dist/ci-gate.json`;
-- the PASS verdicts of `ci_gate.py verify` and the final artifact consistency check.
+- the PASS verdicts of `ci_gate.py verify` and the final artifact consistency check;
+- the path and SHA-256 of every `dist/sbom/*.cdx.json` CycloneDX SBOM that `make sbom` generates per shipped lock
+  (build, runtime, deploy-host, node-runtime, node-tools) — the `sbom` entries, covered by the same signature, not signed separately.
+  A missing pinned generator fails in CI; locally it only warns and the attestation carries no `sbom` entries.
 
 The static, coverage, artifact and PostgreSQL stress verdicts from main CI are kept in the bound CI gate;
 the Release job does not pretend to have run `make check` again.
@@ -612,6 +621,7 @@ artifact, not an automatically created GitHub Release asset, and it is not copie
 | `dist/<release-id>/attestation.json` | `build-release-attestation.py` | Content-addressed release attestation |
 | `dist/current-attestation.json` | same as above | The attestation consumed by the deploy entry point |
 | `dist/current-attestation.bundle.json` | `cosign sign-blob` (via `scripts/cosign_sign_blob.py`) | Sigstore signature material of the release attestation |
+| `dist/sbom/<lock>.cdx.json` | `make sbom` | CycloneDX SBOM of each shipped lock; its SHA-256 is bound by the attestation |
 | `dist/gpu-fault-deploy-host-<platform>.tar.gz` | `build-deploy-host-bundle.py` | Deploy host offline Python environment and tool payload |
 | `.tar.gz.sha256` of the same name | same as above | SHA-256 sidecar of the deploy host offline package |
 | `dist/gpu-fault-deploy-host-<platform>.sigstore.json` | `cosign sign-blob` (via `scripts/cosign_sign_blob.py`) | Sigstore signature material of the deploy host offline package |

@@ -34,7 +34,7 @@
 
 ```text
 main push
-  -> static、artifact、5个非PG coverage shard、1个PG shard并行
+  -> static、artifact、8个非PG coverage shard、4个PG shard、4个shuffled-order job并行
   -> 每个coverage shard:
        -> 计算域内容身份
        -> 命中历史成功main CI的同身份签名gate：验签并复用证据
@@ -45,7 +45,7 @@ main push
        -> 合并pytest结果、生成fault report和duration汇总
        -> 生成并签名聚合unit gate
   -> artifact: source-only canonical组件制品 + 未签名deploy-host bundle
-  -> test: 验证unit域gate，汇总本次static/artifact，生成并签名commit CI gate
+  -> test: 验证unit域gate，汇总本次static/unit/shuffle/artifact，生成并签名commit CI gate
   -> 上传 gpu-fault-ci-candidate
 
 workflow_dispatch 或 v* tag
@@ -53,18 +53,21 @@ workflow_dispatch 或 v* tag
   -> 解析该commit对应的成功main CI run
   -> 下载候选并验证CI gate签名、源码身份和完整文件清单
   -> 通过GitHub OIDC获取AWS临时身份并登录ECR
+  -> make ci-supply-chain-tools（固定版本的SBOM等供应链工具）
   -> make release-build-promoted
        -> 再次验证CI gate
        -> 用候选组件制品构建或复用不可变Runtime Image
-       -> 生成deployable Manifest v4和绑定CI gate的attestation
-       -> 运行最终制品一致性检查并签名attestation
+       -> 生成deployable Manifest v4
+       -> 运行最终制品一致性检查
+       -> make sbom：为每个交付lock生成CycloneDX SBOM
+       -> 生成绑定CI gate与SBOM的attestation并签名
   -> make deploy-host-sign
        -> 只签名CI已经构建的deploy-host archive，不重复构建
   -> 上传 dist/ 为 gpu-fault-release artifact
 ```
 
-PR也运行相同的十二个fresh shard、统一coverage floor、PostgreSQL stress、`static`和
-`artifact`，但shard不作main信任签名、不构建deploy-host bundle，也不生成可供Release
+PR也运行相同的十二个fresh shard、统一coverage floor、PostgreSQL stress、四个`shuffled-order` job、
+`static`和`artifact`，但shard不作main信任签名、不构建deploy-host bundle，也不生成可供Release
 跨run下载的签名候选。最终job仍名为`test`，用于保持分支保护的单一聚合状态。
 
 Release workflow只接受checkout得到的clean commit，并要求其候选来自
@@ -146,13 +149,16 @@ artifact清单仍必须与当前checkout完全一致。
 
 ### 2.2 GitHub 权限
 
-两个workflow只声明：
+`ci.yml`的workflow级默认权限只有`contents: read`，其余权限按job授予：coverage与PostgreSQL
+shard job另有`actions: read`（push时跨run恢复已签名shard）和`id-token: write`（签名shard gate），
+`unit`与`test`只另有`id-token: write`，`static`、`shuffled-order`和`artifact`没有额外权限。
+`release.yml`在workflow级声明下表三项：
 
 | 权限 | 用途 |
 |---|---|
-| `actions: read` | Release跨run下载受信CI候选 |
+| `actions: read` | Release跨run下载受信CI候选；CI coverage/PostgreSQL shard跨run恢复已签名shard |
 | `contents: read` | checkout 源码 |
-| `id-token: write` | CI gate、release attestation、deploy-host archive的keyless签名，以及Release的AWS OIDC |
+| `id-token: write` | coverage shard gate、unit域gate、CI gate、release attestation、deploy-host archive的keyless签名，以及Release的AWS OIDC |
 
 GitHub workflow不配置`COSIGN_SIGNING_KEY`，因此使用keyless `cosign sign-blob`。
 Release在请求AWS身份之前先把CI gate的certificate identity固定为
@@ -177,8 +183,8 @@ CI测试还支持以下可选repository variables：
 
 | 名称 | 默认 | 作用 |
 |---|---|---|
-| `CI_TEST_RUNNER` | `ubuntu-latest` | coverage和PostgreSQL shard使用的已配置larger/self-hosted Runner label |
-| `CI_PYTEST_WORKERS` | `4` | 非PostgreSQL shard的xdist worker数；应与Runner CPU/IO容量匹配 |
+| `CI_TEST_RUNNER` | `ubuntu-latest` | coverage、PostgreSQL shard和`shuffled-order` job使用的已配置larger/self-hosted Runner label |
+| `CI_PYTEST_WORKERS` | `4` | 非PostgreSQL shard和`shuffled-order` job的xdist worker数；应与Runner CPU/IO容量匹配 |
 
 未配置larger runner时不得填写不存在的label。worker数变化会进入shard协议身份；CI固定
 使用`--dist=worksteal`减少长尾，但不会以增加worker代替慢测试分析。
@@ -209,7 +215,7 @@ token只用于GitHub Actions只读API，不得进入命令输出、state、relea
 
 | job | 主要职责 |
 |---|---|
-| `static` | Ruff、mypy strict、compileall、架构、部署契约、文档与CI工具测试、配置、YAML、Shell和artifact安全检查 |
+| `static` | Ruff、mypy strict、compileall、架构、部署契约、文档与CI工具测试、配置、YAML、Shell和artifact安全检查，以及固定版本的pip-audit、promtool行为测试、Grafana dashboard与NVIDIA XID策略生成检查；PR另查文档影响 |
 | `coverage-runtime_0..2` | 普通Runtime pytest按稳定nodeid哈希分为三份，分别采集branch coverage和duration证据 |
 | `coverage-deployment_0..3` | 发布、区域编排、deploy-host管理员pytest按稳定nodeid哈希分为四份，分别采集对应coverage |
 | `coverage-fault_runner` | fault scheduler/runner测试和duration证据 |
@@ -227,8 +233,8 @@ postgres分别拆成三、四、四个物理shard，fault_runner保持一个，�
 | shard | 测试边界 | 内容身份要点 |
 |---|---|---|
 | `runtime_0..2` | 除静态、部署、fault runner和PostgreSQL入口外的普通测试；每个具体nodeid按SHA-256取模只进入一份 | dependencies、Runtime源码、Runtime测试、共享fixture、分区总数和index |
-| `deployment_0..3` | `tests/admin/`、可执行regional测试和release/deploy/artifact根测试；每个具体nodeid按SHA-256取模只进入一份 | dependencies、Runtime共享源码、部署/deploy-host-only源码、部署测试、分区总数和index |
-| `fault_runner` | `tests/test_case_scheduler.py`；catalog完整契约仍由static执行 | dependencies、Runtime共享源码、testcases、runner/scheduler和runner测试 |
+| `deployment_0..3` | `tests/admin/`、`tests/deploy/`、可执行regional测试和release/deploy/artifact根测试；每个具体nodeid按SHA-256取模只进入一份 | dependencies、Runtime共享源码、部署/deploy-host-only源码、部署测试、分区总数和index |
+| `fault_runner` | `tests.fault_runner_files`的显式清单（scheduler、fault结果完整性、cov95证据与runner、pytest reporter契约、场景覆盖与场景测试证据）；catalog完整契约仍由static执行 | dependencies、Runtime共享源码、testcases、runner/scheduler和runner测试 |
 | `postgres_0..3` | `tests.postgres_files` 的完整显式清单；每个具体nodeid按SHA-256取模只进入一份，contract和stress两遍使用同一份 | dependencies、Runtime共享源码、PostgreSQL测试、实际PostgreSQL image、分区总数和index |
 
 PostgreSQL shard 的入口以 `config/ci-unit-gate.json` 的 `tests.postgres_files` 为准，
@@ -260,9 +266,9 @@ PostgreSQL contract和stress串在同一job中。
 shard的pytest命令行由`scripts/ci_coverage_config.py`的`shard_arguments`生成：能整体
 归属本shard（其余shard的测试文件不超过两成）的目录直接作为参数，少数例外用
 `--ignore=`排除，其余文件逐个列出。pytest对每个文件参数都会重新收集其所在目录
-（`Session.collect`对裸文件路径不走收集缓存），所以把`tests/regional`的 843 个文件
-逐个传入会构造约 80 万个 Module 节点，仅收集就比目录参数慢 3 倍（2026-10-03 实测
-190 秒对 63 秒）。回执中的`selection.targets`记录的是实际参数，`collected_files`
+（`Session.collect`对裸文件路径不走收集缓存），所以把`tests/regional`的全部文件
+逐个传入会构造与文件数平方同量级的 Module 节点（引入目录参数时 843 个文件约 80 万个），
+仅收集就比目录参数慢约 3 倍（当时实测 190 秒对 63 秒）。回执中的`selection.targets`记录的是实际参数，`collected_files`
 仍必须精确等于本shard的文件清单，因此参数集合算错会让shard gate失败，而不是跑错
 测试；`tests/test_ci_unit_gate.py`对每个shard证明参数集合恰好收集目标文件。
 
@@ -306,7 +312,7 @@ PostgreSQL stress 也必须提供完整且没有 skip 的回执。原回执的�
 首次执行 producer 均保留。schema-2 聚合报告以 `validated_source_identity` 记录当前
 验证对象，不把历史执行改写为当前源码的新 session。分片 gate 使用 schema 2，聚合
 unit gate 使用 schema 3，旧格式不得绕过新增门禁。
-`make fault-test-cases-ci`直接把这些结果映射到64条unit/component fault case，不再次
+`make fault-test-cases-ci`直接把这些结果映射到`testcases/fault-scenarios.yaml`中全部unit/component级fault case，不再次
 启动pytest。文档/CI契约测试由当前commit的`static` job执行，因此docs或`.github/`
 变化可以复用全部shard，但不能跳过当前static和artifact门禁。
 
@@ -330,7 +336,7 @@ fault case 的 PASS 必须具备 setup/call/teardown 三个成功阶段；带 se
 | `adcaadff` / `37124211673` | 六个shard + 单job打乱轮（测试集增长后） | 39分14秒 | `shuffled-order` 39分；`coverage-deployment` 36分；`coverage-postgres` 30分 | unit未执行 |
 | `453b0dcb` / `37139294375` | 十二个shard + 四个打乱shard（PR run，全部fresh） | 16分42秒 | `coverage-postgres_1` 14分30秒；`coverage-deployment_2` 11分48秒；`shuffled-order-2` 11分36秒；`coverage-runtime_2` 10分54秒；static 8分18秒 | unit 2分（combine 93秒） |
 
-2026-10-03 重新分片前，测试集已经增长到约 4.3 万条 nodeid：单job的打乱轮、单个
+重新分片前，测试集已经增长到约 4.3 万条 nodeid：单job的打乱轮、单个
 deployment shard和串行PostgreSQL shard各自需要 30-40 分钟，三者并行也让整条流水线
 停在 40-45 分钟。重新分片只改变每个job拿到的切片，不改变测试集、coverage floor、
 签名协议和打乱顺序本身（见 `tests/test_ci_unit_gate.py` 和
@@ -359,7 +365,7 @@ workflow在候选验签成功后签名。
 
 ### 3.2 生成受信CI候选
 
-聚合job `test`依赖三个job并逐一要求`success`。main push时它：
+聚合job `test`依赖`static`、`unit`、`shuffle`（`shuffled-order-0..3`）和`artifact`四个job并逐一要求`success`。main push时它：
 
 1. 下载artifact job生成的完整`dist/`；
 2. 下载unit job本次生成的聚合签名gate，再次验签，并核对其内十二个shard gate、
@@ -506,7 +512,10 @@ attestation 绑定：
 - Git commit 和干净工作树状态；
 - `release_tier=production`；
 - `dist/ci-gate.json`的SHA-256；
-- `ci_gate.py verify`和最终artifact consistency的PASS结论。
+- `ci_gate.py verify`和最终artifact consistency的PASS结论；
+- `make sbom`为每个交付lock（build、runtime、deploy-host、node-runtime、node-tools）生成的
+  `dist/sbom/*.cdx.json` CycloneDX SBOM的路径与SHA-256（`sbom`条目，由同一签名覆盖，不另签）。
+  CI中缺少固定版本生成器时失败；本地缺少时只告警，attestation不带`sbom`条目。
 
 main CI中的static、coverage、artifact和PostgreSQL stress结论保存在被绑定的CI gate中，
 不伪装成Release job再次执行了`make check`。
@@ -613,6 +622,7 @@ artifact，不是自动创建的 GitHub Release asset，也不会自动复制到
 | `dist/<release-id>/attestation.json` | `build-release-attestation.py` | 内容寻址 release attestation |
 | `dist/current-attestation.json` | 同上 | 部署入口消费的 attestation |
 | `dist/current-attestation.bundle.json` | `cosign sign-blob`（经`scripts/cosign_sign_blob.py`） | release attestation 的 Sigstore 签名材料 |
+| `dist/sbom/<lock>.cdx.json` | `make sbom` | 每个交付lock的CycloneDX SBOM；SHA-256由attestation绑定 |
 | `dist/gpu-fault-deploy-host-<platform>.tar.gz` | `build-deploy-host-bundle.py` | 部署机离线 Python 环境和工具 payload |
 | 同名 `.tar.gz.sha256` | 同上 | 部署机离线包 SHA-256 sidecar |
 | `dist/gpu-fault-deploy-host-<platform>.sigstore.json` | `cosign sign-blob`（经`scripts/cosign_sign_blob.py`） | 部署机离线包的 Sigstore 签名材料 |
