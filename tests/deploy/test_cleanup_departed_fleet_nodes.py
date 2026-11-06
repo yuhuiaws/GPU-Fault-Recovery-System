@@ -180,7 +180,11 @@ def eks_config(**changes: Any) -> dict[str, Any]:
         ("unknown-provider", "cluster provider must be one of"),
         ("other-context", "outside the bound config scope"),
         ("no-config", "cleanup cluster has no bound config"),
-        ("aws-exit", "cannot describe EC2 instances in us-west-2: <sensitive output"),
+        (
+            "aws-exit",
+            "cannot describe EC2 instances in us-west-2: "
+            "UnauthorizedOperation: <sensitive output",
+        ),
         ("aws-missing", r"EC2 instance lookup failed \(FileNotFoundError\)"),
         ("not-json", "EC2 instance description is invalid JSON"),
         ("invalid-rows", "EC2 instance description is invalid"),
