@@ -49,8 +49,9 @@ make deploy-host-setup-online
 . .venv/bin/activate
 ```
 
-The first deploy should be executed from the repository root. After success, the internal state records the trusted source root directory, and later runs do not require the operator
-to provide the repo path.
+The first deploy should be executed from the repository root. Afterwards every run inside a checkout takes the current directory as the source root
+(with a notice when it differs from the last run), and only a run outside a checkout uses the trusted source root recorded in the internal state,
+so the operator never provides the repo path.
 
 ## 3. Check system tools and identity
 
