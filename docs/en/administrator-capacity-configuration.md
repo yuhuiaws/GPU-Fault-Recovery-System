@@ -502,9 +502,13 @@ index's own density among indexes of at least 64 pages, never on index pages per
 rows reads 74.5 index pages per live row for 149 pages while no index reaches the floor, and `due_actions` of 0 is the
 conclusion (Administrator Operations §10.3). The thresholds (an index of
 at least 64 pages below 8 live entries per page; a small table of at least 16 pages below 4 live rows per page) are not
-capacity parameters and do not vary with the preset; the large tables' heaps and TOAST are reclaimed only by
-`gpu-fault-admin store-maintenance` in a maintenance window (Administrator Operations §10.3) and cost roughly a quarter
-of throughput. The variable is a ConfigMap environment variable, not a capacity-preset field of `admin-config.yaml`.
+capacity parameters and do not vary with the preset. The large tables' heaps and the queue's TOAST are only measured
+and exported; no product path rewrites them: reclaiming them needs `VACUUM FULL`'s exclusive lock for the whole copy, an
+operator decision for a maintenance window. `gpu-fault-admin store-maintenance` (`--reference`, executes only with
+`--confirm STORE_MAINTENANCE`; Administrator Operations §10.3) runs `REINDEX INDEX CONCURRENTLY` over every index of those
+large tables followed by a plain `VACUUM (ANALYZE)`, and `VACUUM (FULL, ANALYZE)` on the three small tables, so it does
+not rewrite the large heaps either. The large heaps cost roughly a quarter of the lost throughput. The variable is a
+ConfigMap environment variable, not a capacity-preset field of `admin-config.yaml`.
 
 ## 5. Configuration File Format
 
