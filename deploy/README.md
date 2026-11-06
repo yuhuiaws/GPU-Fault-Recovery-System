@@ -53,7 +53,7 @@ and select only affected CPU roles.
 | Observability | `observability/` | `observability/install-amp-monitoring.sh` |
 | Centralized container logs | `observability/` | `observability/install-cloudwatch-observability.sh` (read-only `status` unless `GPU_FAULT_CLOUDWATCH_ACTION=install`) |
 | Database and endpoint migrations | `migrations/` | Apply only the named runbook manifest |
-| AWS supporting resources | `aws/{s3,iam,lambda}/` | Use from the matching operations runbook |
+| AWS supporting resources | `aws/{s3,iam}/` | Use from the matching operations runbook |
 | Runtime image | `image/Dockerfile` | CI builds from `uv.lock`-derived hashed requirements and pushes by digest |
 | Historical single-cluster automation | `hyperpod/` | Compatibility and migration only; not the production topology |
 
