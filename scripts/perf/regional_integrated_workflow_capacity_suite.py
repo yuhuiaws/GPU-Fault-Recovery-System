@@ -67,6 +67,7 @@ if __package__:
         postgres_counters,
         store_bloat_section,
         store_layout_section,
+        store_state_section,
         prepare_start_gate,
         processor_priority_latency,
         publish_fixtures,
@@ -142,6 +143,7 @@ else:
         postgres_counters,
         store_bloat_section,
         store_layout_section,
+        store_state_section,
         prepare_start_gate,
         processor_priority_latency,
         publish_fixtures,
@@ -1171,6 +1173,9 @@ def execute_integrated_jobs(
         "window_start_epoch": start_epoch,
         "window_end_epoch": window_end,
     }
+    summary["store_state"] = store_state_section(  # perf plan §3.3
+        summary["store_bloat"], summary["store_layout"]
+    )
     status, errors = verdict(summary, expected_workflows=expected_workflows)
     summary["status"] = status
     summary["errors"] = errors

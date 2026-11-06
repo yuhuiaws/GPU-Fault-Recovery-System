@@ -252,10 +252,13 @@ deployment history:
 - **`steady_state`**: `store_bloat.before.gpu_fault_processor_queue.index_pages_per_live_row >= 8` (the queue indexes
   still at the high-water mark of at least one round's working set: about 19 in the failing state, about 25 in the
   aged passing state), `store_layout.mode == detached`, and **no** manual `store-maintenance` before the round (the
-  `store-compaction` job runs as usual). The runner writes only these two fields into `summary.json`, not the label:
-  the label is derived from them by this rule and the previous one and written into the formal record, never filled in
-  by judgement. A round in `inline` mode may only be labelled a comparison inside the upgrade window, never a formal
-  result of the v23 layout.
+  `store-compaction` job runs as usual). The burst, integrated and action runners derive the label from these two
+  fields by this rule and the previous one and write it as `summary.json.store_state` (`label`, the two values it was
+  derived from, the `reason`; a `steady_state` round also carries `requires`, the one condition the store cannot show --
+  no manual store-maintenance before the round -- for the formal record to confirm;
+  `regional_capacity_database.store_state_section`), never filled in by judgement; a round that meets neither rule
+  has an empty `label` and says why. A round in `inline` mode may only be labelled a comparison inside the upgrade
+  window, never a formal result of the v23 layout.
 - At least one round per label; the verdict is the `steady_state` round's; nothing may be compacted by hand between
   the two; a round without `store_bloat.before` (`recorded=false`) cannot be the record for either label.
 - Every round's `store_layout.before` / `after` give the write-layout mode and the partition count, pages and live rows
@@ -1536,7 +1539,7 @@ previous round's teardown reads in the tens (§3.2). From schema v23 `summary.js
 `store_layout` (§3.3): the `mode` (`inline`/`detached`) and, in the `before`/`after` snapshots, the partition
 counts, pages and live rows of `gpu_fault_gpu_metric_latest_clusters` and `gpu_fault_processor_replays`;
 `recorded=false` means a control plane older than v23 or a failed in-Pod snapshot. A formal record must also state the round's label
-(`optimistic_bound`/`steady_state`, §3.3) with the two values it is derived from --
+(`optimistic_bound`/`steady_state`, §3.3; `summary.json.store_state.label`) with the two values it is derived from --
 `store_bloat.before.gpu_fault_processor_queue.index_pages_per_live_row` and `store_layout.mode` -- and the
 `pg_stat_activity` sampler summary of the first two storm minutes (active statement samples, `LWLock:BufferContent`
 share, peak concurrent admission INSERTs, autovacuum share; the four data points of §3.3 were told apart by exactly

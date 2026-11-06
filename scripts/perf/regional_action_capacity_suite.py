@@ -50,6 +50,7 @@ if TYPE_CHECKING or __package__:
         postgres_counters,
         store_bloat_section,
         store_layout_section,
+        store_state_section,
         register,
         release_identity,
         scrape_cgroup,
@@ -114,6 +115,7 @@ else:
         postgres_counters,
         store_bloat_section,
         store_layout_section,
+        store_state_section,
         register,
         release_identity,
         scrape_cgroup,
@@ -1197,6 +1199,9 @@ def execute_capacity_run(
         },
         "wall_seconds": time.time() - started,
     }
+    summary["store_state"] = store_state_section(  # perf plan §3.3
+        summary["store_bloat"], summary["store_layout"]
+    )
     for name, value in (
         ("metrics-before.json", before_metrics),
         ("metrics-after.json", after_metrics),

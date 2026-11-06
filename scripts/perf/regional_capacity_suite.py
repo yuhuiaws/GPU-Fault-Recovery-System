@@ -111,6 +111,7 @@ _aurora_window = capacity_database.aurora_window
 _postgres_counters = capacity_database.postgres_counters
 store_bloat_section = capacity_database.store_bloat_section
 store_layout_section = capacity_database.store_layout_section
+store_state_section = capacity_database.store_state_section
 _processor_priority_latency = capacity_database.processor_priority_latency
 MEASUREMENT_FAILED_EXIT = capacity_database.MEASUREMENT_FAILED_EXIT
 measured_exit = capacity_database.measured_exit
@@ -921,6 +922,9 @@ def execute_case(
             # aurora_capacity_max, aurora_cpu_max and aurora_measurement.
             **aurora,
         }
+    )
+    summary["store_state"] = store_state_section(  # perf plan §3.3
+        summary["store_bloat"], summary["store_layout"]
     )
     (artifacts / "summary.json").write_text(
         json.dumps(summary, indent=1, sort_keys=True) + "\n"

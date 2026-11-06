@@ -565,6 +565,53 @@ def store_bloat_section(before: dict, after: dict) -> dict:
     }
 
 
+# The store-state labels of perf plan §3.3, decided by the store at a round's
+# start: the queue indexes' pages per live row and the write layout.
+OPTIMISTIC_MAX_INDEX_PAGES_PER_LIVE_ROW = 1.0
+OPTIMISTIC_MIN_ENTRIES_PER_PAGE = 64.0
+STEADY_MIN_INDEX_PAGES_PER_LIVE_ROW = 8.0
+STEADY_STATE_ATTESTATION = "no manual store-maintenance before the round"
+
+
+def store_state_section(store_bloat: dict, store_layout: dict) -> dict:
+    """The round's §3.3 label, derived from ``store_bloat.before`` and
+    ``store_layout.mode`` and never filled in by hand: ``optimistic_bound``
+    (compact queue indexes: an upper bound, never the formal record),
+    ``steady_state`` (queue indexes at a working set's high-water mark on the
+    detached layout; the record must also attest that no manual
+    store-maintenance ran before the round) or none, with the reason."""
+
+    queue = (store_bloat.get("before") or {}).get("gpu_fault_processor_queue") or {}
+    ratio = queue.get("index_pages_per_live_row")
+    density = queue.get("index_min_entries_per_page")
+    mode = store_layout.get("mode")
+    section: dict[str, Any] = {
+        "label": None,
+        "queue_index_pages_per_live_row": ratio,
+        "queue_index_min_entries_per_page": density,
+        "layout_mode": mode,
+    }
+    if not store_bloat.get("recorded") or not isinstance(ratio, (int, float)):
+        reason = "store_bloat.before was not recorded: no label"
+    elif ratio < OPTIMISTIC_MAX_INDEX_PAGES_PER_LIVE_ROW and (
+        density is None or density >= OPTIMISTIC_MIN_ENTRIES_PER_PAGE
+    ):
+        section["label"] = "optimistic_bound"
+        reason = "compact queue indexes: an upper bound, never the formal record"
+    elif ratio < OPTIMISTIC_MAX_INDEX_PAGES_PER_LIVE_ROW:
+        reason = "queue indexes compact by pages but sparse by entries: no label"
+    elif ratio < STEADY_MIN_INDEX_PAGES_PER_LIVE_ROW:
+        reason = "queue indexes between the two labels' bounds: no label"
+    elif mode != "detached":
+        reason = f"layout {mode}: a comparison at most, not the v23 formal record"
+    else:
+        section["label"] = "steady_state"
+        section["requires"] = STEADY_STATE_ATTESTATION
+        reason = "queue indexes at a working set's high-water mark, detached layout"
+    section["reason"] = reason
+    return section
+
+
 def processor_priority_latency(
     control_command: Callable,
     pods: list[str],
