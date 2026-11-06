@@ -226,9 +226,9 @@ Key semantics and implementation basis:
 
 ### 1.4 Version and Package Entry Points
 
-This document corresponds to `gpu-fault-control-plane 0.10.0`; notifications, the persistent registry,
-deployment identity, monitoring and retention periods were partially re-verified on **2026-09-15**;
-all other facts defer to the released source, the generated manifests and the test contracts. The package entry points are:
+This document corresponds to `gpu-fault-control-plane 0.10.0` (the `version` in `pyproject.toml`); its facts
+defer to the released source, the generated manifests and the test contracts, and the code wins where they
+disagree. The package entry points are:
 
 | Command | Entry point |
 |---|---|
@@ -253,8 +253,10 @@ all other facts defer to the released source, the generated manifests and the te
 `gpu-fault-api` is the local development entry point; its listen address is controlled by
 `GPU_FAULT_API_HOST` / `GPU_FAULT_API_PORT`. The production Deployments do not call this
 console script; they run
-`uvicorn gpu_fault.app:create_app --factory` directly, explicitly with
-`--no-proxy-headers` (the loopback identity decision relies on the directly connected peer, see §4.5). The same wheel splits, according to
+`python -m gpu_fault.app.serve gpu_fault.app:create_app --factory` (`gpu_fault.app.serve` accepts a subset
+of the uvicorn command line; every worker binds the service port itself with `SO_REUSEPORT` and so has an
+accept queue of its own), explicitly with `--no-proxy-headers` (the loopback identity decision relies on the
+directly connected peer, see §4.5). The same wheel splits, according to
 `GPU_FAULT_SERVICE_ROLE`, into three role processes, ingress/worker/spool-worker, across three Deployments;
 ports and replica counts are given in §2.18.1.
 
@@ -277,8 +279,13 @@ produce a finding only on a state **transition**.
 
 - Environment: four values, `eks/hyperpod-eks/hyperpod-slurm/kubernetes`; bare `ec2`/`slurm` are no longer legal
   values and are rejected at parse time -- no decision branch consumes them, and a value that loads but silently takes the default path is worse than a missing one.
-- RecoveryAction: no action, isolate, drain, stop/restart workload, reset, reboot, replace, diagnostics, quarantine.
-- WorkflowOperation: subdivides recovery actions into executable steps.
+- RecoveryAction: no action, mark unschedulable (`MARK_UNSCHEDULABLE`), drain, stop/restart workload, collect
+  evidence, reset, reboot, replace, EFA driver remediation, EFA/GPU device-plugin restart, diagnostics, node
+  validation, restore scheduling, quarantine, escalate to an operator (`ESCALATE_OPERATOR`); strength is compared
+  by `RECOVERY_ACTION_RANK`, ordered the same way as the operation ladder of §2.3.1.
+- WorkflowOperation: subdivides recovery actions into executable steps (35 values, defined in
+  `src/gpu_fault/operation_names.py` and re-exported by `models.py`; semantics and authorization live in
+  `src/gpu_fault/operation_registry.py`).
 - CapabilityMode: `OWN/DELEGATE/AUGMENT/OBSERVE/DISABLED`.
 - IncidentState: `DETECTED/ACTION_PENDING/SAFETY_PENDING/QUARANTINED/RECOVERED/ESCALATED`.
 
@@ -379,7 +386,8 @@ digest; v4 is the current release form, requiring `image_layout: split-v1`, plus
 the runtime/executor images each carry exactly one component and must match that wheel's `wheel_sha256`/`module_digest`;
 any missing piece is a `ReleaseError`. Relative paths of wheels/bundles in the manifest are resolved against the checkout or source
 snapshot **containing the manifest** (`containing_repository_root()` in `src/gpu_fault_release/__init__.py`, anchored on
-the two directories `deploy/control-plane/regional` and `scripts`), not against the running engine's own
+the two directories `deploy/control-plane/regional` and `scripts` plus the rollout entrypoint
+`deploy/control-plane/regional/rollout-regional-release.sh`), not against the running engine's own
 `ROOT`: join-cluster runs the engine in-process inside the operator's checkout, and if resolution followed the engine root, `VERIFIED` would
 fail to find `dist/<release-id>/` in its own tree and roll back an already successful release.
 
@@ -454,9 +462,9 @@ The SXID Catalog action mapping is as follows:
   stays blocked.
 - `20012`: mechanical connection check; `10004/10005`: cooling or thermal status check.
 
-A repeated request with the same `event_id` returns the existing decision. Cross-source correlation among Fabric Manager, kernel and DCGM requires the same node and error code, and requires an intersection when both sides carry GPU UUIDs or PCI BDFs. PCI BDFs compare as devices, not strings (`src/gpu_fault/pci_identity.py`, batch 236): the kernel NVRM line's `0000:b9:00`, the dcgm-exporter `pci_bus_id` and nvidia-smi's `00000000:B9:00.0` and the inventory collectors' lower-cased form are one device -- domain width and case do not matter, an absent domain or function matches any value; a spelling that is no address intersects only an identical string. The raw-string intersection used before never associated the kernel line and the DCGM field 230 report of one H200 XID.
+A repeated request with the same `event_id` returns the existing decision. Cross-source correlation among Fabric Manager, kernel and DCGM requires the same node and error code, and requires an intersection when both sides carry GPU UUIDs or PCI BDFs. PCI BDFs compare as devices, not strings (`src/gpu_fault/pci_identity.py`): the kernel NVRM line's `0000:b9:00`, the dcgm-exporter `pci_bus_id` and nvidia-smi's `00000000:B9:00.0` and the inventory collectors' lower-cased form are one device -- domain width and case do not matter, an absent domain or function matches any value; a spelling that is no address intersects only an identical string. A raw-string intersection would never associate the kernel line and the DCGM field 230 report of one XID.
 
-**One XID, two reports (`src/gpu_fault/policy/xid_cross_source.py`, batch 237).** The kernel NVRM line and the DCGM field 230 change of one XID are one occurrence, not two faults. Evidence: DCGM Field Identifiers, DCGM documentation "Version: 4.6 (Latest)", <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_XID_ERROR>, entry `DCGM_FI_DEV_XID_ERROR` 230 (the counters CSV writes the older name `DCGM_FI_DEV_XID_ERRORS`): "XID errors." "The value is the specific XID error"; NVIDIA dcgm-exporter 4.8.4 default counters <https://github.com/NVIDIA/dcgm-exporter/blob/4.8.4/etc/default-counters.csv>: "Value of the last XID error encountered." A change therefore reports one XID on one GPU and nothing more -- no time of its own beyond the sample, no count, no message. The kernel line and the change are twins when they carry the same XID on the same GPU (UUID, else the PCI device as above), from a compatible boot, within 120 s of each other. A twin pairs once: one change with one line and one line with one change (a report whose stored decision names its twin is taken), and more than 16 reports of one XID on one GPU around an event -- a storm -- pair nothing. A change with a free kernel twin takes the line's decode and joins its incident through `correlated_event_id`; a kernel line whose change was decided first and the same way (disposition, action, safety action, official action and pre-actions, compared after the generation fence and the site's XID 45 policy) joins the change's incident. Either way the second report is linked to the first one's incident as a duplicate observation and plans nothing, whatever that incident's workflow is doing -- pending, running, blocked or finished; a report joining a `RECOVERED` incident has its marker retired. The second report sends no FAULT_DETECTED notice of its own either: its per-XID investigatory notice takes the first report's event ID as deduplication key, so it is the first report's notice and the second report's `investigatory_notification_id` names it (batch 238). Where the decode reads the kernel line (catalog actions `XID_154`, `WORKFLOW_NVLINK_ERR` and `WORKFLOW_NVLINK5_ERR`: the recovery-action label, the XID 74 and the XID 144-150 registers) a change without a twin waits up to 120 s for its line (`PENDING_CORRELATION`); a line lost for good leaves the change's fail-closed `BLOCKED_MISSING_EVIDENCE` once that window closes, and a line arriving after it keeps its own decision beside the quarantine. A repeated identical XID leaves the gauge unchanged and arrives as kernel lines only: a line beyond the window or past an already paired change is a new occurrence with its own recovery. Before batch 237 only an XID 144-150 change followed its kernel line (batch 235) and nothing else joined the pair; outside the store's merge groups (the node group of an idle node's `RESET_GPU`/`REBOOT_NODE`, the attempt group of a job bound to the faulted GPU) the second report ran its own remediation: on a node whose job the GPU could not be bound to, a second STOP_WORKLOADS + RESET_GPU or RESTART_NODE + RESTART_WORKLOAD behind the first, or both job workflows held against each other until the busy-node timeout stopped the job with no reset; once the first remediation had finished, any second report re-ran it; an XID 154 or 74 change quarantined the node the line's own decode had just repaired. Live acceptance cannot move field 230 with a synthetic kernel line, so this path is unit-tested only ([validation limitations](../validation-limitations.md)).
+**One XID, two reports (`src/gpu_fault/policy/xid_cross_source.py`).** The kernel NVRM line and the DCGM field 230 change of one XID are one occurrence, not two faults. Evidence: DCGM Field Identifiers, DCGM documentation "Version: 4.6 (Latest)", <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_XID_ERROR>, entry `DCGM_FI_DEV_XID_ERROR` 230 (the counters CSV writes the older name `DCGM_FI_DEV_XID_ERRORS`): "XID errors." "The value is the specific XID error"; NVIDIA dcgm-exporter 4.8.4 default counters <https://github.com/NVIDIA/dcgm-exporter/blob/4.8.4/etc/default-counters.csv>: "Value of the last XID error encountered." A change therefore reports one XID on one GPU and nothing more -- no time of its own beyond the sample, no count, no message. The kernel line and the change are twins when they carry the same XID on the same GPU (UUID, else the PCI device as above), from a compatible boot, within 120 s of each other. A twin pairs once: one change with one line and one line with one change (a report whose stored decision names its twin is taken), and more than 16 reports of one XID on one GPU around an event -- a storm -- pair nothing. A change with a free kernel twin takes the line's decode and joins its incident through `correlated_event_id`; a kernel line whose change was decided first and the same way (disposition, action, safety action, official action and pre-actions, compared after the generation fence and the site's XID 45 policy) joins the change's incident. Either way the second report is linked to the first one's incident as a duplicate observation and plans nothing, whatever that incident's workflow is doing -- pending, running, blocked or finished; a report joining a `RECOVERED` incident has its marker retired. The second report sends no FAULT_DETECTED notice of its own either: its per-XID investigatory notice takes the first report's event ID as deduplication key, so it is the first report's notice and the second report's `investigatory_notification_id` names it. Where the decode reads the kernel line (catalog actions `XID_154`, `WORKFLOW_NVLINK_ERR` and `WORKFLOW_NVLINK5_ERR`: the recovery-action label, the XID 74 and the XID 144-150 registers) a change without a twin waits up to 120 s for its line (`PENDING_CORRELATION`); a line lost for good leaves the change's fail-closed `BLOCKED_MISSING_EVIDENCE` once that window closes, and a line arriving after it keeps its own decision beside the quarantine. A repeated identical XID leaves the gauge unchanged and arrives as kernel lines only: a line beyond the window or past an already paired change is a new occurrence with its own recovery. Without this pairing, outside the store's merge groups (the node group of an idle node's `RESET_GPU`/`REBOOT_NODE`, the attempt group of a job bound to the faulted GPU) the second report would run its own remediation: on a node whose job the GPU could not be bound to, a second STOP_WORKLOADS + RESET_GPU or RESTART_NODE + RESTART_WORKLOAD behind the first, or both job workflows held against each other until the busy-node timeout stopped the job with no reset; once the first remediation had finished, any second report would re-run it; an XID 154 or 74 change would quarantine the node the line's own decode had just repaired. Live acceptance cannot move field 230 with a synthetic kernel line, so this path is unit-tested only ([validation limitations](../validation-limitations.md)).
 
 At load time the NVLink catalog verifies that every pattern is 32 characters of `0/1/-` and that errorStatus is a
 hexadecimal list; a malformed catalog prevents the process from starting.
@@ -465,7 +473,9 @@ hexadecimal list; a malformed catalog prevents the process from starting.
 
 The current version adopts the constraint "one GPU node runs at most one managed training attempt at a time".
 The control plane queries the `AttemptObservation` records persisted by the Completion Watcher for `RUNNING/PENDING` attempts on the event's node within the last
-120 seconds. Only when the candidate set contains exactly one
+120 seconds (`telemetry.WorkloadTopologyService.resolve`); when the event carries a GPU UUID (an SXID: its participating GPUs)
+or a `pod_uid`/`container_id`/`host_pid`/`cgroup_path`, only attempts whose containers on that node match those identities
+remain candidates. Only when the candidate set contains exactly one
 `job-id + attempt-id` is the identity source marked
 `SOLE_ACTIVE_ATTEMPT_ON_NODE` and automatic cross-type aggregation allowed. Zero candidates are marked
 `NO_ACTIVE_MANAGED_ATTEMPT`; multiple candidates are marked `AMBIGUOUS_ACTIVE_ATTEMPTS`; neither guesses
@@ -479,16 +489,27 @@ period; every merged, not-yet-executed event refreshes the workflow's `not_befor
 `cluster_id` still has `PENDING/LEASED` processor requests, the dispatcher defers claiming the workflow;
 the fixed `aggregation_max_deadline` waits at most another
 `GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS` (default 30 seconds), after which it force-releases to avoid
-starvation caused by continuous telemetry. Other clusters and completed requests do not affect that workflow. The action priority is:
+starvation caused by continuous telemetry. Other clusters and completed requests do not affect that workflow. The action priority
+is (`recovery_rank` in parentheses):
 
 ```text
-RUN_DIAGNOSTICS < RESTART_WORKLOAD < RESET_GPU < RESET_ALL_GPUS_NVSWITCHES
-< RESTART_NODE < DRAIN/QUARANTINE < REPLACE_NODE
-< CHECK_MECHANICALS/ESCALATE_SUPPORT
+RUN_DCGM_DIAGNOSTIC = RUN_FIELD_DIAGNOSTIC = RESTART_FABRIC_MANAGER (10)
+< RESTART_EFA_DEVICE_PLUGIN = RESTART_GPU_DEVICE_PLUGIN (15) < RESTART_WORKLOAD (20)
+< RESET_GPU = RECOVER_DRAIN_P2P (30) < REMEDIATE_EFA_DRIVER (35)
+< RESET_ALL_GPUS_NVSWITCHES (40) < RESTART_NODE (50) < QUARANTINE (60)
+< REMEDIATE_DRIVER = UPDATE_SOFTWARE_FIRMWARE (70) < REPLACE_NODE (75)
+< CHECK_MECHANICALS = ESCALATE_SUPPORT (80)
 ```
 
-This ladder is the single global ordering of action strength; cross-type arbitration, workflow merging, preemption and failure escalation all use it
-for comparison, and no module keeps its own copy.
+The ladder is the `recovery_rank` of every operation in `src/gpu_fault/operation_registry.py`, collected into
+`RECOVERY_OPERATION_RANK` (evidence, mark-unschedulable, stop, validation and restore-scheduling operations rank 0); a
+workflow's rank is the highest rank among its official steps (`RecoveryArbiter.workflow_recovery_rank`). It is the single
+global ordering of workflow action strength; cross-type arbitration, workflow merging, preemption and failure escalation all
+use it for comparison, and no module keeps its own copy. The same registry's `dominates` additionally declares which weaker
+actions a stronger one covers (`RESTART_NODE` covers a GPU reset, the drain-P2P recovery, the full GPU/NVSwitch reset, a
+Fabric Manager restart, the device-plugin restarts and the EFA driver remediation; `REPLACE_NODE` covers `RESTART_NODE`, the
+driver remediation and the software/firmware update as well). The decision layer's `RecoveryAction` uses the
+`RECOVERY_ACTION_RANK` of `models.py`, ordered the same way, only to pick the strongest action within one decision.
 
 Only GPU-class `NodeHealthFinding` records that carry a metric name and whose policy source is DCGM/NVIDIA GPU Memory Error Management
 enter this fault group. Ordinary node-health findings for CPU, file system, network and so on
@@ -526,9 +547,9 @@ When `started_at` is later than the event time, the event belongs to the previou
 - Only recovery and observation decisions (`EXECUTABLE`, `MONITOR_ONLY`) are subject to this time fence. A containment or
   operator decision (`NOT_APPLICABLE`, `SITE_SAFETY`, `BLOCKED_WORKFLOW`, `BLOCKED_MISSING_EVIDENCE`) runs safety steps, not
   the official steps whose level is compared here, and no workload restart answers a quarantine, so it keeps the original
-  fail-safe handling -- the plan the same event gets inside the current attempt (batch 238). Before, such a decision was ranked
-  by official steps that never run (level 0) and judged "not an escalation": its quarantine was dropped, the incident was
-  recorded `RECOVERED` with a live marker, and the `NOT_APPLICABLE` notice then refused that state, the kernel-event route
+  fail-safe handling -- the plan the same event gets inside the current attempt. Ranked by official steps that never run
+  (level 0), such a decision would be judged "not an escalation": its quarantine would be dropped, the incident recorded
+  `RECOVERED` with a live marker, and the `NOT_APPLICABLE` notice would then refuse that state, the kernel-event route
   answering 409.
 
 This generation fence also runs on the fast-return path where the provider has already correlated the incident, so that the correlation window does not swallow
@@ -547,7 +568,10 @@ Serialization by `cluster-id + job-id` covers only two events of the same traini
 and findings reported by the host collector carry no trusted job attribution, so another layer of job-independent
 per-node exclusive serialization is needed; see 2.9.1. Both layers apply at once, and the first predecessor hit wins.
 
-This constraint does not yet support running multiple training jobs in parallel on the same GPU node. Supporting that scenario in the future requires adding the full
+The GPU filter lets an event that carries GPU identity tell apart attempts on the same node that use different GPUs; a
+node-level event without GPU or process identity is still `AMBIGUOUS_ACTIVE_ATTEMPTS` while several attempts coexist and does
+not enter cross-type aggregation. Full support for running multiple training jobs in parallel on the same GPU node still
+requires the complete
 `GPU UUID -> host PID -> cgroup/container ID -> Pod UID -> job/attempt` ownership chain;
 the node-unique attempt inference cannot continue to be used.
 
@@ -655,7 +679,7 @@ the Hopper family (H100/H200):
 The diagnostics bundle additionally includes `nvidia-smi nvlink --errorcounters` and `nvidia-smi topo --matrix`; the manifest
 stores the Link ID, bit counts, the seven registers, the decoding reason, PCI BDF, policy version and raw
 evidence reference.
-Direct support uses the fixed `xid74-support-zh-v2` mail and does not reuse the "automatic recovery chain exhausted" template.
+Direct support uses the fixed `xid74-support-zh-v3` mail and does not reuse the "automatic recovery chain exhausted" template.
 `RUN_NVLINK74_WORKFLOW` is generated when the official Field Diagnostic condition is met, carrying the Link ID,
 registers and counts; the production Runtime Profile must configure a real owner for `nvlinkDiagnostics`,
 otherwise the workflow stays safety pending. The production owner is `gpu-fault-node-agent`:
@@ -697,7 +721,7 @@ The temperature policy prefers the device limits that the collector reads via `n
 | GPU fallback warning/critical | 85/90 C |
 | HBM fallback warning/critical | 90/95 C |
 | Thermal violation consecutive escalation | 2 increasing samples |
-| PCIe replay rate warning | `>` DCGM's expected rate of the current link (31/min at Gen5 x16); `>8/min` without the link (batch 233, below) |
+| PCIe replay rate warning | `>` DCGM's expected rate of the current link (31/min at Gen5 x16); `>8/min` without the link (below) |
 | NVLink error delta critical | `>=1` |
 
 **The two scales of a temperature limit.** NVIDIA reports device temperature limits on two scales and the product never
@@ -795,7 +819,7 @@ say the current T.Limit can be more negative than the threshold without the trig
 maximum GPU temperature"). NVIDIA gives no conversion formula, so the product never derives an absolute threshold from
 something like `gpu_temp + T.Limit`; it grades on the T.Limit scale, where a breach is "at or below" (the absolute
 shutdown temperature of a T.Limit GPU below is a value the device reports; that arithmetic only checks it, it never
-produces it). The live H200
+produces it). An H200
 (driver 580.178.04: shutdown −8, slowdown −2, GPU and memory max-operating 0) warns at `gpu_tlimit_c` ≤ 3
 (max(−2 + 5, 0, 0)) and is critical at ≤ −2.
 
@@ -821,11 +845,11 @@ correlation.
 **The absolute shutdown temperature of a T.Limit GPU (`collectors/gpu/shutdown_limit.py`).** The XML prints every
 threshold either absolute or on the T.Limit scale (the DTD), so a GPU printing T.Limit thresholds never had a
 `gpu_shutdown_temperature_c`, and the one-sample absolute shutdown protection (the shutdown check of
-`temperature_decision` and the emergency of `confirm_environment_decision`) could fire on no H200. Live (HyperPod,
-4 × ml.p5en.48xlarge, 32 × H200, driver 580.178.04, NVML 13.580.178.04, DCGM 4.7.0 host engine, every GPU alike): the
+`temperature_decision` and the emergency of `confirm_environment_decision`) could fire on no H200. On H200 (driver
+580.178.04, NVML 13.580.178.04, DCGM 4.7.0 host engine), for example, the
 XML has only `gpu_temp_max_tlimit_threshold` −8 C; NVML `nvmlDeviceGetTemperatureThreshold` SHUTDOWN/SLOWDOWN/GPU_MAX/
 MEM_MAX answer 95/89/87/95; NVML fields 193/194/196/195 answer −8/−2/0/0; DCGM fields 159/158 answer 95/89; and
-`gpu_temp + gpu_temp_tlimit` is 87 (= the absolute GPU max-operating) on all 32 GPUs, so 87 − (−8) = 95: the three
+`gpu_temp + gpu_temp_tlimit` is 87 (= the absolute GPU max-operating), so 87 − (−8) = 95: the three
 sources agree.
 
 - **Source: DCGM field 159** (`DCGM_FI_DEV_SHUTDOWN_TEMP`, 4.6 name `DCGM_FI_DEV_GPU_TEMP_SHUTDOWN_CELSIUS`; both names
@@ -835,7 +859,7 @@ sources agree.
   field 159 with that legacy NVML call itself, so NVML's note binds it too ("This API is no longer the preferred
   interface ... on Ada and later architectures", support may be removed for Ada and later). It is acceptable anyway:
   the preferred `NVML_FI_DEV_TEMPERATURE_SHUTDOWN_TLIMIT` reports the T.Limit offset only (the product already grades
-  it, and NVIDIA documents no conversion); the driver the fleet runs still answers with the absolute value; the value
+  it, and NVIDIA documents no conversion); the R580 driver still answers with the absolute value; the value
   feeds one rule, the one-sample shutdown protection, never the T.Limit grading; it is published only after the
   device's own T.Limit arithmetic confirms it; and a driver that stops answering makes DCGM serve a blank sentinel the
   parser drops: nothing is published, the GPU is graded on the T.Limit scale alone, and no wrong limit appears.
@@ -845,8 +869,8 @@ sources agree.
   ("Current margin in degrees Celsius from the maximum GPU operating temperature."), and max-operating − the shutdown
   T.Limit threshold is the shutdown temperature ("The T.Limit temperature below which a GPU may shutdown."). The
   snapshot's reading and margin ride as `snapshot_gpu_temp_c`/`snapshot_gpu_tlimit_c` labels on the
-  `gpu_shutdown_tlimit_c` sample (87 on all 32 live GPUs); the tick's DCGM fields 150/153 are not used, because they
-  are sampled one by one (their `dcgmi dmon` sum was 88 on 2 of the 32) and a fast ramp (or a replayed temperature) would fail the check exactly when protection matters, while the limit does
+  `gpu_shutdown_tlimit_c` sample; the tick's DCGM fields 150/153 are not used, because they
+  are sampled one by one (under `dcgmi dmon` their sum can be 1 °C off) and a fast ramp (or a replayed temperature) would fail the check exactly when protection matters, while the limit does
   not change between ticks. A missing input (no shutdown T.Limit threshold, a snapshot reading N/A) or a mismatch
   withholds (`withheld:tlimit-input-missing` / `withheld:tlimit-mismatch`), and two names of the field disagreeing on
   one GPU are `withheld:ambiguous`: a wrong limit would `DRAIN` a healthy node on one sample, a withheld one keeps
@@ -860,17 +884,16 @@ sources agree.
   slowdown or max-operating is published (it would add a second decision). One sample at or above it is CRITICAL
   `DRAIN` (`confirmation_count` 1) with the reason "device limit DCGM_FI_DEV_SHUTDOWN_TEMP, DCGM field 159, checked
   against the GPU's T.Limit thresholds" and the DCGM field link above as `policy_reference`; the XML-sourced protection
-  is unchanged (NVML link). The live H200 is protected by one sample at ≥ 95 °C; at 94 °C its T.Limit rules grade it
+  is unchanged (NVML link). That H200 is protected by one sample at ≥ 95 °C; at 94 °C its T.Limit rules grade it
   (≤ −2 after three confirmations). An exporter without field 159, or nvidia-smi metrics mode, has no such protection:
   the field is exported, never required.
 
 **Probe and logging (`TemperatureLimitProbe` in `collectors/gpu/inventory_cadence.py`).** Thresholds on either scale
 are a success, cached for the process's lifetime; after 3 consecutive failures the retry drops to the inventory
 interval (60 s) and doubles with every further failure, capped at 3600 s; one WARNING per distinct reason, repeats are
-DEBUG, and limits found later log one INFO. Before, the fixed 60 s retry warned on every probe: the 580 T.Limit tags
-were unknown, the 60 s retry rounded up to the next 15 s tick, about one line per 64 s per node (28 per 30 minutes);
-the counter only restarted with the process (a release roll, a quiesce or reset window, a `TRIGGER_HEALTH_SNAPSHOT`
-step, which restarts the unit, a reboot), and every restart probes three times in 30 s by design.
+DEBUG, and limits found later log one INFO. The failure counter only restarts with the process (a release roll, a
+quiesce or reset window, a `TRIGGER_HEALTH_SNAPSHOT` step, which restarts the unit, a reboot), so every restart probes
+three more times within 30 s.
 
 The DCGM XID gauge only establishes a baseline on its first reading; only later value changes produce an XidEvent, and repeated identical values do not re-alert.
 row-remap uses the correctable/uncorrectable remapped-row fields; on environments such as H200 the aggregated
@@ -915,23 +938,21 @@ re-judging it), `grace_elapsed_at`, `step_cap_at` and the reason text `awaiting 
 (observed <ts>) to re-judge it; grace elapsed <ts>, step cap <ts>`. The bound on that wait is the executor's existing per-step
 cap (`GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS`, default 600 seconds; `step_bounds.bounded_waiting_outcome` fails the step with
 `past the 600s per-step cap`), no new knob. A finding still active after newer data re-judged it (its current state postdates
-the grace end) fails as before, naming the finding; a cleared one succeeds. The collector delivers edges only on confirmation
-and recovery and otherwise one health summary per node on its fixed phase every 270-330 s, so the fixed grace read one
-physical sequence two ways: on plain EKS (2026-10-26, workflows created 23:24:17.98Z) a summary landed between the confirmed
-and the recovered reads, the recovered edge was a zero delta and validation passed at 23:24:49Z; on HyperPod (2026-10-27,
-created 01:48:01.5Z) the recovered edge re-minted the finding at 01:48:32Z, the only newer batch -- the 01:49:47Z summary --
-carried a counter reset and could not re-judge it, and validation failed at the grace end, 01:50:01.6Z (51 of 60 summary
-phases inconclusive for the same data). On `FAIL/INCONCLUSIVE`, or when newer data re-judges the warning as still present
+the grace end) fails, naming the finding; a cleared one succeeds. The collector delivers edges only on confirmation
+and recovery and otherwise one health summary per node on its fixed phase every 270-330 s, so a fixed grace alone would
+read one physical sequence two ways: a summary landing between the confirmed and the recovered reads makes the recovered
+edge a zero delta and validation passes; a recovered edge that re-mints the finding, with the only newer summary inside the
+grace carrying a counter reset that cannot re-judge it, fails validation at the grace end. On `FAIL/INCONCLUSIVE`, or when newer data re-judges the warning as still present
 after the grace, the original workflow fails and idempotently escalates to `DRAIN`: mark unschedulable, stop the affected jobs, isolate the node, collect the full
 diagnostic bundle and validate the GPU. This escalation does not include `RESTORE_SCHEDULING` or `RESTART_WORKLOAD`; recovery is only possible after
 the fault clears and an administrator has handled it.
 
-A pending-repair flag is re-judged on newer data after the reset (b209). `row_remap_pending` (Ampere and later) and
+A pending-repair flag is re-judged on newer data after the reset. `row_remap_pending` (Ampere and later) and
 `retired_pages_pending` (earlier parts) mean a repair is recorded and not yet applied, and NVIDIA applies it at the next GPU
 reset, so once this workflow has reset the GPU or rebooted the node, a pending finding whose current state (the batch that
 minted or re-graded it) is not newer than that step's completion describes the GPU before the reset and cannot say whether
-the reset applied the repair. `VALIDATE_GPU` failed it at once all the same: the grace and the newer-batch wait above cover
-only the thermal / correctable-memory / power WARNING families. Now, while every blocking finding is a pending-repair flag
+the reset applied the repair. The grace and the newer-batch wait above cover only the thermal / correctable-memory / power
+WARNING families; a pending-repair flag is judged against the reset instead: while every blocking finding is a pending-repair flag
 whose current state is not newer than the completion of the last GPU reset or node reboot this workflow ran on the node
 (`RESET_GPU` -- which must have reset the finding's GPU --, `RESET_ALL_GPUS_NVSWITCHES`, `RESTART_NODE`), `VALIDATE_GPU`
 keeps `WAITING` on the same mechanism: `node_pending.<node>` carries `awaiting_newer_gpu_metrics`,
@@ -944,11 +965,10 @@ no grace: the reset, not a timer, is the barrier. The first GPU metrics batch ne
 than the reset, and the existing failure path fails it (`active_gpu_health_findings`, then the escalation ladder). Not counted
 as applying the repair: `RECOVER_DRAIN_P2P` (it resets only the GPUs whose driver recovery action asks for it and can succeed
 with `reset_skipped`), `REMEDIATE_DRIVER` / `UPDATE_SOFTWARE_FIRMWARE` (a site-configured command the product cannot see
-reset the GPU) and `REPLACE_NODE` (other hardware); with no reset in the workflow the flag fails at once as before -- nothing
-short of a reset applies the repair. The gap was latent: found by code reading during the GF-GENERAL-LIVE-024 analysis,
-never seen live. The freshness gates in front of the finding check (the GPU_METRICS collector status and every targeted
+reset the GPU) and `REPLACE_NODE` (other hardware); with no reset in the workflow the flag fails at once -- nothing
+short of a reset applies the repair. The rule closes a latent gap found by code reading and never seen live: the freshness gates in front of the finding check (the GPU_METRICS collector status and every targeted
 GPU's metric presence must postdate the reset) already wait while the latest batch is still the pre-reset one, and the
-collector delivers whole scrapes, so it does not bite today; it bites whenever post-reset GPU data passes those gates
+collector delivers whole scrapes, so it does not usually bite; it bites whenever post-reset GPU data passes those gates
 without re-judging the flag (a scrape without the flag's field, the post-reset batch's finding-state write not visible yet,
 a caller of the finding check alone). HyperPod and plain EKS nodes run the same DCGM collector and the same `RESET_GPU` node
 action, so the behaviour is the same on both. Implementation: `src/gpu_fault/adapters/pending_repair_rejudge.py`; tests:
@@ -982,7 +1002,7 @@ with no large-model call:
 
 The Agent always grades by the cluster's declared DCGM mode (`GPU_FAULT_DCGM_HOSTENGINE`, from the node-group label `gpu-fault.io/dcgm-hostengine`), never by a per-node guess; the node preflight records every GPU node's DCGM state (`not-installed`, `installed-inactive`, `host-active`, `cuda-mismatch`, `host-failed`, `unmanaged-hostengine`) in the `dcgm` object of its verdict, accepts only `host-active` in host mode and in embedded mode refuses a host hostengine next to the exporter's embedded one (running, active/activating or enabled); a HyperPod node is always host mode, refused when one of the four engine checks (`dcgmi`, `nv-hostengine`, an active `nvidia-dcgm`, `dcgmi discovery -l`) fails, while a CUDA flavor mismatch or a foreign nv-hostengine only warns. The declaration is re-read by every deploy, by one of an unchanged source before its NOOP shortcut too (`admin/dcgm_declaration.py`, sharing the node group reads with discovery), and `status`/`node-scope` show a declaration that differs from the `site.yaml` record as the next deploy; the release diff probes the mode the renders actually run from the exporter DaemonSet's annotation (or environment) and the reconciler's `GPU_FAULT_DCGM_HOSTENGINE` (`dcgm_hostengine_drift`), the `gpu_cluster:<id>` check fails on a live mode that disagrees with the record, and `sync-state` records `dcgm_hostengines_sha256` from the mode the exporters run; a node preflight refusal comes from the preflight batch's per-node report (`GPU_FAULT_NODE_PREFLIGHT_REPORT`), one line of whole reasons per failed node, and every node's DCGM state is recorded in the release state on a refusal too; the rollback alignment restores a refused mode to the one the rolled-back release ran.
 
-A release that changes only the node configuration still rolls through the Agent waves (`regional_release_node_identity.py`). The fleet deployment calls a node READY when its Agent's heartbeat reports the nine-field identity (protocol, version, artifact, compatibility digest, bundle, template, policy, Runtime Profile, config digest), and only the nodes that are not READY get a wave (the one-node canary, the wave safety gate and lease, the failure-domain cap, the per-wave convergence wait); the node installer reconciler re-installs a node whose installer identity on its annotations differs from its own, and that identity also holds an `eks-managed` cluster's DCGM mode (`gpu-fault.io/installer-dcgm-hostengine`). None of the nine heartbeat fields moved with the mode (the template identity was the digest of the node template's source files, `node_template_inputs`, and the Agent config digest leaves the mode out by design), so a release that only flipped the mode opened a fleet deployment that was `SUCCEEDED` before its first wave, skipped every wave, and the steady-state reconciler that followed (`*`) re-installed every Agent of the cluster at once at the policy's `max_unavailable`: no canary, no wave safety gate, no failure-domain cap, only one steady-state convergence wait. The installer template identity the release hands the reconciler (`GPU_FAULT_INSTALLER_TEMPLATE_SHA256`) is therefore the source digest folded with the cluster's node configuration: `sha256("<source digest>:dcgm-hostengine:host")` in host mode (the reconciler's own Job-name suffix rule), the source digest byte for byte for HyperPod, the embedded engine and every cluster rendered before the mode existed. The reconciler stamps it on the node, the installer writes it into the Agent environment (`GPU_FAULT_NODE_INSTALLER_TEMPLATE_SHA256`), the heartbeat reports it and the fleet compares it: a mode change leaves those nodes `PENDING` when the deployment is created and rolls them through the Agent waves like any other node change, in both directions and in a rollback; nothing on the wire, in the control plane or in a stored record changes. The release state's `node_template_sha256` stays the source digest; a caller that holds only that digest (the node-key activation) accepts the folded identity by the mode the node itself records (`installed_template_matches`). Host-mode Agents installed before the fold still report the source digest and are re-installed once in the Agent waves of the next release that touches the reconciler or the Agents: a release that re-deploys only the reconciler, without the Agent waves (an executor, image or node-scope change), over installed nodes whose installer identity (artifact, Agent config digest, bundle, template identity: the fields their Agents report) differs from the release's gets `node_installer_identity_drift` from the release diff and plans the Agent waves instead of handing those nodes to the reconciler's `*`. The installer version the reconciler renders the installer Job and its node identity (`gpu-fault.io/installer-version`) with, `GPU_FAULT_VERSION`, comes from the bundle the release rolls as well (the candidate's bundle file, for a rollback the bundle key the snapshot captured): a value exported in the deploy host's shell never reaches the node identity.
+A release that changes only the node configuration still rolls through the Agent waves (`regional_release_node_identity.py`). The fleet deployment calls a node READY when its Agent's heartbeat reports the nine-field identity (protocol, version, artifact, compatibility digest, bundle, template, policy, Runtime Profile, config digest), and only the nodes that are not READY get a wave (the one-node canary, the wave safety gate and lease, the failure-domain cap, the per-wave convergence wait); the node installer reconciler re-installs a node whose installer identity on its annotations differs from its own, and that identity also holds an `eks-managed` cluster's DCGM mode (`gpu-fault.io/installer-dcgm-hostengine`). None of the nine heartbeat fields moves with the mode by itself (the template identity is the digest of the node template's source files, `node_template_inputs`, and the Agent config digest leaves the mode out by design); left alone, a release that only flipped the mode would open a fleet deployment that is `SUCCEEDED` before its first wave, skip every wave, and the steady-state reconciler that follows (`*`) would re-install every Agent of the cluster at once at the policy's `max_unavailable`: no canary, no wave safety gate, no failure-domain cap, only one steady-state convergence wait. The installer template identity the release hands the reconciler (`GPU_FAULT_INSTALLER_TEMPLATE_SHA256`) is therefore the source digest folded with the cluster's node configuration: `sha256("<source digest>:dcgm-hostengine:host")` in host mode (the reconciler's own Job-name suffix rule), the source digest byte for byte for HyperPod, the embedded engine and every cluster rendered before the mode existed. The reconciler stamps it on the node, the installer writes it into the Agent environment (`GPU_FAULT_NODE_INSTALLER_TEMPLATE_SHA256`), the heartbeat reports it and the fleet compares it: a mode change leaves those nodes `PENDING` when the deployment is created and rolls them through the Agent waves like any other node change, in both directions and in a rollback; nothing on the wire, in the control plane or in a stored record changes. The release state's `node_template_sha256` stays the source digest; a caller that holds only that digest (the node-key activation) accepts the folded identity by the mode the node itself records (`installed_template_matches`). Host-mode Agents installed before the fold still report the source digest and are re-installed once in the Agent waves of the next release that touches the reconciler or the Agents: a release that re-deploys only the reconciler, without the Agent waves (an executor, image or node-scope change), over installed nodes whose installer identity (artifact, Agent config digest, bundle, template identity: the fields their Agents report) differs from the release's gets `node_installer_identity_drift` from the release diff and plans the Agent waves instead of handing those nodes to the reconciler's `*`. The installer version the reconciler renders the installer Job and its node identity (`gpu-fault.io/installer-version`) with, `GPU_FAULT_VERSION`, comes from the bundle the release rolls as well (the candidate's bundle file, for a rollback the bundle key the snapshot captured): a value exported in the deploy host's shell never reaches the node identity.
 
 In host mode (eks host mode and HyperPod), when `dcgmi diag` reaches no engine (226 or the connection error text, or any failure without JSON while the unit is down), the Agent recovers once before grading (`operations/hostengine_recovery.py`): a unit that is `inactive`/`failed` and enabled gets `systemctl reset-failed` (failed only) and `systemctl start nvidia-dcgm`, `activating` is only waited for; an `active` engine is never restarted, nothing is started while any quiesce window is open on the node (`GpuActivityGate.open_windows`, the diagnostic's own incident's included), packages are never installed and embedded mode is never touched; then a wait of at most 30 s for `dcgmi discovery -l`, one more diagnostic when it answers, otherwise the unchanged grading; the evidence is the result's `hostengine_recovery`. Every Agent's heartbeat reports `nvidia-dcgm` in its unit map (`collector_services`, which has always taken any unit under the signature), the record keeps it (`collector_requirements.RECORDED_UNITS`) and `status --full` shows it live through the `control_api` check's `dcgm_hostengine_live`; an older control plane verifies and drops the entry, an older Agent has none -- no protocol version change. The heartbeat also carries the running engine's version (`dcgm_versions.py`): while `nvidia-dcgm` is active the Agent reads the "Hostengine build info" of `dcgmi -v` when the engine has just become active and on every enablement refresh tick (every 30th heartbeat) and reports one more entry, `nvidia-dcgm/version=<v>`, which the record keeps by shape, exactly one (`collector_requirements.RECORDED_UNIT_SHAPES`), and the node preflight puts the same reading in its verdict's `dcgm.version`; in host mode the release and `status --full` compare it with the DCGM half of the exporter's image tag (the client library version, currently 4.6.1; `paired`/`client-newer`/`host-newer`/`unknown`) -- NVIDIA requires the client to be at least the host engine, so a newer engine gets a release `WARN` and a `status --full` header line and an older one is listed in `unpaired_nodes` -- all advisory: no verdict, `healthy` or exit code changes.
 
@@ -991,9 +1011,8 @@ returned by the Node Agent, together with the control-plane action, are written 
 store both the evidence URI and the fixed guidance. Each diagnostic also generates one idempotent
 `dcgm-diagnostic-zh-v2` mail whose fields come entirely from the structured result and the rule table above.
 
-**The DCGM field audit's fields (batch 233; `src/gpu_fault/gpu_field_rules.py`).** The 2026-11-01 DCGM field audit compared what
-DCGM 4.7.0 serves on the live H200 nodes (driver 580.178.04, both clusters) with the bundled counters and found fault evidence
-nothing exported. The fields below are now in `deploy/dataplane/dcgm-counters.csv` and `DCGM_METRICS`, each exported and never
+**The DCGM field audit's fields (`src/gpu_fault/gpu_field_rules.py`).** A DCGM field audit compared what DCGM 4.7.0 serves on
+H200 nodes (driver 580.178.04) with the bundled counters and found fault evidence nothing exported. The fields below are therefore in `deploy/dataplane/dcgm-counters.csv` and `DCGM_METRICS`, each exported and never
 required: an exporter that does not serve one leaves its rule silent and raises no completeness error. The CSV keeps the DCGM
 4.5.3 names; the collector also reads the DCGM 4.6 names and collapses an identical pair into one observation
 (`DCGM_ENVIRONMENT_ALIASES`). Every CSV name resolves in the pinned exporter's go-dcgm `v1.4611.2` (`pkg/dcgm/const_fields.go`,
@@ -1010,7 +1029,7 @@ this subsection is unit-tested from NVIDIA documentation, not live-verified (no 
 | 235/236 `DCGM_FI_DEV_PCIE_MAX_LINK_GEN`/`_WIDTH`, 237/238 `DCGM_FI_DEV_PCIE_LINK_GEN`/`_WIDTH` | `pcie_link_gen_max`, `pcie_link_width_max`, `pcie_link_gen_current`, `pcie_link_width_current`; the collector's verdict `pcie_link_downtrain` | the gauges are no edges (an idle GPU may downshift); the verdict is a breached state | downtrain under load → WARNING `RUN_DIAGNOSTICS` (`SITE_PCIE_LINK_DOWNTRAIN`); still downtrained after a GPU reset or reboot → WARNING `ESCALATE_OPERATOR`; a `PCIE_XID_LINK_FAILURE` component |
 | 346 `DCGM_FI_DEV_THRESHOLD_SRM` | `sram_threshold_exceeded` | state edge `sram-threshold-changed` | 1 → CRITICAL `DRAIN`, official `RUN_FIELD_DIAGNOSTIC_FOR_RMA` (Ampere and later; another part `QUARANTINE`, `REVIEW_GPU_ARCHITECTURE`), the `row_remap_failure` path including its `memoryDiagnostics: OBSERVE` containment prefix |
 | 388/389 `DCGM_FI_DEV_BANKS_REMAP_ROWS_AVAIL_LOW`/`_NONE` | `row_remap_banks_low`, `row_remap_banks_none` | state edge `row-remap-headroom-changed` | 389 > 0 → WARNING `RUN_DIAGNOSTICS` plus an operator notice, no automatic hardware action; 388 is context |
-| 393 (exported before) | `row_remap_uncorrectable_total` | counter | ≥ 512 without a new increment → WARNING `RUN_DIAGNOSTICS` (`NVIDIA_DCGM_ROW_REMAP_LIMIT`); a new increment keeps its delta verdict |
+| 393 (an existing counter) | `row_remap_uncorrectable_total` | counter | ≥ 512 without a new increment → WARNING `RUN_DIAGNOSTICS` (`NVIDIA_DCGM_ROW_REMAP_LIMIT`); a new increment keeps its delta verdict |
 | 1423 `DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_THERM_SLOWDOWN_NS` | `hw_thermal_slowdown_violation_total_us` | duty-cycle counter (ns → µs) | graded as field 241's thermal limiting time; a `THERMAL_STRESS` signal |
 | 1424 `DCGM_FI_DEV_CLOCKS_EVENT_REASON_HW_POWER_BRAKE_SLOWDOWN_NS` | `hw_power_brake_violation_total_us` | delivered every tick while brake time accrues | duty > 0 → WARNING `RUN_DIAGNOSTICS`; ≥ 1 % in two consecutive samples, or beside clock-event bit 0x80 → the brake's CRITICAL `DRAIN` (`NVIDIA_HW_POWER_BRAKE`, official `CONTACT_SUPPORT`) |
 | 300/301 `DCGM_FI_DEV_ECC_CURRENT`/`_PENDING` | `ecc_mode_current`, `ecc_mode_pending` | state edge `ecc-mode-changed` | current 0 → WARNING `ESCALATE_OPERATOR` (the memory rules are blind), official `ENABLE_ECC_AND_REBOOT`; pending ≠ current → WARNING `ESCALATE_OPERATOR`, official `REVIEW_ECC_MODE_CHANGE` |
@@ -1068,7 +1087,7 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   maximum in this collector process (it never outlives a boot, and a quiesce or reset window stops it) publish
   `pcie_link_downtrain` = 1, a valid sample at the maximum publishes 0, an idle or incomplete sample carries the verdict. The
   maximum is the device and system one, never a fleet constant: a platform that offers Gen4 to a Gen5 GPU is no downtrain, and
-  a Gen6 link (DGX B300) is full only at Gen6. P-state is not a load signal: the live H200s report P0 at 0 % utilization. A
+  a Gen6 link (DGX B300) is full only at Gen6. P-state is not a load signal: H200s report P0 at 0 % utilization. A
   downtrain already active that outlived a completed RESET_GPU naming the GPU, a full GPU + NVSwitch reset or a reboot since it
   was last judged → `ESCALATE_OPERATOR`, official `RECONNECT_PCIE_AND_RUN_FIELD_DIAGNOSTIC` (DCGM v4.7.0
   `DCGM_FR_PCI_REPLAY_RATE_NEXT`: "Reconnect PCIe card. Run system side PCIE diagnostic utilities to verify hops off the GPU
@@ -1082,7 +1101,7 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   "Introduction to NVIDIA DGX B300" › "Key Enhancements Over Previous DGX Systems"
   <https://docs.nvidia.com/dgx/dgxb300-user-guide/introduction-to-dgxb300.html#key-enhancements-over-previous-dgx-systems>:
   "ConnectX-8 networking connects directly to GPUs via PCIe Gen6."
-- **PCIe replay threshold (202, decision 3a).** NVIDIA's documentation states one figure, from the Gen3 era: DCGM Feature
+- **PCIe replay threshold (202).** NVIDIA's documentation states one figure, from the Gen3 era: DCGM Feature
   Overview (docs 4.6), "Background Health Checks" › "Failure Conditions"
   <https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#background-health-checks>: "There were more
   than 8 PCIe replays in the last minute."; DCGM Diagnostics (docs 4.6), PCIe plugin parameter `max_pcie_replays`
@@ -1097,11 +1116,11 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   "Cap the version at the max we know about."), and `MonitorPcie` warns "Detected more than %u PCIe replays per minute"
   (`DCGM_FR_PCI_REPLAY_RATE_MSG`). Gen3 x16 gives exactly the documented 8. The product uses that formula
   (`gpu_pcie_link_policy.expected_pcie_error_rate`): with the current link in the scrape the threshold is DCGM's rate for it
-  (`NVIDIA_DCGM_REPLAY_RATE_FOR_LINK`: 31/min at Gen5 x16 -- the live H200 -- 62/min at Gen6 x16, 16/min at Gen4 x16), without
+  (`NVIDIA_DCGM_REPLAY_RATE_FOR_LINK`: 31/min at Gen5 x16 (H200), 62/min at Gen6 x16, 16/min at Gen4 x16), without
   it the documented 8/min (`NVIDIA_DCGM_DOCUMENTED_REPLAY_RATE`; DCGM itself then decides nothing), and a configured
   `GPU_FAULT_PCIE_REPLAY_RATE_WARNING_PER_MINUTE` other than 8 still wins (`SITE_CONFIGURED_REPLAY_RATE`). The finding records
-  the threshold in `threshold_value`/`threshold_source`; the reason text is unchanged. Live consequence: on the H200 sites
-  (Gen5 x16) a replay rate between 8 and 31/min no longer warns.
+  the threshold in `threshold_value`/`threshold_source`. A replay rate between 8 and 31/min therefore does not warn on a
+  Gen5 x16 link (such as H200).
 - **PCIe correctable errors (1501).** Graded by rate only, never on any change: occasional correctable errors are normal and the
   counter restarts with a GPU reset. NVIDIA documents no health threshold for it (NVML
   <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html#c.NVML_FI_DEV_PCIE_COUNT_CORRECTABLE_ERRORS>:
@@ -1118,7 +1137,7 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   baseline and the health summaries the collector delivers the field only while its rate between consecutive readings is above
   R; the control plane grades a rate above R in two consecutive windows WARNING `RUN_DIAGNOSTICS` (`SITE_PCIE_CORRECTABLE_RATE`),
   the first window evidence only. A confirmed
-  rate is a `PCIE_XID_LINK_FAILURE` component. Live: 0 on every H200, and the guest has no sysfs AER file for the GPU, so DCGM
+  rate is a `PCIE_XID_LINK_FAILURE` component. An H200 guest has no sysfs AER file for the GPU, so DCGM
   is the only source.
 - **SRAM threshold (346).** NVIDIA GPU Memory Error Management (docs version 615), "RMA Policy" › "GPU L2 Memory RMA Policy"
   <https://docs.nvidia.com/deploy/a100-gpu-mem-error-mgmt/rma-policy-thresholds-for-row-remapping.html#gpu-l2-memory-rma-policy>:
@@ -1127,7 +1146,7 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   an RMA criterion the field diagnostic decides, so the flag takes `row_remap_failure`'s path in `memory_decision`: CRITICAL
   `DRAIN`, official `RUN_FIELD_DIAGNOSTIC_FOR_RMA` on the Ampere-and-later set, `QUARANTINE` with `REVIEW_GPU_ARCHITECTURE` on
   any other part; under `memoryDiagnostics: OBSERVE` the containment prefix (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE
-  → COLLECT_DIAGNOSTIC_BUNDLE) runs before the block (b192).
+  → COLLECT_DIAGNOSTIC_BUNDLE) runs before the block.
 - **Remap headroom (388/389) and the 393 limit.** nvidia-smi documentation, "Row Remapper" › "Bank Remap Availability
   Histogram": "Maximum availability means that all reserved rows are available for remapping while None means that no reserved
   rows are available."; DCGM Field Identifiers (docs 4.6), `DCGM_FI_DEV_BANK_REMAP_AVAIL_NONE 389`: "Historical marker of
@@ -1161,7 +1180,7 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   v4.7.0 `sdk/nvidia/nvml/dcgm_nvml.h` reads them as NVML fields 270/271, the numbering of NVML v580 ("Changes between v575 and
   v580": "Adjusted NVML_FI_DEV_CLOCKS_EVENT_REASON_* and NVML_FI_DEV_POWER_SYNC_BALANCING_* field value numbering to resolve
   overlap with NVML_FI_PWR_SMOOTHING_* field values."), so a driver 580 host reads the right counter. That the counters are
-  cumulative is NVIDIA's wording, not a live observation (0 on every idle H200); the grading fails safe: a decrease is a counter
+  cumulative is NVIDIA's wording, not confirmed by a hardware reading (0 on every idle H200); the grading fails safe: a decrease is a counter
   reset and grades nothing, a duty above 105 % is no duration and grades nothing. 1423 is graded as the thermal violation time
   (241) is (`thermal_duration_decision`) and feeds `THERMAL_STRESS`; 1424 brake time > 0 is WARNING `RUN_DIAGNOSTICS`
   (`NVIDIA_HW_POWER_BRAKE_DURATION`), ≥ 1 % of two consecutive samples (≤ 60 s apart) or any brake time beside bit 0x80 in the
@@ -1172,7 +1191,7 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   "Requires ECC Mode to be enabled." -- with ECC off every memory rule is blind, so current = 0 is WARNING `ESCALATE_OPERATOR`
   (`NVIDIA_ECC_MODE_DISABLED`); `nvmlDeviceGetEccMode`: "Changing ECC modes requires a reboot. The “pending” ECC mode refers to
   the target mode following the next reboot." -- pending ≠ current is WARNING `ESCALATE_OPERATOR` (`NVIDIA_ECC_MODE_PENDING`):
-  the mode changes at the next reboot. Live: 1/1 on every H200.
+  the mode changes at the next reboot.
 - **InfoROM validity.** DCGM field 84 (`DCGM_FI_DEV_INFOROM_CONFIG_VALID`) "Reads the infoROM from the flash and verifies the
   checksums." on every watch, so it stays out of the per-tick counters; the collector reads the same check once per inventory
   interval (60 s by default) with `nvidia-smi --query-gpu=index,pci.bus_id,uuid,inforom.checksum_validation
@@ -1183,9 +1202,9 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   InfoROM to clear this corruption."), and the finding says the GPU's memory-repair evidence is untrusted: Dynamic Page
   Retirement (docs 615), "Implementation"
   <https://docs.nvidia.com/deploy/dynamic-page-retirement/implementation.html#implementation>: "These addresses are stored in
-  the InfoROM." Like every batch-233 field it is read in the DCGM exporter mode only; the nvidia-smi metrics mode carries none
+  the InfoROM." Like every field of this paragraph it is read in the DCGM exporter mode only; the nvidia-smi metrics mode carries none
   of them.
-- **Clock-event bit 0x08 alone (decision 3c): not graded.** nvidia-smi documentation, "Clocks Event Reasons" › "HW Slowdown":
+- **Clock-event bit 0x08 alone: not graded.** nvidia-smi documentation, "Clocks Event Reasons" › "HW Slowdown":
   "This option will be removed a future CUDA release. HW Slowdown is engaged, reducing the core clocks by a factor of 2 or more.
   It is active if either HW Thermal Slowdown or HW Power Brake are active." -- 0x08 is the OR of 0x40 (graded with 0x20 as
   thermal limiting, now also by field 1423's duration) and 0x80 (the brake DRAIN, now also by field 1424's duration). NVML
@@ -1199,29 +1218,29 @@ one cordons first (FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → ESCALATE_SUPPORT).
   "The board limit (operating) policy is currently limiting the GPU clocks." and `nvmlClocksEventReasonReliability` "The
   reliability policy is currently limiting the GPU clocks." (values 0x200 and 0x400 from `nvidia-ml-py` 13.615.71); an unknown
   bit neither grades nor hides the bits the product names.
-- **Not added.** 174/175 (NVLink fabric health) are NOT_SUPPORTED on H200 with driver 580 (live 0/0, XML N/A) and graded since
-  batch 235 for the NVL5 parts that report them (below); 1508 (per-link
-  NVLink state) is served live (18/18 ACTIVE) but the exporter's link-entity emission and the parser keys need a staging check
-  and it costs 144 series per node, so it is deferred; 158 is the T.Limit critical boundary again (live 87 − (−2) = 89, b232);
+- **Not added.** 174/175 (NVLink fabric health) are NOT_SUPPORTED on H200 with driver 580 (read 0/0, XML N/A) and graded
+  only for the NVL5 parts that report them (below); 1508 (per-link
+  NVLink state) is readable on H200 but the exporter's link-entity emission and the parser keys need a staging check
+  and it costs 144 series per node, so it is deferred; 158 is the T.Limit critical boundary again (87 − (−2) = 89 on H200);
   profiling fields stay out ("collection of profiling metrics with DCGM will conflict with usage of other developer tools from
   NVIDIA such as Nsight Systems or Nsight Compute", DCGM Feature Overview, docs 4.6); NVSwitch-entity fields stay out because
   the SXID lines carry the same faults in more detail. The Blackwell fields (the NVLink5 counters, NVLink ECC 1220, 174/175,
-  unrepairable memory 1507) are batch 235's (below); adding a field is a CSV row, a
+  unrepairable memory 1507) follow in the next paragraph; adding a field is a CSV row, a
   `DCGM_METRICS` entry, a branch of `gpu_field_rules.field_rule_decision` (or the policy module it names) and a pin row.
   Tests: `tests/metrics/test_dcgm_gap_field_rules.py`, `tests/collectors/test_dcgm_gap_field_edges.py`,
   `tests/orchestration/test_dcgm_gap_field_plans.py`, `tests/execution/test_validation_gpu_recovery_action.py`,
   `tests/regional/test_dataplane_dcgm_counters.py`, and the evidence pins in `tests/test_dcgm_gap_field_evidence.py`.
 
-**HGX B200/B300 DCGM fields (batch 235; `src/gpu_fault/gpu_nvlink5_policy.py`, `src/gpu_fault/gpu_fabric_health.py`,
-`src/gpu_fault/gpu_memory_repair_policy.py`).** The 2026-11-01 Blackwell field audit re-judged every DCGM field for HGX
-B200/B300 (`p6-b200.48xlarge`, `p6-b300.48xlarge`; driver R580, DCGM 4.7.0) and found a blocker: NVML does not report the
-NVLink data-link counters on Blackwell, so a B-series node could never satisfy the required NVLink fields -- a permanent
+**HGX B200/B300 DCGM fields (`src/gpu_fault/gpu_nvlink5_policy.py`, `src/gpu_fault/gpu_fabric_health.py`,
+`src/gpu_fault/gpu_memory_repair_policy.py`).** A Blackwell field audit that re-judged every DCGM field for HGX
+B200/B300 (`p6-b200.48xlarge`, `p6-b300.48xlarge`; driver R580, DCGM 4.7.0) found a blocker: NVML does not report the
+NVLink data-link counters on Blackwell, so on those counters alone a B-series node could never satisfy the required NVLink fields -- a permanent
 `dcgm_field_completeness` finding, `RUN_DIAGNOSTICS` after 180 s, every VALIDATE_GPU refused on `active_gpu_health_findings`,
 VALIDATE_FABRIC waiting for `missing_fabric_metric_groups` until its cap, and the legacy deploy's endpoint probe calling the
-exporter incompatible. The fields below are now in `deploy/dataplane/dcgm-counters.csv` (the DCGM 4.5.3 names that go-dcgm
+exporter incompatible. The fields below are therefore in `deploy/dataplane/dcgm-counters.csv` (the DCGM 4.5.3 names that go-dcgm
 `v1.4611.2` resolves through its legacy map; field 175 has only its DCGM 4.6 name) and in `DCGM_METRICS` under both names;
-each is exported and never required. A Hopper part reports none of the NVLink5 fields, and the live H200 reads 0/0
-(NOT_SUPPORTED) for 174/175 and `No` for the repair flags, so an H200 node grades exactly as before. **Blackwell (B200/B300):
+each is exported and never required. A Hopper part reports none of the NVLink5 fields, and an H200 reads 0/0
+(NOT_SUPPORTED) for 174/175 and `No` for the repair flags, so these rules do not change how an H200 node grades. **Blackwell (B200/B300):
 every rule in this subsection is unit-tested from NVIDIA documentation, not live-verified (no B-series hardware).** B-series
 nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deployment-and-operations-manual.md)).
 
@@ -1278,7 +1297,7 @@ nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deploy
   difference: the aggregate sums the active ports, DCGM Feature Overview (docs 4.6), "NVLink COUNT Fields"
   <https://docs.nvidia.com/datacenter/dcgm/latest/user-guide/feature-overview.html#nvlink-count-fields>: "Aggregate (GPU entity) —
   returns the sum across all active NVLink ports on a GPU.", so a link that left the active set lowers it. The healthy-link
-  baseline is NVIDIA's "(should be 0)", not a live observation; should a healthy B-series node show these counters moving, the
+  baseline is NVIDIA's "(should be 0)", not observed on hardware; should a healthy B-series node show these counters moving, the
   rule must move to rates. Not graded and not exported: the BER readings 1215-1218 -- DCGM Release Notes 4.7.0, "Bug Fixes" ›
   "Active health checks (dcgmi diag)" <https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html>: "Removed
   NVLink bit-error-rate thresholds that caused false health and diagnostic failures on healthy GB200 systems." -- and the FEC
@@ -1297,13 +1316,13 @@ nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deploy
   (`gpu_nvlink5_policy.nvlink_component`); the link-recovery trio counts as one error class (`nvlink_class`: one recovery
   increments 1211 or 1212 *and* 1213), an evidence-only finding is no component, and a CRITICAL `DRAIN` component (1212) makes
   the composite CRITICAL `DRAIN` (`nvlink_composite_grade`) -- a composite suppresses its components' own incidents, so a WARNING
-  one must never swallow a failed link recovery. With Hopper components the composites are graded exactly as before.
+  one must never swallow a failed link recovery. With Hopper components the composite grading is unaffected.
 - **DCGM field 230 and the kernel line (`src/gpu_fault/policy/xid_cross_source.py`).** The last-XID gauge carries no registers, so an
-  XID 144-150 read from it alone is `BLOCKED_MISSING_EVIDENCE`, and before batch 235 it opened a second, BLOCKED incident beside
+  XID 144-150 read from it alone is `BLOCKED_MISSING_EVIDENCE`, and unpaired with its kernel line it would open a second, BLOCKED incident beside
   the kernel-sourced one of the same fault (marker association alone never merges two executions). A gauge change whose kernel
   twin -- the same XID on the same GPU (UUID, else the PCI device in either spelling), read from the kernel log within 120 s --
-  is among the correlation candidates takes the twin's decode and joins its incident through `correlated_event_id`. Batch 237
-  made this the rule of every XID in both arrival orders (2.3): a change that arrives first waits up to 120 s for its line,
+  is among the correlation candidates takes the twin's decode and joins its incident through `correlated_event_id`. This
+  is the rule of every XID in both arrival orders (2.3): a change that arrives first waits up to 120 s for its line,
   and without one it stays fail-closed BLOCKED.
 - **Fabric health (174/175, `gpu_fabric_health`).** The decode is NVML's layout, NVML API Reference (docs version 615), "Fabric
   Definitions" <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFabricDefs.html> ("Fabric Health Mask: Route is
@@ -1334,8 +1353,8 @@ nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deploy
   VALIDATE_GPU (`fabric_validation`) requires every graded GPU's summary to be HEALTHY or NOT_SUPPORTED:
   `nvlink_fabric_health_not_healthy(<gpu>=<summary> [nvidia-smi ...])`, reported with a Fabric Manager failure when both apply.
   The second source is the nvidia-smi XML `<fabric><health>` sub-tags (`summary`, `bandwidth`, `route_recovery_in_progress`,
-  `route_unhealthy`, `access_timeout_recovery`, `incorrect_configuration`, `partition_assigned`; live H200 R580 XML lines 298-312,
-  all `N/A`), read at the inventory cadence and published as `fabric_health_xml` (nothing while every tag is `N/A`) -- evidence
+  `route_unhealthy`, `access_timeout_recovery`, `incorrect_configuration`, `partition_assigned`; all `N/A`
+  in the H200 R580 XML), read at the inventory cadence and published as `fabric_health_xml` (nothing while every tag is `N/A`) -- evidence
   in the reason and the validation text, never a grade; nvidia-smi documentation (the v610-era page), "Fabric" › "Health"
   <https://docs.nvidia.com/deploy/nvidia-smi/index.html>: "Summary - Summary of Fabric Health <Healthy, Unhealthy, Limited
   Capacity>" and "Route Unhealthy - is NVLink route recovery failed or aborted <True/False>".
@@ -1349,17 +1368,17 @@ nodes should run the DCGM host engine 4.7.0 or later ([deployment manual](deploy
   "Indicates if a TPC repair is pending" and "Indicates if there is unrepairable memory"; its change log, "Changes between
   nvidia-smi v580 Update and v575": "Added Channel/TPC repair pending flags to ECC field: 'nvidia-smi -q -d ECC'". The DCGM
   collector reads `<channel_repair_pending>`, `<tpc_repair_pending>` and `<unrepairable_memory>` from `nvidia-smi -q -x` once
-  per inventory interval (the tag names are the live H200 R580 output, XML lines 194-196 of the per-GPU memory section, all `No`;
+  per inventory interval (the tag names are those of the H200 R580 output, all `No` in the per-GPU memory section;
   the parser finds them by name): `Yes` 1, `No` 0, `N/A` or a missing tag nothing; a failed query keeps nothing. A pending
   channel or TPC repair with field 1523 None (or not reported) is WARNING `ESCALATE_OPERATOR`, official
   `REBOOT_IN_SERVICE_WINDOW` (FREEZE_EVIDENCE → ESCALATE_SUPPORT), a persistent advisory that VALIDATE_GPU does not fail on;
-  with 1523 not None it is evidence only and batch 233's 1523 rule decides (e.g. 2 → the `REBOOT_NODE` path). The unrepairable
+  with 1523 not None it is evidence only and the 1523 rule above decides (e.g. 2 → the `REBOOT_NODE` path). The unrepairable
   flag has a second source, DCGM field 1507 (DCGM Field Identifiers, docs 4.6
   <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html#c.DCGM_FI_DEV_MEMORY_UNREPAIRABLE>:
   "Unrepairable memory flag indicating if memory has unrepairable errors 1=yes, 0=no"), which needs NVML v590 (NVML API Reference
   change log <https://docs.nvidia.com/deploy/nvml-api/latest/change-log.html>, "Changes between v580 and v590": "Added
   nvmlDeviceGetUnrepairableMemoryFlag_v1() to report whether or not there is unrepairable memory.") and reads N/A on R580 --
-  while the R580 nvidia-smi already prints the tag (live; nvidia-smi's change log lists it under v590). A GPU that reports both
+  while the R580 nvidia-smi already prints the tag (nvidia-smi's change log lists it under v590). A GPU that reports both
   is published once, at the higher reading; DCGM v4.7.0 `MonitorMemUnrepairableFlag` FAILs on any non-zero value
   (`DCGM_FR_FAULTY_MEMORY`, "Run a field diagnostic on the GPU."), and the product takes the row-remap failure path in
   `memory_decision`: CRITICAL `DRAIN`, official `RUN_FIELD_DIAGNOSTIC_FOR_RMA`, the containment prefix under `memoryDiagnostics:
@@ -1386,11 +1405,10 @@ Manager trains, and CUDA does not start on a GPU before its registration complet
 DCGM reports the registration state per GPU as `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` (field 170, a
 `dcgmFabricManagerStatus_t`: 0 NotSupported, 1 NotStarted, 2 InProgress, 3 Success, 4 Failure, 5 Unrecognized, 6 NvmlTooOld; `dcgm_structs.h` is identical in DCGM 4.4.1 and 4.7.0) and the DCGM return
 code of a completed registration as `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE` (field 171, 0 = OK; blank, so no exporter sample,
-until it completes). Live, on a plain EKS p5en (H200 HGX, 4 NVSwitches, driver 580.178.04, DCGM 4.7.0), the product's own
-reboot (GF-REGIONAL-COLLECT-015) came back with `nvidia-fabricmanager` failed ("failed to configure all the available GPUs or
-NVSwitches") and every GPU InProgress for about 19.5 h; VALIDATE_GPU/HOST/FABRIC all passed and scheduling was restored while
-nothing read the field. A healthy node reads 3/0. HGX B200/B300 are graded by the same rules but have not been observed live
-(the site has no p6-b200/p6-b300 node).
+until it completes). When `nvidia-fabricmanager` fails to start after a reboot (e.g. "failed to configure all the available
+GPUs or NVSwitches"), every GPU stays InProgress; with nothing reading the field, VALIDATE_GPU/HOST/FABRIC would all pass and
+scheduling would be restored. A healthy node reads 3/0. HGX B200/B300 are graded by the same rules but are not live-verified
+(no B-series hardware).
 
 **The Fabric Manager unit on NVL5.** On HGX B200/B300 the one `nvidia-fabricmanager.service` starts the NVLink Subnet
 Manager (NVLSM) and then Fabric Manager. NVIDIA Fabric Manager User Guide, "The Fabric Manager Service"
@@ -1441,7 +1459,7 @@ refuses Fabric Manager SXIDs on Blackwell (§2.3).
   Fabric Manager that is not running (§2.12). The ladder is unchanged (§2.9): a failed reset or validation → REBOOT_NODE (HyperPod `BatchRebootClusterNodes`,
   eks-managed EC2 `RebootInstances`, both a warm reboot; a cold stop/start is not available -- one-time Spot instances cannot be
   stopped and the product has no stop/start adapter) → REPLACE_NODE (a warm-spare handover on both providers, no provider
-  replacement API) → ESCALATE_SUPPORT. A Fabric Manager restart alone does not re-register the GPUs (live, all 8 stayed
+  replacement API) → ESCALATE_SUPPORT. A Fabric Manager restart alone does not re-register the GPUs (measured: the GPUs stayed
   InProgress after a `systemctl restart nvidia-fabricmanager`); NVIDIA's procedure for H100 and later is to stop the CUDA
   applications and GPU services (e.g. DCGM), stop Fabric Manager, `nvidia-smi -r`, start Fabric Manager and resume the services,
   and to reboot or power-cycle for persistent problems.
@@ -1459,7 +1477,7 @@ refuses Fabric Manager SXIDs on Blackwell (§2.3).
   holds; with no completed step before the validation (a validated restore), a record older than the validation sample age
   (`GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS`, 420 s) is not judged. Nothing reported is not judged: an exporter without the
   field, an ungraded part, an older Agent, a unit systemd does not enable. So a node whose Fabric Manager is still failed after
-  a reboot or reset no longer gets its scheduling back (the COLLECT-015 shape); it climbs the ladder instead.
+  a reboot or reset does not get its scheduling back (the Fabric Manager start failure above); it climbs the ladder instead.
 - **Fabric Manager restart and the solo XID 45**: a solo XID 45 finalizes as the catalog's `RESTART_FM` (Investigatory
   Action "Solo: RESTART_FM / Not Solo: IGNORE (follow other Xid)"). On a node whose latest samples are graded
   (`graded_fabric_gpus`: field 170 reports a fabric state on a Hopper SXM or HGX B200/B300 part), a Fabric Manager restart
@@ -1518,9 +1536,9 @@ refuses Fabric Manager SXIDs on Blackwell (§2.3).
 - **DCGM diagnostic**: the software test's Fabric Manager message (`DCGM_FR_FABRIC_MANAGER_TRAINING_ERROR`, 112, severity CONFIG
   in DCGM's table; the variants training not started, training in progress, Training completed with an error, unknown fabric
   manager state) is never configuration-only: the run grades FAIL and the DRAIN successor holds the node; the summary and the
-  message-less per-GPU results of the same test map to `NVLINK_FABRIC_RECOVERY` (IMMEDIATE) instead of
+  message-less per-GPU results of the same test map to `NVLINK_FABRIC_RECOVERY` (IMMEDIATE), not to
   `GPU_HOST_CONFIG_REMEDIATION` ("Do not drain the node for this"). When every FAIL of the run is the fabric's or
-  configuration-only, the non-zero `dcgmi` exit the failure itself causes no longer adds `DCGM_EXECUTION_REVIEW`; any other
+  configuration-only, the non-zero `dcgmi` exit the failure itself causes does not add `DCGM_EXECUTION_REVIEW`; any other
   failure beside it keeps the review. When that DRAIN already holds the node, the fabric recovery cannot take a terminal
   quarantine over: repair the node out of band (reboot the instance), then `gpu-fault-admin submit-remediation --disposition
   restore`, whose VALIDATE_GPU refuses a node whose fabric has not trained.
@@ -1541,7 +1559,7 @@ long as the composite stays active with the same automatic action
 from it (`app/ingest/gpu_findings`: event id `gpu-<finding id>` → `inc-gpu-<finding id>`), hence:
 
 - A severity change within the episode (`CORRECTABLE_MEMORY_DEGRADATION` turning CRITICAL at
-  `correctable_memory_drain_consecutive_samples`=3 consecutive breaches) no longer mints a second
+  `correctable_memory_drain_consecutive_samples`=3 consecutive breaches) does not mint a second
   incident: the stores' `gpu_finding_transition` still counts the grade change as an activation (the
   history keeps the latest grade), `gpu_composites.resolve_composite_updates` recognises it as a
   re-grade by the unchanged id and reports it in
@@ -1553,7 +1571,7 @@ from it (`app/ingest/gpu_findings`: event id `gpu-<finding id>` → `inc-gpu-<fi
   plan stands and no workflow is scheduled. An incident an operator already closed keeps the
   escalation as a reason and is not reopened; only a breach after a clear opens anew. A re-grade whose
   event has no incident (the activation's incident write never committed on a nontransactional
-  backend) is ingested as a new finding -- the repair F-M1 asks for.
+  backend) is ingested as a new finding.
 - A changed automatic action (`THERMAL_STRESS` moving from RUN_DIAGNOSTICS to DRAIN with a CRITICAL
   temperature, `GPU_MEMORY_DEGRADATION` following its components' actions) is a new recovery decision:
   the candidate keeps this batch's id and mints a new incident and plan (serialized behind or
@@ -1561,7 +1579,7 @@ from it (`app/ingest/gpu_findings`: event id `gpu-<finding id>` → `inc-gpu-<fi
   diagnostic.
 - A composite that cleared (its components stopped breaching, the state's finding is None) and forms
   again is a new episode: new id, new incident, the consecutive count restarts at 1.
-- The device-signal rule (b183: a vanished device's signal must not swallow the next episode) applies
+- The device-signal rule (a vanished device's signal must not swallow the next episode) applies
   too: an active composite scope is re-evaluated by every batch and clears within one correlation
   window once a component stops breaching, so an active composite state older than
   `GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS` (45 s) relative to the batch can only have been left by a
@@ -1579,9 +1597,9 @@ from it (`app/ingest/gpu_findings`: event id `gpu-<finding id>` → `inc-gpu-<fi
 | `THERMAL_STRESS` | GPU/HBM temperature finding + thermal violation or thermal throttle bit | Diagnostics first; `DRAIN` after 2 consecutive hits by default |
 | `POWER_LIMIT_THROTTLING` | power violation + power usage reaching the configured ratio of the limit + high utilization + no temperature finding | Power-limit context, diagnostics; does not directly rule hardware damage |
 | `GPU_MEMORY_DEGRADATION` | DBE/uncorrectable remap + pending/failed repair or pending retired page | `DRAIN`, Field Diagnostic/RMA evidence |
-| `PCIE_XID_LINK_FAILURE` | PCIe replay rate finding (from batch 233 also a confirmed `pcie_link_downtrain` or `pcie_correctable_error_total` rate finding) + XID 32/79 on the same GPU inside the window (a trusted kernel event, or a change of the DCGM last-XID gauge inside the window; an expired gauge does not join) | `DRAIN` and retain the combined PCIe/XID evidence |
-| `NVLINK_LINK_DEGRADATION` | at least two kinds of NVLink error finding on the same GPU (from batch 235 the NVLink5 counters too; the link-recovery counters 1211-1213 are one kind, an evidence-only finding is none) | `DRAIN` and run link/fabric diagnostics; with a failed NVLink5 link recovery (1212) among the components the composite is CRITICAL `DRAIN` |
-| `MULTI_GPU_NVLINK_FABRIC_FAILURE` | at least two GPUs on the same node with NVLink error findings (from batch 235 the NVLink5 counters too) | Generate one node-level composite and `DRAIN`; with a failed NVLink5 link recovery (1212) among the components the composite is CRITICAL `DRAIN` |
+| `PCIE_XID_LINK_FAILURE` | PCIe replay rate finding (or a confirmed `pcie_link_downtrain` or `pcie_correctable_error_total` rate finding) + XID 32/79 on the same GPU inside the window (a trusted kernel event, or a change of the DCGM last-XID gauge inside the window; an expired gauge does not join) | `DRAIN` and retain the combined PCIe/XID evidence |
+| `NVLINK_LINK_DEGRADATION` | at least two kinds of NVLink error finding on the same GPU (the NVLink5 counters included; the link-recovery counters 1211-1213 are one kind, an evidence-only finding is none) | `DRAIN` and run link/fabric diagnostics; with a failed NVLink5 link recovery (1212) among the components the composite is CRITICAL `DRAIN` |
+| `MULTI_GPU_NVLINK_FABRIC_FAILURE` | at least two GPUs on the same node with NVLink error findings (the NVLink5 counters included) | Generate one node-level composite and `DRAIN`; with a failed NVLink5 link recovery (1212) among the components the composite is CRITICAL `DRAIN` |
 | `CORRECTABLE_MEMORY_DEGRADATION` | at least two of SBE, retired SBE page and correctable row-remap increasing at the same time | WARNING/diagnostics first; after 3 consecutive hits by default the same composite is re-graded CRITICAL (action still diagnostics, the same incident updated) and the running VALIDATE_GPU fails on the CRITICAL finding and `DRAIN`s through the existing ladder |
 
 Thermal slowdown uses the software/hardware thermal slowdown bits `0x20/0x40` of
@@ -1633,6 +1651,19 @@ this module marks NVIDIA provenance only for rules that can be reliably reconstr
 
 Collects and evaluates CPU/load, MCE, memory, OOM, file systems, Lustre, NIC, RDMA/EFA, service status and log patterns. Findings are converted to markers and enter a separate `SITE_NODE_HEALTH` incident.
 
+When the MCE log rule (`log_rules.py`, `machine check|mce:|hardware error|edac.*(uncorrect|UE)`) matches,
+`log_recovery_context.log_rule_decision` calls `mce_grading.grade_mce_line` to decide whether the error was corrected: the
+kernel `__print_mce()` header `CPU n: Machine Check[ Exception]: <MCG_STATUS> Bank b: <IA32_MCi_STATUS>` is decoded from its
+status word (VAL=1 with UC bit 61, PCC bit 57 and Deferred bit 44 clear → corrected; a ` Exception`, UC=1, `uncorrected`/`fatal`
+or an EDAC `UE` → stays CRITICAL/QUARANTINE); the `Machine check events logged` notice, mce_amd's `Corrected error, no action
+required.`, CPER `event severity: corrected` and the CMCI storm notices → WARNING/`RUN_DIAGNOSTICS` (`SITE_APPLICATION_LOG`,
+VALIDATE_HOST + ESCALATE_SUPPORT, no isolation); the `TSC`/`PROCESSOR`/`RIP`, `Error Addr`/`IPID`/`Ext. Error Code` and GHES
+`{N}[Hardware Error]:` section lines are details of the same record and raise no finding of their own. Evidence: Intel SDM
+Vol. 3B (253669-093US) §18.3.2.2 IA32_MCi_STATUS, Linux v6.12 `arch/x86/kernel/cpu/mce/core.c`, `arch/x86/include/asm/mce.h`,
+`drivers/edac/mce_amd.c`, `drivers/edac/skx_common.c`, `drivers/edac/edac_mc.c`, `drivers/firmware/efi/cper.c` and
+`drivers/acpi/apei/ghes.c` -- quoted line by line in the module docstring of `src/gpu_fault/mce_grading.py` and pinned by
+`tests/test_mce_grading.py`.
+
 The host collector only reads InfiniBand devices whose driver is `efa`; mlx5 and other RDMA devices do not enter the EFA
 count, traffic or error baselines. The BMC status `nc` means non-critical and is not counted in
 `bmc_critical_sensor`; only `cr/critical/nr/non-recoverable` are counted (distinct sensor names). A count ≥1 carries
@@ -1657,7 +1688,7 @@ When SMART gives no conclusion it is reported in one of two classes, neither of 
 
 - UNKNOWN (a failed read): `smart_query_failed=1` plus a collection error. When `--scan-open` exits non-zero, times
   out, or prints `# scan_smart_devices: <error>` (smartctl still exits 0 then), the drive set is unknown: it emits
-  `failure_mode=SCAN_FAILED` with no device and queries no drive this round -- it used to parse as "the node has no
+  `failure_mode=SCAN_FAILED` with no device and queries no drive this round -- otherwise it would parse as "the node has no
   drives", indistinguishable from healthy. A `# /dev/X -d ... open failed: <reason>` comment line in the scan emits
   `OPEN_FAILED` for that drive instead of silently dropping it. When `smartctl -H` cannot run, times out, prints no
   JSON, or `passed` is not a boolean, it emits `QUERY_FAILED` for that drive. A timeout affects only its own drive; the
@@ -1678,8 +1709,8 @@ that is not a decimal integer leaves its group unknown too. When `ethtool -S` ex
 that netdev records a collection error and emits no delta, while the other netdevs are still read. When the NIC has no
 counter for a group, or the driver exposes no statistics at all (`no stats available`, `Operation not supported`), it
 emits `efa_ethtool_counters_unsupported` (`value` is the number of missing groups, `labels.metrics` lists the missing
-delta names, `reason` is `MISSING_COUNTER` or `NO_STATISTICS`) instead of a 0, and records no collection error.
-All of these used to be reported as 0, which VALIDATE_FABRIC accepted as a clean link for counters it never measured.
+delta names, `reason` is `MISSING_COUNTER` or `NO_STATISTICS`) instead of a 0, and records no collection error:
+a reported 0 would make VALIDATE_FABRIC accept a clean link for counters it never measured.
 
 **Observability of the NOT_SUPPORTED capability markers.** The three markers -- `bmc_status_unsupported`,
 `smart_status_unsupported`, `efa_ethtool_counters_unsupported`, registered in
@@ -1687,7 +1718,7 @@ All of these used to be reported as 0, which VALIDATE_FABRIC accepted as a clean
 the state the node is in, not an event, and ship with every tick, so a marker is no edge of its own: a gap the node
 had from the start rides the baseline batch and the health summaries after it. The host collector's edge filter
 derives a reason from the whole marker, `not-supported:<marker>:<device|node>:<reason>[:<other label values>]`
-(the EFA marker's is `...:<reason>:<metrics>`, unchanged from the EFA-only rule;
+(the EFA marker's is `...:<reason>:<metrics>`;
 `host_capability_markers.not_supported_edge_reason`, `collector.py` `_edge_reasons`): a marker that appears (a
 node whose BMC answered becomes one without a device), a `reason` that changes (`TOOL_MISSING` -> `NO_DEVICE`,
 `MISSING_COUNTER` <-> `NO_STATISTICS`) and an EFA counter list that changes (one more or one fewer name in
@@ -1699,13 +1730,10 @@ The markers are also in `NodeHealthPolicy.LATEST_METRICS_REQUIRED` (`host_health
 which by design writes no raw evidence -- into `telemetry_metric_latest` with its `reason` label and device, so the
 node's capability state is readable at any time; the record is latest-wins, a cleared marker keeps the stamp of its
 last appearance, and that is how a reader tells a current gap (stamped with the node's newest batch) from a closed
-one. A marker is still no rule input: no finding, no isolation, no held host validation. Before this only the EFA
-marker had an edge (the first live run of GF-GENERAL-LIVE-010 `missing_counter`: the marker named the withdrawn
-counter on every tick but had no delivery reason); a BMC or SMART marker that changed had no delivery reason and no
-latest record either, so GF-GENERAL-LIVE-015 `command_failure` could not read the NO_DEVICE marker that followed the
-replayed failure (it rode only the tick that closed the collection error; every steady tick after it was no edge),
-and `unsupported_bmc` read zero batches in a whole health summary period on a node without `ipmitool` (the steady
-marker rides only the summary, and the summary is not evidence).
+one. A marker is still no rule input: no finding, no isolation, no held host validation. Without these edge reasons and
+latest records a changed marker would not be delivered, and a steady marker would ride only the health summaries,
+which write no evidence, so a reader would see no capability state for a whole summary period
+(GF-GENERAL-LIVE-010 `missing_counter` and GF-GENERAL-LIVE-015 `command_failure`/`unsupported_bmc` cover these paths).
 
 The sysfs RDMA error counters (`/sys/class/infiniband/<device>/ports/<port>/{counters,hw_counters}`, summed per port
 into `rdma_errors_delta`, each counter also reported as `rdma_<counter>_delta`) and the netdev `statistics` counters
@@ -1715,9 +1743,9 @@ port's `rdma_errors_delta` (or the netdev's metric) ships no delta that round, t
 device/port and the counter in the `ethtool` reader's wording (for example
 `_rdma: … rdmap0/1: symbol_error reset (10 -> 1); delta unknown`), the baseline is re-armed from the new value and the
 next round measures from it; a port's counter sum that falls although no counter went backwards (a counter file
-disappeared) is unknown too. Counters that did not reset, and the link state, are still reported. `_delta` used to clamp
-the fall to 0 and ship it as `rdma_errors_delta=0` / `network_errors_delta=0`: a reading that cleared the still-alarming
-signal, let VALIDATE_FABRIC accept the port as clean, and had the continuing increase minted again as a new incident.
+disappeared) is unknown too. Counters that did not reset, and the link state, are still reported. Clamping
+the fall to 0 and shipping it as `rdma_errors_delta=0` / `network_errors_delta=0` would clear the still-alarming
+signal, let VALIDATE_FABRIC accept the port as clean, and have the continuing increase minted again as a new incident.
 
 A single node log message can match several rules at once. The policy first picks the highest severity by `FATAL > CRITICAL > WARNING > INFO`,
 then picks the stronger action by the global RecoveryAction rank; on a complete tie it keeps the more specific rule that appears earlier in the rule table. Therefore a single line containing both OOM text and an EFA fatal is ultimately ruled an RDMA
@@ -1731,7 +1759,7 @@ amzn-drivers `kernel/linux/efa/src` at tags `efa_linux_3.3.1` / `efa_linux_3.4.0
 time prints `(null): `, `dev_err(&pdev->dev)` prints `efa <PCI BDF>: `). The ib device is registered as `efa_N`, and rdma-core's
 udev rule `rdma_rename %k NAME_FALLBACK` (`rdma-persistent-naming.rules`) renames it at once after its PCI location,
 `rdmap<bus>s<slot>` (`rdma_rename.c` `by_pci()`; `0000:55:00.0` → `rdmap85s0`); `ib_device_rename()` renames the very name
-`__ibdev_printk()` prints, so every runtime line of a live node on both clusters carries `rdmap…`, and the prefix accepts any
+`__ibdev_printk()` prints, so every runtime line of a real node carries `rdmap…`, and the prefix accepts any
 device name without whitespace or a colon. The fatal vocabulary -- the admin queue no longer answers / is closed / the reset
 handshake failed: `The device didn't send any completion for admin cmd`, `The device sent a completion but the driver didn't
 receive any MSI-X interrupt`, `Wait for completion (polling) timeout` (no source runs an admin command in polling mode, so no
@@ -1746,7 +1774,7 @@ probe failures, probe-time attribute queries -- is graded WARNING/`RUN_DIAGNOSTI
 FREEZE_EVIDENCE → VALIDATE_FABRIC → ESCALATE_SUPPORT, no isolation); the register / unregister / irq information lines and a
 single command the device answered with an error (`Failed to create qp [-12]`, `Failed to process command … err -12|-22`,
 `efa_com_comp_status_to_errno()`) match no rule. EFA has no link-down wording (`efa_query_port()` always reports
-`IB_PORT_ACTIVE`); the port state belongs to the `rdma_link_down` metric rule; `efa` is no longer a keyword trigger, and
+`IB_PORT_ACTIVE`); the port state belongs to the `rdma_link_down` metric rule; `efa` is not a keyword trigger, and
 `rdma|infiniband|ib_*` + `fatal|error|timeout|link/port down` serves other fabrics only. Both RDMA rules are `KERNEL_LOG_SOURCES`;
 the node-side `matching_log_rules` decides from the same vocabulary which lines are shipped, so a vocabulary change ships with
 the control plane, the executor and the node runtime together. The sources are pinned to tags:
@@ -1765,7 +1793,13 @@ Each rank heartbeat contains step, throughput, loss, numerical error and checkpo
 - step regression;
 - step lag relative to peers;
 - throughput ratio too low;
-- `numerical_error=true`.
+- `numerical_error=true` or a non-finite loss.
+
+Defaults (`TrainingHealthPolicy.from_environment`): heartbeat timeout 120 s
+(`GPU_FAULT_TRAINING_HEARTBEAT_TIMEOUT_SECONDS`), startup grace 300 s (`GPU_FAULT_TRAINING_STARTUP_GRACE_SECONDS`),
+a step lag ≥ 20 within one `progress_group` (`GPU_FAULT_TRAINING_MAX_STEP_LAG`) or a throughput below 0.5 times the
+group median (`GPU_FAULT_TRAINING_MIN_THROUGHPUT_RATIO`). A heartbeat timeout and a step that stops advancing are
+CRITICAL; a rank whose live heartbeat carries no step is only WARNING `progress-unavailable` (liveness is not progress).
 
 State transitions are deduplicated by a persisted signal key, so multiple API replicas do not produce the same active finding twice.
 
@@ -1811,11 +1845,9 @@ positioning options cannot be combined: in systemd v252 (the version on AL2023 n
 `Please specify only one of --since=, --cursor=, and --after-cursor=.`
 (<https://github.com/systemd/systemd/blob/v252/src/journal/journalctl.c>; reproduced on systemd 255, exit
 status 1; in v257 the same check also counts `--cursor-file=`); `--until` is not part of that check; the meaning of `--after-cursor=` is in journalctl(1)
-(<https://www.freedesktop.org/software/systemd/man/latest/journalctl.html#--after-cursor=>). Before the fix
-the collector passed both as soon as it knew a cursor: every resumed poll was refused, the refusal mentions
-"cursor" and was taken for a lost cursor, which dropped the cursor, so every other poll read nothing, and the
-control plane saw it only when the periodic slot happened to land on a refused poll (`journalctl-failures=17`
-in a collector status). The cursor string itself is never parsed -- sd_journal_get_cursor(3): "The cursor
+(<https://www.freedesktop.org/software/systemd/man/latest/journalctl.html#--after-cursor=>). Passing both
+would refuse every resumed poll, and since the refusal mentions "cursor" it would be taken for a lost cursor that
+drops the cursor, so every other poll would read nothing. The cursor string itself is never parsed -- sd_journal_get_cursor(3): "The cursor
 string should be considered opaque and not be parsed by clients."
 (<https://www.freedesktop.org/software/systemd/man/latest/sd_journal_get_cursor.html>). Failure visibility:
 a non-zero exit is counted by stderr class under `journalctl-failures-<class>` (`refused-arguments`,
@@ -1858,9 +1890,9 @@ When violation-class counters participate in candidate decisions, the duty cycle
 and only crossing `GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD` (default 0.05) counts as a candidate.
 When the duty cycle is above `DUTY_CYCLE_MAX_PLAUSIBLE` (1.05) it **does not participate in edge decisions**, and a WARNING is logged once for that
 device/field: a violation duration cannot be longer than the elapsed time, and exceeding it shows that the field is not in microseconds on this
-machine. This gate directly prevents a class of silent missed detections: on production H200s,
+machine. This gate directly prevents a class of silent missed detections: on H200,
 `DCGM_FI_DEV_POWER_VIOLATION` advances at about 1.125e9 ns/s even when fully idle, so the duty cycle is permanently out of bounds,
-and every card locks into a confirmed candidate within about `GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES` samples after start-up;
+and without the gate every card would lock into a confirmed candidate within about `GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES` samples after start-up;
 a confirmed candidate is announced only once at the transition, after which **real power throttling
 can never again produce a delivery edge**. Refusing to grade an uninterpretable duty cycle both preserves debouncing and prevents an unreadable
 counter from masking the fault it should have exposed. `GF-REGIONAL-COLLECT-002` is the live-hardware criterion for this gate.
