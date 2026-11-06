@@ -385,10 +385,12 @@ The key differences between the two paths, which are also the anchors of the acc
   requires HyperPod `NodeRecovery=None`, and with `local_only=True` enumerates warm-spare nodes only from Kubernetes
   labels (`src/gpu_fault/hyperpod_spares.py::HyperPodSpareCoordinator.allocate`).
   At the same time the managed/provider recovery adapter **explicitly refuses** to take over this kind of step.
-- **Provider replace (forbidden in this system)**: calls `batch_replace_cluster_nodes`
-  (`src/gpu_fault/hyperpod.py::HyperPodLifecycleAdapter.submit`; `857` is the reboot branch, both share the same submission path),
-  and the old instance is destroyed permanently. Gated by `GPU_FAULT_ALLOW_HYPERPOD_REPLACE`, which
-  `deploy/dataplane/cluster-action-executor.yaml:164-165` sets to `false` --
+- **Provider replace (forbidden in this system)**: a provider replace destroys the old instance permanently, and the product has
+  no submission path for it. `src/gpu_fault/hyperpod.py::HyperPodLifecycleAdapter.submit` refuses `HyperPodAction.REPLACE`
+  before it writes the submission ledger or calls the provider (`provider node replacement is prohibited; use the healthy
+  warm-spare coordinator`), `HyperPodAdapterConfig.action_enabled(REPLACE)` is always `False`, and a configuration with
+  `replace_enabled=true` fails validation. `deploy/dataplane/cluster-action-executor.yaml` sets
+  `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` to `false`, and setting it to `true` makes the process refuse to start --
   **in this system that value is an invariant, not a "default"**;
   no case or maintenance operation may change it to `true`.
 
@@ -396,14 +398,16 @@ The key differences between the two paths, which are also the anchors of the acc
 
 This is the easiest place to misconfigure and the easiest to misread when checking: **`GPU_FAULT_ENABLE_HYPERPOD_ADAPTER`
 is not the reboot/replace switch**; it only decides whether the adapter is installed at all.
-In `src/gpu_fault/hyperpod.py::HyperPodLifecycleAdapter.submit`, reboot and replace are one submission path
-that forks on `action`, so turning this switch off means **turning both off together** --
-it cannot satisfy the requirement "allow reboot, forbid replace".
+Replace has no submission path under any configuration (`HyperPodLifecycleAdapter.submit` refuses it before the ledger and
+the provider), so turning this switch off only turns reboot off and does nothing for "forbid replace";
+"allow reboot" comes from the dedicated reboot switch of layer 2.
 
 The gate that really separates the actions is layer 2, `src/gpu_fault/hyperpod.py::HyperPodAdapterConfig.action_enabled`:
 
 ```python
 def action_enabled(self, action: HyperPodAction) -> bool:
+    if action is HyperPodAction.REPLACE:
+        return False
     override = (self.reboot_enabled if action is HyperPodAction.REBOOT
                 else self.replace_enabled)
     return self.execution_enabled if override is None else override
@@ -411,8 +415,8 @@ def action_enabled(self, action: HyperPodAction) -> bool:
 
 | Layer | Mechanism | Variable / parameter | Granularity | Manifest default |
 | --- | --- | --- | --- | --- |
-| 1 | whether the adapter is installed | `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER` (`executor_from_environment` in `gpu_fault.cluster_executor.bootstrap`) | **shared** by reboot/replace; off turns both off | `false` (`:146-147`) |
-| 2 | per-action release (**fail-closed hard gate**) | `GPU_FAULT_ALLOW_HYPERPOD_REBOOT` / `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` (`hyperpod.py:203-206`) | each action independently | `true` / `false` (`:162-165`); **the latter is an invariant, always `false`** |
+| 1 | whether the adapter is installed | `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER` (`executor_from_environment` in `gpu_fault.cluster_executor.bootstrap`) | affects reboot only (replace has no submission path) | `true` |
+| 2 | per-action release (**fail-closed hard gate**) | `GPU_FAULT_ALLOW_HYPERPOD_REBOOT` / `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` (`HyperPodAdapterConfig.from_environment`) | each action independently | `true` / `false`; **the latter is an invariant, always `false`; `true` makes the process refuse to start** |
 | 3 | warm spare vs provider | step parameter `replacement_strategy=HEALTHY_WARM_SPARE_ONLY` | decides routing, not permission | decided by the workflow |
 
 `GPU_FAULT_ALLOW_HYPERPOD_MUTATION` is the legacy reboot compatibility switch:
@@ -420,11 +424,15 @@ def action_enabled(self, action: HyperPodAction) -> bool:
 explicitly setting `GPU_FAULT_ALLOW_HYPERPOD_REPLACE=true` makes the process refuse to start.
 The regional manifests must therefore leave the legacy variable unset and explicitly keep replace=false.
 
-The error text when layer 2 is violated (`hyperpod.py:737-744`, the anchor of the acceptance assertion):
+The error text when a REPLACE is submitted (`HyperPodLifecycleAdapter.submit`, the anchor of the acceptance assertion; raised
+before the submission ledger is written):
 
 ```
-HyperPod preflight failed: HyperPod REPLACE mutation is disabled by configuration
+provider node replacement is prohibited; use the healthy warm-spare coordinator
 ```
+
+A read-only `HyperPodLifecycleAdapter.preflight(REPLACE)` still reports
+`HyperPod REPLACE mutation is disabled by configuration` in its `gate_failures`.
 
 **The two paths are not guarded by the same gate; that is why the "Warm spare" phase and the
 "Failover and constraint disproof" phase are accepted separately
@@ -10013,9 +10021,9 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      **after submission** to force a restart, confirm that on replay it reads `SUBMITTED` and
      returns duplicate directly, and that `BatchRebootClusterNodes` appears only once in CloudTrail.
      **This assertion also replaces the idempotency assertion of the retired `DESTR-004`**:
-     reboot and replace share the same submission path and the same
-     `HyperPodSubmissionRecord` (`hyperpod.py:857-862` branches only on `action`),
-     so verifying idempotency on reboot holds equally for replace,
+     replace has no submission path (`HyperPodLifecycleAdapter.submit` refuses `REPLACE` before it writes a
+     `HyperPodSubmissionRecord`), so submission idempotency exists only on the reboot path,
+     verifying it on reboot covers every provider submission,
      and no instance needs to be destroyed.
   4. Observe the provider call: `RebootClusterNodes` (or `BatchRebootClusterNodes`) appears in
      CloudTrail, with `Username` being **the executor's role**,
@@ -10324,9 +10332,9 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
 > - The idempotency assertion "submission record `SUBMITTED` + replay after an executor restart returns duplicate,
 >   the provider verb appears exactly once" → verified by `DESTR-002`
 >   on the **reboot** path (`BatchRebootClusterNodes` appears exactly once).
->   Both share the same submission path and the same `HyperPodSubmissionRecord`
->   (`hyperpod.py:857-862` branches on `action`),
->   so verifying idempotency on reboot holds equally for replace,
+>   Replace has no submission path (`HyperPodLifecycleAdapter.submit` refuses `REPLACE` before it writes a
+>   `HyperPodSubmissionRecord`), so submission idempotency exists only on the reboot path,
+>   verifying it on reboot covers every provider submission,
 >   and no instance needs to be destroyed.
 > - "The old Agent is permanently fenced, the new Agent re-registers, identity rebinding is correct"
 >   → covered by the corresponding steps of `DESTR-003` (warm spare).
