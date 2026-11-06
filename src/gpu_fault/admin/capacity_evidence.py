@@ -101,10 +101,11 @@ def ingress_normal_concurrency(managed_node_count: int) -> int:
     """GPU_FAULT_INGRESS_NORMAL_CONCURRENCY for a fleet of ``managed_node_count``.
 
     One normal-tier ingress slot per five managed nodes, clamped to
-    [1000, 3584]: the 32-cluster preset (8,192 nodes) keeps its measured 1000,
-    the 50-cluster preset (12,800 nodes) gets 2560 (section 8.4: 1000 gave
-    0.58-3.85 % reserved 503 there), and the ceiling leaves room for the 256
-    fault slots under uvicorn's 4096 in-flight limit.
+    [1000, 3584]: the floor is the 1000 the 32-cluster preset measured clean
+    with (section 8.4), the 32-cluster preset (8,192 nodes) gets 1639, the
+    50-cluster preset (12,800 nodes) 2560 (section 8.4: 1000 gave 0.58-3.85 %
+    reserved 503 there), and the ceiling leaves room for the 256 fault slots
+    under uvicorn's 4096 in-flight limit.
     """
 
     if managed_node_count < 1:

@@ -17,10 +17,13 @@ So ``hyperpod-scheduled-update --rolling`` writes ``deployment_config``:
 ``MaximumBatchSize`` and ``RollbackMaximumBatchSize`` both ``ROLLING_BATCH``
 (one instance at a time), the wait, and ``AutoRollbackConfiguration`` naming
 the operator's ``--rollback-alarm`` alarms -- never one this module invents.
-An alarm only protects the roll while it can go to ALARM: the helper and the
-CPU control plane's advisory read each named alarm (``alarm_records``) and
-report one that is missing, has no data, or watches a load balancer other than
-the current API NLB (``alarm_problems``). The recommended pair watches the
+An alarm only protects the roll while it can go to ALARM: the helper
+(``read_rollback_alarms``) and the ``cpu_rolling_update`` check of ``status
+--full`` (``gpu_fault_release.regional_cpu_rolling_update``) read each named
+alarm (``alarm_records``) and report one that is missing, has no data, is in
+ALARM already, or watches a load balancer other than the current API NLB
+(``alarm_problems``); the CPU control plane's advisory lines only name the
+alarms and leave that judgement to the check. The recommended pair watches the
 Maximum of the API NLB's ``HealthyHostCount`` (``suggested_alarms``,
 ``RECOMMENDED_STATISTIC``): on 2026-11-01 it was the one control-plane metric
 that saw the all-at-once re-image (3 healthy targets to 0), while Container
