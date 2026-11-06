@@ -5423,7 +5423,8 @@ HyperPod name (an empty string for an eks-managed entry, which also carries `pro
 `us-west-2` or other Region default. Every entry must also carry a non-empty `agent_endpoint_allowed_cidrs` (the GPU node subnet
 CIDRs; the example template holds the documentation-only range `192.0.2.0/24` as a placeholder, which must be replaced with the
 real node subnets): without it the engine fails with `<cluster_id> requires Agent endpoint CIDRs`
-before writing the registry, and the preflight checks that the actual node IPs fall inside these CIDRs. `gpu-fault-admin` does not
+before writing the registry; a malformed CIDR (for example `192.0.2.0/33`) fails the registry and the preflight with
+`<cluster_id> Agent endpoint CIDRs are invalid`; and the preflight checks that the actual node IPs fall inside these CIDRs. `gpu-fault-admin` does not
 require writing this JSON by hand: every command materializes the same configuration from `site.yaml` (a temporary 0600
 `regional-release.json`) and hands it to the engine.
 That `version` is the single version input for the CPU fleet pin, the Kubernetes Resource Collector,

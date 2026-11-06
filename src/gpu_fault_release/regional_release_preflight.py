@@ -532,9 +532,12 @@ def _validate_agent_endpoint_cidrs(
     node_selector: str,
     configured_cidrs: tuple[str, ...],
 ) -> None:
-    networks = tuple(
-        ipaddress.ip_network(value, strict=False) for value in configured_cidrs
-    )
+    try:
+        networks = tuple(
+            ipaddress.ip_network(value, strict=False) for value in configured_cidrs
+        )
+    except ValueError as exc:
+        raise ReleaseError(f"{cluster_id} Agent endpoint CIDRs are invalid") from exc
     if not networks:
         raise ReleaseError(f"{cluster_id} requires Agent endpoint CIDRs")
     raw = runner.run(

@@ -157,6 +157,7 @@ class ContextRelease(ResourceRelease):
         ("hyperpod", "does not target"),
         ("recovery", "NodeRecovery=None"),
         ("empty-cidrs", "requires Agent endpoint CIDRs"),
+        ("bad-cidrs", "Agent endpoint CIDRs are invalid"),
         ("no-nodes", "has no Kubernetes nodes"),
         ("no-address", "do not cover nodes"),
         ("cidr", "do not cover nodes"),
@@ -167,9 +168,10 @@ def test_context_preflight_binds_eks_hyperpod_and_agent_address_scope(
 ) -> None:
     release = ContextRelease()
     release.fault = fault
-    if fault == "empty-cidrs":
+    if fault in {"empty-cidrs", "bad-cidrs"}:
+        cidrs = () if fault == "empty-cidrs" else ("192.0.2.0/33",)
         release.config.clusters = tuple(
-            replace(target, agent_endpoint_allowed_cidrs=())
+            replace(target, agent_endpoint_allowed_cidrs=cidrs)
             for target in release.config.clusters
         )
     with pytest.raises(ReleaseError, match=problem):
