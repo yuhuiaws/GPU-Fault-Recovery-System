@@ -3520,30 +3520,36 @@ aws sns list-subscriptions-by-topic \
     --query Account --output text):gpu-fault-control-plane-alerts-${AWS_REGION}"
 ```
 
-**Amazon Managed Grafana dashboards** are imported automatically by `gpu-fault-admin deploy` after the AMP installation converges;
-they are not part of the alerting chain. deploy resolves a workspace in the Region of the CPU cluster ARN (there is no separate Region option):
+**Amazon Managed Grafana dashboards** are imported automatically by `gpu-fault-admin deploy` in a separate bootstrap task,
+`grafana_install`, once this site's AMP workspace (`monitoring_resources`) is ready; they are not part of the alerting chain. deploy resolves a workspace in the Region of the CPU cluster ARN (there is no separate Region option):
 first `--grafana-workspace-id` (a typo fails the deployment, because this is operator input), then a workspace tagged
 `gpu-fault:site-id`, then the only ACTIVE workspace in that Region (which gets the site tag,
 for example a workspace created by the HyperPod observability component -- we only reuse it and never delete it); several untagged
-workspaces raise an error listing all ids, never guessing; when there is none at all, a new one is created for the customer (`AWS_SSO`, i.e. IAM Identity
-Center authentication, `CUSTOMER_MANAGED`, a self-built read-only `aps:Query*` role, tagged `gpu-fault:grafana-created-by`
+workspaces fail the deployment with an error listing all ids (pick one with `--grafana-workspace-id`), never guessing; several workspaces
+carrying this site's tag, a workspace whose site tag names another site, or a mismatching workspace IAM role identity fail the deployment
+as well (unclear ownership is not an optional presentation outage); when there is none at all, a new one is created for the customer (`AWS_SSO`, i.e. IAM Identity
+Center authentication, `CUSTOMER_MANAGED`, a self-built read-only AMP role (`aps:QueryMetrics`, `aps:GetSeries` and similar read permissions), tagged `gpu-fault:grafana-created-by`
 and written into the installation resource registry as CREATED). There is no switch: dashboards are not the alerting chain and there is no reason to turn them off.
 Then, with a one-shot service account token (15 minutes, deleted after use, never entering state or logs), it creates the Prometheus data source
 `gpu-fault-amp` (SigV4 `default`, pointing at this site's AMP workspace), verifies it can query, creates the folder
 `GPU Fault Recovery` (uid `gpu-fault-recovery`) and imports
-`deploy/observability/dashboards/*.json` with `overwrite`; when the JSON changes, the next deploy re-imports automatically. On workspace resolution
-ambiguity, creation refused by the Region (for example no IAM Identity Center instance) or a Grafana API refusal, it records
-`FAILED`, prints a WARNING (stating the manual fallback: create an Identity Center-authenticated workspace in the console and rerun with
-`--grafana-workspace-id`, or in the Grafana UI use Dashboards -> New -> Import and paste the JSON files above one by one,
-choosing `GPU Fault AMP (<region>)` as the data source) and continues the deployment; the next deploy retries. The result is written to
-`spec.health.grafanaWorkspaceId` in `site.yaml` and to the bootstrap state `resources.monitoring_install.grafana`;
-uninstall deletes only the workspace we created (tagged `gpu-fault:grafana-created-by`) and our service account.
+`deploy/observability/dashboards/*.json` with `overwrite`; when the JSON changes, the next deploy re-imports automatically. When the
+Region refuses the creation (for example no IAM Identity Center instance), the automatically resolved workspace is not ACTIVE, or the
+Grafana API refuses a step, the result is recorded as `DEGRADED` (`reason_code` `PRESENTATION_UNAVAILABLE`, task report status
+`degraded`), a WARNING is printed (stating the reason and the manual fallback: fix the cause and rerun deploy, or in the Grafana UI use
+Dashboards -> New -> Import and import the JSON files above one by one, choosing `GPU Fault AMP (<region>)` as the data source; when the
+creation was refused the reason also says to create an IAM Identity Center-authenticated, `CUSTOMER_MANAGED` workspace in the console and
+rerun with `--grafana-workspace-id <id>`) and the deployment continues; deploy ends by printing `Grafana dashboards: DEGRADED; <reason>`.
+While the result is not `PROVISIONED` the read-only probe asks for a rerun, so the next deploy retries. The result is written to
+`spec.health.grafanaWorkspaceId` in `site.yaml` and to the bootstrap state `resources.grafana_install.grafana` (an older state's
+`resources.monitoring_install.grafana` is still read); uninstall deletes only the workspace we created (tagged
+`gpu-fault:grafana-created-by`), the workspace IAM role created with it and our service account.
 A human opening the dashboards still needs Identity Center user authorisation, which deploy does automatically after the import: using the site administrator email
 (the `--admin-email` of the first deployment, afterwards read from site.yaml), it queries `aws sso-admin list-instances` in the CPU cluster Region
 to obtain the single Identity Center instance and its identity store, then uses `aws identitystore get-user-id` to find that user by
 `emails.value` (falling back to `userName`), first checks the roles already held with `aws grafana list-permissions`,
 and only when ADMIN is missing runs `update-permissions` to grant **ADMIN** (the administrator can then add
-VIEWER for on-call colleagues in the Grafana UI); the result is written to `resources.monitoring_install.grafana.admin_grant`
+VIEWER for on-call colleagues in the Grafana UI); the result is written to `resources.grafana_install.grafana.admin_grant`
 (`status` is `granted` / `already` / `not-derivable`), and at the end deploy prints
 `Grafana ADMIN granted to <email> (Identity Center user <id>)`. When the user cannot be derived (no
 Identity Center instance visible in that Region, several instances visible, no user whose email or username equals the administrator email, `identitystore:GetUserId`
@@ -6922,13 +6928,18 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
 | `regional mode requires GPU_FAULT_REGIONAL_CLUSTERS_JSON` | The Secret `gpu-fault-regional-clusters` does not exist or the key name is not `clusters.json` | Create per step 2 of the registration chapter; the key must be `clusters.json` |
 | `GPU_FAULT_REGIONAL_CLUSTERS_JSON is invalid` | JSON syntax error, commonly a newline introduced when concatenating with `jq -r`, or the token written as a bare string | Validate locally with `jq empty` before writing the Secret |
 | `regional cluster registry must be a list` | The registry JSON is not an array | Change to an array of objects; an unloaded control plane uses an explicit `[]` |
+| `regional cluster registry entries must be objects` | An element of the array is not an object | Write every entry as a JSON object |
 | `regional mode uses the cluster registry; GPU_FAULT_HYPERPOD_CLUSTER must be unset` | Environment variables copied from a single-cluster deployment | Remove `GPU_FAULT_HYPERPOD_CLUSTER` from the regional patch |
+| `regional cluster registrations require agent_endpoint_allowed_cidrs: <cluster_id,...>` | With the Agent registry enabled (the regional manifests' default) the listed entries lack the GPU node subnet CIDRs | Add `agent_endpoint_allowed_cidrs` to those entries per REG-2 |
 | `regional control plane must not enable the in-cluster KubernetesWorkflowAdapter` | `GPU_FAULT_ENABLE_KUBERNETES_ADAPTER=true` | Change to `false`; scheduling actions go through remote commands |
 | `regional control plane must delegate HyperPod mutations to the target cluster executor` | `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true` (this is a data-plane switch, not a control-plane switch) | Set `false` on the control plane and enable it in the executor manifest |
 | `regional mode requires remote execution owners` | `GPU_FAULT_REMOTE_EXECUTION_OWNERS` was set to an empty string | Remove the variable to use the default, or fill in the complete owner list |
 | `HyperPod managed recovery observer requires GPU_FAULT_ENABLE_AGENT_REGISTRY=true` | The agent registry was disabled while the managed recovery observer was kept | Enable the registry, or set `GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER` to `false` |
 
-Validate the combination of these switches in the manifests without waiting for a Pod crash:
+Before rolling out, run the same lint over the rendered manifests: it refuses, by the rules a process applies at start-up, unknown or
+unusable `GPU_FAULT_*` variables and blank booleans, as well as role, connection-budget and operation-allowlist violations (all of which
+also make a Pod exit at start-up). The regional guards in the table above depend on the registry Secret's content and the runtime
+Settings and are outside the lint; the Pod log is authoritative for them:
 
 ```bash
 ROLE_SPLIT_CHECK_DIR="$(mktemp -d)"
@@ -6941,8 +6952,8 @@ rm -rf "${ROLE_SPLIT_CHECK_DIR}"
 
 ##### REG-14.2 Commands Stay PENDING (Most Common)
 
-`PENDING` means the command has been written to the control plane but no executor has claimed it. No component reports an error for this, so you must
-check proactively. Look at the alerts and metrics first:
+`PENDING` means the command has been written to the control plane but no executor has claimed it. The command itself reports no error; it is found
+through the alerts, the executor's readiness (items 1-4 below) and the metrics, so you must check proactively. Look at the alerts and metrics first:
 
 ```bash
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -6950,29 +6961,39 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
   'import urllib.request; print("".join(l for l in urllib.request.urlopen("http://127.0.0.1:8080/metrics", timeout=10).read().decode().splitlines(True) if "remote_command" in l))'
 ```
 
-`gpu_fault_remote_command_oldest_unclaimed_seconds{cluster_id="..."}` above 600 seconds
-triggers the `GpuFaultRemoteCommandUnclaimed` alert. Rule out causes in this order:
+`gpu_fault_remote_command_oldest_unclaimed_seconds{cluster_id="..."}` above 600 seconds for 2 minutes
+triggers the `GpuFaultRemoteCommandUnclaimed` (critical) alert. Rule out causes in this order:
 
-1. **The executor is not claiming at all.** `kubectl -n gpu-fault-system logs -l
+1. **The executor is not claiming at all.** `kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" logs -l
    app=gpu-fault-cluster-executor --since=5m`. With no claim logs at all, check the OCI image digest,
-   entrypoint and `startupProbe`; the production Manifest performs no runtime `pip install`.
-2. **TLS or token failure.** `CERTIFICATE_VERIFY_FAILED` in the logs => `ca.crt` not mounted
-   or `SSL_CERT_FILE` missing; `401`/`403` => the tokens on the two sides differ; re-sync per the token rotation sub-section.
-   Note that the readinessProbe only verifies `/healthz` is reachable; both failures still leave the Pod
-   Ready.
-3. **`cluster_id` mismatch.** The GPU Secret's `cluster-id` must be exactly identical to the registry entry
-   (case and leading/trailing whitespace count). Claiming with the wrong ID returns 200 but `commands` is always empty:
+   entrypoint and `startupProbe`; the production Manifest performs no runtime `pip install`. When the executor can claim but a
+   command it advertises stays unclaimed beyond `GPU_FAULT_EXECUTOR_READINESS_MAX_UNCLAIMED_SECONDS` (default 300 seconds), or its last
+   successful claim is older than `GPU_FAULT_EXECUTOR_READINESS_MAX_CLAIM_AGE_SECONDS` (default 300 seconds), readiness fails and the
+   Pod turns NotReady.
+2. **TLS or token failure.** `CERTIFICATE_VERIFY_FAILED` in the logs => the connection Secret's `ca.crt` is not mounted at
+   `/etc/gpu-fault/tls/ca.crt` (`GPU_FAULT_CONTROL_PLANE_CA_FILE`) or does not match the NLB certificate chain; do not set
+   `SSL_CERT_FILE`/`REQUESTS_CA_BUNDLE` instead, they replace boto3's public trust roots and break STS/HyperPod calls.
+   `401`/`403` (`regional cluster authentication failed`) => the tokens on the two sides differ; re-sync with `rotate-token` (REG-9).
+   The readinessProbe runs `gpu-fault-cluster-executor-readiness`, which calls `POST /v1/regional/executors/readiness` with this
+   cluster's token, so both failures turn the Pod NotReady (log `executor readiness probe failed: ...`).
+3. **`cluster_id` mismatch.** The GPU Secret's `cluster-id` must match the registry entry (case-sensitive; the executor strips only
+   leading/trailing whitespace, and a value containing control characters fails at start-up with
+   `cluster_id must not contain control characters`). On a mismatch both claim and readiness get 403
+   `regional cluster is not registered` and the Pod stays NotReady:
    ```bash
    kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
      get secret gpu-fault-regional-connection \
      -o jsonpath='{.data.cluster-id}' | base64 -d | od -c | tail -3
    ```
-   The output must not end with `\n`.
-4. **Owner not advertised (the most hidden).** The executor reports to the claim endpoint only the owners of the adapters it
-   **actually constructed**, and the control plane silently skips commands whose owner is not advertised: neither side reports an error. Setting
-   `nodeReboot`/`nodeReplace` to OWN in the runtime profile (owner
-   `gpu-fault-hyperpod-adapter`) while the executor has
-   `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=false` is exactly this case. Cross-check:
+   The output must match the registry entry's `cluster_id` character for character.
+4. **Owner not advertised.** The executor reports to the claim and readiness endpoints only the owners of the adapters it
+   **actually constructed**, and a claim returns only commands of advertised owners. When the backlog holds a command of an owner it does
+   not advertise, readiness answers 503 (`open backlog needs execution owners this executor does not advertise: <owner>`), the Pod turns
+   NotReady and the control-plane log records `executor ... is not ready: ...`; the command itself stays PENDING. Setting
+   `nodeReboot`/`nodeReplace` to OWN in the runtime profile (owner `gpu-fault-hyperpod-adapter` on HyperPod,
+   `gpu-fault-eks-adapter` on eks-managed) while the executor has
+   `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=false` is exactly this case. Cross-check (on an eks-managed cluster use
+   `config/runtime-profile.regional-eks-safe.example.yaml` or the profile the site actually registered):
    ```bash
    kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
      get deployment/gpu-fault-cluster-executor \
@@ -6988,22 +7009,24 @@ triggers the `GpuFaultRemoteCommandUnclaimed` alert. Rule out causes in this ord
    ' config/runtime-profile.regional-hyperpod-safe.example.yaml
    ```
    Every owner in the output must be covered by an enabled adapter:
-   `gpu-fault-kubernetes-adapter` is enabled by default; `gpu-fault-node-agent` needs
-   `GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER=true`; `gpu-fault-hyperpod-adapter` needs
-   `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true`, and reboot/replace are additionally controlled by
+   `gpu-fault-kubernetes-adapter` is always enabled; `gpu-fault-node-agent` needs
+   `GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER=true`; `gpu-fault-hyperpod-adapter` (`gpu-fault-eks-adapter` on eks-managed) needs
+   `GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true` (the name predates plain-EKS support and was not renamed; both switches default to
+   `true` in the executor manifest), and reboot/replace are additionally controlled by
    `GPU_FAULT_ALLOW_HYPERPOD_REBOOT` / `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` respectively.
    Capabilities whose owner is `gpu-fault-control-plane`, `gpu-fault-validation-adapter` or
    `gpu-fault-support-escalation` execute locally on the control plane and produce no remote command.
-5. **The command belongs to a deregistered or disabled cluster.** When the registry entry has `enabled: false`, claims are
-   refused and commands pile up.
+5. **The command belongs to a deregistered or disabled cluster.** When the registry entry has `enabled: false` (or a
+   `REVOKED`/`ROLLED_BACK` lifecycle) its token is no longer accepted, claims are refused (403 `regional cluster authentication failed`)
+   and commands pile up.
 
 Unclaimed commands have a timeout and dead-lettering: the control plane's periodic cleanup sets commands still `PENDING` whose creation time exceeds
 `GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS` (default 900 seconds)
 to `FAILED` with `status_source=unclaimed-deadline-exceeded`, and the error states that no executor announced the
 `execution_owner`. The workflow therefore **fails** and enters the alerting path instead of staying in WAITING
 forever; setting 0 disables the timeout, but that reverts to the old behaviour of "nobody takes the order and nobody knows".
-The count is on `gpu_fault_remote_command_unclaimed_expired` in `/metrics`;
-the `GpuFaultRemoteCommandUnclaimed` alert remains the earlier means of discovery -- do not turn it off.
+The count is on `gpu_fault_remote_command_unclaimed_expired` in `/metrics` (its growth fires
+`GpuFaultRemoteCommandUnclaimedExpired`); the `GpuFaultRemoteCommandUnclaimed` alert remains the earlier means of discovery -- do not turn it off.
 
 ##### REG-14.3 Commands Stuck in LEASED
 
@@ -7022,8 +7045,10 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
 ```
 
 `regional cluster executor could not report result` means the action was executed on the GPU cluster but reporting the result
-failed (network jitter or a control-plane rollout). The command is then re-claimed and executed once more, relying on the adapter's
-idempotency keys for deduplication. If a real action (such as a HyperPod replace) really executed twice, record it and evaluate, based on the duration of
+failed: while the lease is still this executor's, a transient failure (no HTTP status or 408/425/429/5xx, for example network jitter or a
+control-plane rollout) is retried first, 3 attempts in total; only when they all fail, or the result is refused (stale lease, mismatching
+fencing token), is this ERROR logged. The command then stays LEASED and, once the lease expires, is re-claimed and executed once more,
+relying on the adapter's idempotency keys for deduplication. If a real action (such as RESET_GPU) really executed twice, record it and evaluate, based on the duration of
 `gpu_fault_remote_command_total{status="LEASED"}`, whether
 `LEASE_SECONDS` needs lowering.
 
@@ -7037,8 +7062,11 @@ The result carries a `status_source` field distinguishing the failure origin:
 | `status_source` | Meaning | Handling |
 |---|---|---|
 | Missing or an adapter's own value | The adapter executed normally and judged failure | Handle according to the specific adapter's failure reason |
-| `executor-rejected` | The executor actively refused (credentials, namespace allowlist, switch not enabled) | Look at `details`; usually a configuration problem |
+| `executor-rejected` | The executor refused on purpose: command cluster differs from the executor's, mismatching fencing token, workload namespace not in the allowlist, no or an ambiguous adapter | Look at `error`; usually a configuration or routing problem |
+| `executor-configuration-error` | An AWS deployment gap: the ServiceAccount lacks `eks.amazonaws.com/role-arn`, the role cannot be assumed or an API call is denied; `details.configuration_error=true`, not counted as an internal error | Fix the IAM/IRSA item `error` names, then replay |
+| `executor-execution-timeout` / `executor-execution-timeout-outcome-unknown` | One command ran longer than `GPU_FAULT_CLUSTER_EXECUTOR_MAX_EXECUTION_SECONDS` (default 1800 seconds) and the executor gave up on it; node actions, destructive operations and `ESCALATE_SUPPORT`/`FREEZE_EVIDENCE`/`CHECKPOINT_WORKLOADS` get the latter with `details.manual_confirmation_required=true` | The former leaves nothing running; for the latter confirm the node and external state by hand first |
 | `executor-internal-error` | **An exception in the executor's own code**; `details.exception_type` gives the exception type | A defect, not a configuration problem; the retained count is shown by the `gpu_fault_remote_command_executor_internal_errors_total` gauge, `gpu_fault_remote_command_executor_internal_error_last_seen_timestamp_seconds` records the latest event and triggers `GpuFaultRemoteCommandExecutorInternalError` within a 900-second window; capture the full executor stack trace |
+| `unclaimed-deadline-exceeded` | Set FAILED by the control plane: no executor claimed it before the deadline | Investigate per REG-14.2 |
 
 ```bash
 kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
@@ -7050,12 +7078,16 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
 
 Node credentials and executor credentials are two separate distribution paths: the executor reads the Kubernetes Secret, while the collectors and
 Node Agent read the host `/etc/gpu-fault/*.env`. Updating only the Secret leaves the executor working while all
-nodes lose contact after `GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS` (default 90 seconds).
-Use the endpoint migration DaemonSet of sub-section 10 to synchronise the host env files.
+nodes lose contact after `GPU_FAULT_AGENT_MAX_HEARTBEAT_AGE_SECONDS` (default 90 seconds). Change a token only with
+`gpu-fault-admin rotate-token` (REG-9), which updates the Secret and reinstalls the node Agents per fleet wave; only an endpoint or CA
+change uses the endpoint migration DaemonSet of REG-10 to synchronise the host env files.
 
-Another cause is an artifact compatibility refusal: when the CPU side's
-`GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256` / `GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST`
-differ from the nodes' actual values, registration is refused. Read the actual values before setting them; do not guess in advance:
+Another cause is a compatibility refusal: when the artifact, compatibility digest or config digest a node reports is outside the CPU-side
+pins (`GPU_FAULT_REQUIRED_AGENT_ARTIFACT_SHA256`, `GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST` and the compatible values of the
+compatibility window), the node still registers but fleet readiness judges it not ready, with reasons such as
+`artifact SHA-256 mismatch: expected ..., got ...` or `config digest mismatch: ...`. The pins come from the signed release and must not
+be changed to follow what nodes report; compare the nodes' actual values with the read-only query below, and reinstall the mismatching
+nodes through the release's Agent wave or the installer reconciler:
 
 ```bash
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -7066,12 +7098,15 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
 
 ##### REG-14.6 Receiving 403 "regional mode requires a valid X-GPU-Fault-Execution-Token"
 
-Regional-mode authorisation is default-deny: any request that is neither on the public whitelist (`/healthz`, `/metrics`, `/openapi.json`,
-`/docs`, `/redoc`) nor a data-plane path requires the operator execution token.
-`/v1/fleet/agents` and `/v1/fleet/readiness` accept two kinds of credentials -- with
-`X-GPU-Fault-Cluster-ID` they validate the data-plane token and enforce scope; without it they require the execution
-token. So operator calls must explicitly carry the execution token and must not carry the cluster ID
-header at the same time.
+Regional-mode authorisation is default-deny: every route declares its credential class, and a path no route serves answers 404. Only
+`/healthz` and `/livez` (plus `/openapi.json`, `/docs`, `/redoc`) are public; `/metrics` is public only to a loopback peer
+(`127.0.0.1` inside the Pod), other callers need the execution token (`X-GPU-Fault-Execution-Token` or `Authorization: Bearer`);
+data-plane paths require the cluster token; every other request requires the operator execution token and is answered 403
+`regional mode requires a valid X-GPU-Fault-Execution-Token for this endpoint` when it is missing or wrong.
+The fleet routes such as `/v1/fleet/agents` and `/v1/fleet/readiness` accept two kinds of credentials and pick by the credential the request
+actually carries: with `X-GPU-Fault-Execution-Token` they check the operator token; with only `Authorization: Bearer` plus
+`X-GPU-Fault-Cluster-ID` they validate the data-plane token and enforce scope; with neither they deny as the operator class. So operator
+calls must explicitly carry the execution token; a cluster ID header alone does not switch to data-plane validation.
 
 ##### REG-14.7 HyperPod Reboot Reports "unknown outcome" or "already reserved"
 
@@ -7092,11 +7127,14 @@ This directly distinguishes three failures:
 
 | Step error | Record state | Meaning and handling |
 |---|---|---|
-| `...has an unknown outcome; an operator must confirm the node state before retrying` | `UNKNOWN` | The provider call raised an exception and **whether the submission took effect is unknown**. Not retrying automatically is deliberate: first confirm the node's actual state with CloudTrail and `describe-cluster-node`, and replay the workflow manually only after confirming it did not take effect |
+| `...has an unknown outcome; an operator must confirm the node state before retrying` | `UNKNOWN` | The provider call raised an exception and **whether the submission took effect is unknown**. Not retrying automatically is deliberate: first confirm the node's actual state with CloudTrail and `describe-cluster-node` (the EC2 instance state on eks-managed), and replay the workflow manually only after confirming it did not take effect |
 | `a HyperPod submission for this idempotency key is already reserved and has no recorded outcome` | `INTENDED` | The submission is in progress on another replica, or the executor was killed mid-submission. Re-check after one lease period; still `INTENDED` means the process is dead; confirm manually as in the previous row |
 | `idempotency key was already used for a different HyperPod request` | Any | The same key was used for a different action or node set; a defect or a hand-crafted request; do not overwrite the record |
 
-To view the record of a step (over loopback from inside the CPU API Pod, with that cluster's cluster token):
+eks-managed clusters (EC2 `RebootInstances`) share the same records; `HyperPod` in the error texts reads `EKS`, and `cluster_name` is the
+cluster's `cluster_id`; the control plane refuses a `cluster_name` that does not match the registration (403 `submission cluster_name does
+not match the registered provider cluster ...`). To view the record of a step (over loopback from inside the CPU API Pod, with that cluster's
+cluster token; on an eks-managed cluster set `HP` to `${CLUSTER_ID}`):
 
 ```bash
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -7122,13 +7160,19 @@ treated as a new provider submission.
 In addition, the executor's `confirm_cluster_name` second confirmation is taken only from the separate
 `GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER` (the connection Secret's
 `hyperpod-confirm-cluster-name`). The actual provider target still comes from
-`GPU_FAULT_HYPERPOD_CLUSTER`. The two values must be supplied by different configuration items and explicitly compared; the command or
-provider configuration must not confirm itself. Therefore:
+`GPU_FAULT_HYPERPOD_CLUSTER` (`hyperpod-cluster-name`). The deployment writes the provider cluster name (the HyperPod cluster name; the
+`cluster_id` on eks-managed) into both keys; the two values come from different configuration items and are compared explicitly before a
+submission, so the command or provider configuration cannot confirm itself. Therefore:
 
-- When the variable is missing, every HyperPod reboot/replace step FAILs directly, reporting
-  `confirm_cluster_name` missing. For an executor that does not own HyperPod changes, leaving it missing is the correct configuration.
-- When the confirmation variable differs from the provider's `hyperpod_cluster_name`, the step fails at the adapter's confirmation
-  gate. This is precisely the mechanism preventing one executor from mis-operating another HyperPod cluster; do not bypass it by changing code.
+- With the lifecycle adapter enabled (`GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true`, the executor manifest's default) and the variable missing,
+  the executor **fails at start-up**: `GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER is required when the HyperPod adapter is enabled` (`EKS adapter`
+  on eks-managed); an enabled adapter without AWS credentials (the ServiceAccount lacks `eks.amazonaws.com/role-arn`) fails at start-up
+  as well. Only an executor with the adapter set to `false` may leave the variable unset; it advertises no lifecycle owner and claims no
+  reboot/replace commands.
+- When the confirmation variable differs from the cluster name in the provider configuration, the submission fails at the confirmation
+  gate (`cluster confirmation does not match configured HyperPod cluster`; on eks-managed `cluster confirmation does not match the
+  configured cluster id`). This is precisely the mechanism preventing one executor from mis-operating another cluster; do not bypass it by
+  changing code.
 
 <a id="5a4-区域数据面训练任务提交与验收"></a>
 ### 5.4 Regional Data-Plane Training Job Submission and Acceptance
@@ -7211,20 +7255,22 @@ Parameter description:
 | `--attempt-id` | `<job-id>-aNNN` | ID of this run |
 | `--attempt-number` | `1` | Used when no attempt ID is given explicitly |
 | `--site` | `GPU_FAULT_SITE_FILE` | Reads the current Runtime Profile version from the site source of truth |
-| `--runtime-profile-version` | Site version, otherwise `GPU_FAULT_RUNTIME_PROFILE` or `hyperpod-v1` | Explicit override; must agree when given together with `--site` |
+| `--runtime-profile-version` | Site version, otherwise `GPU_FAULT_RUNTIME_PROFILE` or `hyperpod-v1` | Explicit override; given together with `--site` it must equal the site Profile or a cluster's own Profile (`spec.clusters[].runtimeProfile`) |
 | `--expected-critical-ranks` | Derived from the workload | Number of critical Pod/rank units; an explicit value must equal the template-derived value |
 | `--training-container` | Auto-derived for single-container Pods | Multi-container Pods must specify the training container |
-| `--restart-budget` | Not injected; the Watcher default applies | Maximum automatic restarts of the same job |
+| `--restart-budget` | Not injected; the Watcher uses `GPU_FAULT_DEFAULT_RESTART_BUDGET` (default 1) | Maximum automatic restarts of the same job |
 | `--namespace` | kubectl current namespace | Also overrides `metadata.namespace` of the rendered manifest and is passed to `kubectl` |
-| `--context` | kubectl current context | Target HyperPod EKS context |
+| `--context` | kubectl current context | Target GPU EKS context |
 | `--kubeconfig` | kubectl default path | kubeconfig file |
 | `--dry-run` | false | Only outputs the injected YAML without calling kubectl |
 
 The command:
 
-1. Injects managed, job, attempt and role labels on the workload and all Pod Templates.
-2. Injects expected ranks, the training container, the Runtime Profile and the optional restart budget.
-3. Injects the global rank offset for PyTorchJob and JobSet.
+1. Validates that the job/attempt IDs are valid label values of at most 63 characters, injects the managed, job and attempt labels on
+   the workload, and injects those three plus the role and critical labels on all Pod Templates.
+2. Injects expected ranks, the training container, the Runtime Profile and the optional restart budget on the Pod Templates.
+3. Injects the global rank offset on every Pod Template (a PyTorchJob's Master comes first; a JobSet also gets
+   `gpu-fault.io/rank-job-stride`).
 4. Validates that multi-rank `Job`s and JobSet child Jobs use `completionMode: Indexed`.
 5. Calls `kubectl apply -f -` once via standard input.
 
@@ -7255,13 +7301,15 @@ It can also write to stdout for feeding into signing, scanning or GitOps flows:
 
 ```bash
 gpu-fault-workload-annotate training.yaml \
+  --site "${SITE_FILE}" \
   --job-id customer42-llama70b \
   --attempt-id customer42-llama70b-a002 \
   > /tmp/training.managed.yaml
 ```
 
 An external training platform may generate an equivalent complete managed YAML itself and `kubectl apply` it directly, but it must
-satisfy the same contract. The generated YAML contains, on the workload and all Pod Templates:
+satisfy the same contract. The generated YAML carries the first three labels on the workload and all of the following keys on every Pod
+Template (`restart-budget` only when given; a JobSet also carries `gpu-fault.io/rank-job-stride`):
 
 - `gpu-fault.io/managed`
 - `gpu-fault.io/job-id`
@@ -7284,9 +7332,8 @@ NCCL example and is not a control-plane dependency. Both `gpu-training-submit` a
 volume and resource configuration of the customer YAML and inject only fault-management metadata.
 
 That digest corresponds to the AWS PyTorch Training DLC
-`2.9.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.6`. On 2026-08-23 it was validated in the current
-H200/P5en environment with PyTorch 2.9, CUDA 13.0, NCCL 2.27.7, aws-ofi-nccl,
-Libfabric/EFA direct, 24-rank `all_reduce=300.0` and three-step DDP training.
+`2.9.0-gpu-py312-cu130-ubuntu22.04-ec2-v1.6`, which carries PyTorch 2.9, CUDA 13.0, NCCL 2.27.7, aws-ofi-nccl and the
+Libfabric/EFA runtime; TRAIN-1c uses it for the 24-rank `all_reduce` check and three-step DDP training on H200 (P5en) nodes.
 
 When the customer already has a final `Job`, `PyTorchJob` or `JobSet`, use that YAML directly as the input of both commands.
 If you reuse the repository's three-node sample, first replace Master/Worker simultaneously with structured YAML processing; do not just
@@ -7444,7 +7491,8 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
   delete serviceaccount gpu-fault-training-image-puller
 ```
 
-The DaemonSet's desired count must equal the number of target GPU nodes, all Pods must have been Ready, and the events must contain no
+When the site records a node selector for the cluster (always on eks-managed, and on HyperPod clusters joined under the ownership
+convention), replace the `nodeSelector` with that selector's key and value. The DaemonSet's desired count must equal the number of target GPU nodes, all Pods must have been Ready, and the events must contain no
 `ErrImagePull`/`ImagePullBackOff`. Submit the training job immediately after deleting it, so the image is not
 GC'd again while idle. The pre-pull requests no GPUs and does not change training capacity.
 
@@ -7453,24 +7501,25 @@ Submit:
 ```bash
 gpu-training-submit \
   examples/hyperpod/three-node-pytorchjob.yaml \
+  --context "${GPU_EKS_CONTEXT}" \
   --job-id hp-three-node-24gpu-demo \
   --attempt-number 1 \
   --runtime-profile-version "${RUNTIME_PROFILE_VERSION}" \
   --restart-budget 1
 ```
 
-The cluster's Kubeflow Training Operator requires the main training container to be named `pytorch`. 8-GPU NCCL
+The Kubeflow Training Operator requires a PyTorchJob's main training container to be named `pytorch`. 8-GPU NCCL
 also needs enough shared memory; the example mounts an 8 GiB memory-backed `emptyDir` at `/dev/shm`. Without that mount
 you may see `Error while creating shared memory segment ... No space left on device`.
 
 Verify the three-node resources and identity:
 
 ```bash
-kubectl get pods -n gpu-fault-system \
+kubectl --context "${GPU_EKS_CONTEXT}" get pods -n gpu-fault-system \
   -l gpu-fault.io/attempt-id=hp-three-node-24gpu-demo-a001 \
   -o wide
 
-kubectl wait --for=condition=Succeeded \
+kubectl --context "${GPU_EKS_CONTEXT}" wait --for=condition=Succeeded \
   pytorchjob/gpu-fault-three-node-pytorch \
   -n gpu-fault-system --timeout=180s
 ```
@@ -7494,14 +7543,15 @@ CA, wheel, Runtime Profile and node-specific action key.
 With an existing DCGM Exporter:
 
 ```bash
+NODE_IP="$(hostname -I | awk '{print $1}')"
 sudo deploy/node/install-gpu-fault-collector.sh \
   --control-plane-url https://gpu-fault.example.internal \
   --ca-certificate /secure/path/control-plane-ca.crt \
   --cluster-id gpu-prod-01 \
-  --runtime-profile-version hyperpod-active-v1 \
+  --runtime-profile-version "${RUNTIME_PROFILE_VERSION}" \
   --token-file /secure/cluster-token \
   --wheel-sha256 "$(cat /secure/node-runtime-wheel.sha256)" \
-  --node-id "$(hostname -f)" \
+  --node-id '<Kubernetes Node name>' \
   --driver-branch 575 \
   --cuda-version 12.9 \
   --metrics-mode dcgm \
@@ -7512,16 +7562,23 @@ sudo deploy/node/install-gpu-fault-collector.sh \
   --python-command /usr/bin/python3.12 \
   --enable-node-agent \
   --node-action-secret-file /secure/node-action-secret \
+  --node-action-key-version 2 \
   --allow-gpu-reset \
   --allow-fabric-reset \
   --allow-service-quiesce \
   --allow-fabric-manager-restart \
-  --node-agent-advertise-url "https://$(hostname -I | awk '{print $1}'):9099" \
-  --node-instance-id '<stable instance ID or Kubernetes Node UID>'
+  --node-agent-host "${NODE_IP}" \
+  --node-agent-advertise-url "https://${NODE_IP}:9099" \
+  --node-instance-id '<HyperPod: Kubernetes Node UID; eks-managed: EC2 instance ID>'
 ```
 
 Regional production installation enables reset/quiesce by default. The bare CLI default of the generic installer is still off, so a manual
-installation must pass the four parameters above explicitly to ensure the config digest in the node heartbeat matches the control-plane pin.
+installation must pass the four parameters above explicitly, together with `--node-action-key-version 2` (the control plane requires
+node-level v2 keys and the managed Installer Job passes it too), to ensure the config digest in the node heartbeat matches the control-plane
+pin. `--node-id` must equal the Kubernetes Node name; `--node-agent-host` and the advertise URL use the same node IP, because the
+auto-generated TLS certificate carries SANs only for the node ID and that address. An eks-managed node also passes
+`--cluster-provider eks-managed --quiesce-sweep-kubernetes-device-holders` (plus `--dcgm-hostengine host|embedded` when the site declares
+a DCGM host engine mode), matching the managed Installer Job's arguments.
 The production RESET_GPU and RESET_ALL_GPUS_NVSWITCHES workflows do not allow bypassing the service quiesce,
 the no-GPU-client check, fencing or the control-plane allowlist.
 
@@ -7531,8 +7588,11 @@ completed first. Only after additional validation in an isolated environment may
 ```bash
 sudo deploy/node/install-gpu-fault-collector.sh \
   --control-plane-url https://gpu-fault.example.internal \
+  --ca-certificate /secure/path/control-plane-ca.crt \
   --cluster-id gpu-prod-01 \
-  --runtime-profile-version eks-v1 \
+  --runtime-profile-version "${RUNTIME_PROFILE_VERSION}" \
+  --token-file /secure/cluster-token \
+  --wheel-sha256 "$(cat /secure/node-runtime-wheel.sha256)" \
   --metrics-mode nvidia-smi \
   --dcgm-exporter disabled \
   --enable-nvidia-smi-metrics-collector
@@ -7551,7 +7611,7 @@ these parameters do not replace the managed release, node identity or maintenanc
 | `--certificate-min-validity-seconds` | No | 2592000 | Refuse installation when the remaining validity of the CA/leaf certificate is below this many seconds; the same value is used by `gpu-fault-certificate-check.timer` for periodic re-checks |
 | `--cluster-id` | Yes | Non-empty | Stable cluster ID |
 | `--runtime-profile-version` | Yes | Non-empty | A registered profile |
-| `--node-id` | No | Host FQDN | Must match the control-plane/cluster node name |
+| `--node-id` | No | Host FQDN | Must equal the Kubernetes Node name (the managed Installer Job passes the Node name) |
 | `--node-instance-type` | No | Read automatically on HyperPod | EC2/HyperPod instance type, written into metrics and emails |
 | `--expected-gpu-count` | No | By instance type | Expected number of visible GPU UUIDs |
 | `--expected-efa-device-count` | No | Not checked when unset | Expected number of ACTIVE EFA devices |
@@ -7590,7 +7650,7 @@ these parameters do not replace the managed release, node identity or maintenanc
 | `--node-action-secret[-file]` | Conditional | >=32 characters | One of the two when the Agent is enabled |
 | `--derive-node-action-secret` | No | false | Derives the node-specific key by `cluster_id/node_id` from the supplied fleet secret (the node does not keep the fleet master after installation); the key version is fixed at 2 when deriving; a legacy-path compatibility parameter -- regional production provisions node-level v2 keys on the CPU and does not distribute the fleet master to GPU nodes |
 | `--node-action-key-version` | No | 1 when not deriving | Declares the version of the supplied key (1 or 2); managed regional installation provides node-level keys explicitly and sets 2; 1 is only for legacy migration, and production must ultimately be 2 |
-| `--node-agent-host` | No | Node ID | Agent bind address |
+| `--node-agent-host` | No | Node ID | Agent bind address, also written into the SAN of the auto-generated certificate; the managed install passes the node IP |
 | `--allow-node-agent-plaintext` | No | false | Compatibility parameter explicitly allowing HTTP without a server certificate; forbidden in production |
 | `--allow-gpu-reset` | No | false | Dangerous switch |
 | `--allow-fabric-reset` | No | false | Allows node-local all-GPU/NVSwitch reset; requires service quiesce |
@@ -7598,7 +7658,7 @@ these parameters do not replace the managed release, node identity or maintenanc
 | `--allow-fabric-manager-restart` | No | false | Allows fenced Fabric Manager restart |
 | `--diagnostic-output-dir` | No | `/var/lib/gpu-fault/diagnostics` | Local diagnostic bundle directory |
 | `--diagnostic-s3-uri` | No | Empty | Optional S3 target for persisting diagnostic bundles; on a managed site supplied by the release engine from `spec.diagnosticS3Uri` of `site.yaml` |
-| `--diagnostic-retention-seconds` | No | 604800 | Local diagnostic bundle retention time |
+| `--diagnostic-retention-seconds` | No | 604800, minimum 3600 | Local diagnostic bundle retention time |
 | `--diagnostic-max-archives` | No | 20 | Cap on the number of local diagnostic bundles |
 | `--allow-field-diagnostic` | No | false | Enables the pinned NVIDIA Field Diagnostic; must be given together with `--field-diagnostic-command` (absolute path; `{link_id}`/`{gpu_uuid}`/`{pci_bdf}` may be used) and `--field-diagnostic-sha256` |
 | `--field-diagnostic-timeout` | No | 1800, range 60-7200 | Field Diagnostic timeout (seconds) |
@@ -7608,23 +7668,27 @@ these parameters do not replace the managed release, node identity or maintenanc
 | `--disable-efa-driver-remediation` | No | false | Explicitly disables EFA PCI driver rebinding and removes `REMEDIATE_EFA_DRIVER` from the node allowlist |
 | `--allow-firmware-update` | No | false | Allows explicitly mapped SXID firmware updates; must be given together with `--firmware-update-command`/`-sha256`, `--target-firmware-version`, `--firmware-verify-command`/`-sha256` |
 | `--quiesce-services` | No | `nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-gpu-persistence,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet` (7 items) | Restored in this order, stopped in reverse; a per-GPU reset window keeps a running `nvidia-fabricmanager` (Phase C, item 10; on NVL5 the unit also runs NVLSM, kept or stopped together, item 11); the complete default is also in §7.5 |
-| `--quiesce-processes` | No | NVIDIA/DCGM base processes | Sends TERM by exact process name |
+| `--quiesce-processes` | No | Empty | Sends TERM by exact process name |
 | `--quiesce-containers` | No | `aws-hyperpod/health-monitoring-agent,gpu-fault-system/exporter,kube-system/nvidia-device-plugin-ctr` | Kubernetes `namespace/container` selectors stopped during quiesce |
+| `--cluster-provider` | No | `hyperpod` | `hyperpod` or `eks-managed`; an eks-managed quiesce never stops kubelet/containerd (the configured list and the config digest stay the same) |
+| `--dcgm-hostengine` | No | `embedded` | eks-managed only: `host` (the node runs nvidia-dcgm) or `embedded` |
+| `--quiesce-sweep-kubernetes-device-holders` | No | false | eks-managed only: after the named containers are down, also stop Kubernetes containers still holding the target GPU |
+| `--device-sweep-timeout` | No | 20 seconds, range 0-120 | How long a TERMed `/dev/nvidiaN` holder may take to let go before escalation to KILL |
 | `--container-stop-timeout` | No | 30 seconds | Container graceful-stop timeout |
-| `--container-restore-timeout` | No | 180 seconds | Timeout waiting for containers to recover |
+| `--container-restore-timeout` | No | 180 seconds, minimum 30 | Timeout waiting for containers to recover |
 | `--quiesce-failsafe-seconds` | No | 420, range 30-3600 | Delay of the first automatic systemd recovery |
 | `--quiesce-retry-seconds` | No | 60, range 10-600 | Retry period after automatic recovery fails |
 | `--quiesce-settle-seconds` | No | 2 | Settle wait after stopping services and sending TERM |
 | `--node-agent-port` | No | 9099 | 1-65535 |
-| `--node-agent-advertise-url` | No | `https://node:9099` | The installer auto-generates the node TLS cert/key by default; production must use HTTPS |
+| `--node-agent-advertise-url` | No | `https://<node-id>:<port>` | The installer auto-generates the node TLS cert/key by default; production must use HTTPS |
 | `--node-agent-tls-cert` | No | Auto-generated | When given explicitly, must be given together with the key |
 | `--node-agent-tls-key` | No | Auto-generated | Certificate private key |
 | `--node-agent-tls-client-ca` | No | Empty | Requires client certificates and verifies them with this CA |
 | `--node-heartbeat-interval` | No | 30 seconds | Minimum 5 seconds |
-| `--node-inflight-wait-timeout` | No | 2100 seconds | Cap on how long a duplicate command waits for the in-flight original to finish |
+| `--node-inflight-wait-timeout` | No | 2100 seconds, minimum 10 | Cap on how long a duplicate command waits for the in-flight original to finish |
 | `--node-action-retention-seconds` | No | 2592000 seconds (30 days), minimum 600 | Node action ledger retention time |
 | `--node-action-max-results` | No | 10000 | Cap on ledger rows |
-| `--node-instance-id` | Conditional | Auto-discovered | Passing the Node UID/instance ID explicitly is recommended |
+| `--node-instance-id` | Conditional | Auto-discovered (DMI `product_uuid`, else `/etc/machine-id`) | Must be determinable when the Node Agent is enabled; the managed install passes the Kubernetes Node UID (HyperPod) or the EC2 instance ID (eks-managed), and a manual install should match it |
 | `--no-start` | No | false | Install and enable only |
 | `--print-config-digest-environment` | No | Does not install | Prints the deterministic Agent config digest inputs and exits; used to cross-check the fleet digest |
 
@@ -7643,6 +7707,10 @@ Enabling the capability by default does not change the guard that keeps the Node
 - `/var/lib/gpu-fault/node-actions.db`
 - `/var/lib/gpu-fault/quiesce/` (holds recovery state only during a quiesce)
 - `/var/lib/gpu-fault/log-collector-state.json` (generated only after the NodeLogCollector is enabled)
+- `/var/lib/gpu-fault/fabric-manager-collector-state.json`, `/var/lib/gpu-fault/health-snapshot/` (the Fabric Manager collector cursor
+  and the health-snapshot requests of the install check)
+- `/var/lib/gpu-fault/diagnostics/` (the default local diagnostic bundle directory, see `--diagnostic-output-dir`)
+- `/etc/gpu-fault/node-agent.crt`, `/etc/gpu-fault/node-agent.key` (the auto-generated Agent TLS certificate and private key)
 - `/opt/gpu-fault/verify`
 - `/opt/gpu-fault/uninstall`
 - `/opt/gpu-fault/verify-certificate-bundle`, `/opt/gpu-fault/check-control-plane-certificate` (certificate check entry points, used with `gpu-fault-certificate-check.service/.timer`)
@@ -7655,7 +7723,8 @@ Enabling the capability by default does not change the guard that keeps the Node
 Before an upgrade or uninstall, the script checks the quiesce state file and first calls the fail-safe recovery entry point. If any service cannot
 be recovered the operation aborts immediately and does not delete the recovery program or the state file.
 
-Configuration files have mode `0600`.
+`collector.env`, `node-agent.env`, `dcgm-exporter.env` and the Agent TLS private key have mode `0600`; `dcgm-counters.csv` and the
+Agent certificate are `0644` (they hold no secrets).
 
 #### NODE-4. NodeLogCollector Deployment Policy
 
@@ -7690,7 +7759,8 @@ VERIFY/RESET for GPUs whose device node cannot be resolved: the error string
 `the driver reports no minor number for it` (`nvidia-smi -q -x` gave no minor for that card; the card is lost;
 go the REPLACE route), `the driver reports device node /dev/nvidiaN for more than one GPU` (two cards
 report the same minor; the driver state is abnormal; reboot the node first and look again), `no GPU on this node reports this UUID`
-(the UUID carried by the workflow does not belong to this node: a stale plan or sent to the wrong node; check the incident's node binding).
+(the UUID carried by the workflow does not belong to this node: a stale plan or sent to the wrong node; check the incident's node binding);
+when the inventory probe itself fails the reason degrades to `the driver reported no device node for it`.
 Do not retry the reset in any of the three cases. A VERIFY without an explicit UUID now takes all GPUs of this node as targets, and if any of them cannot resolve
 a device node the whole node refuses, rather than scanning only the resolvable ones and passing; when `nvidia-smi -L` enumerates none
 it refuses likewise. Also affected are `UPDATE_SOFTWARE_FIRMWARE` and `REMEDIATE_DRIVER`: they VERIFY with the event's
