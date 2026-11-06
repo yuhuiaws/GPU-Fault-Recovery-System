@@ -189,8 +189,8 @@ GB300 属于 GB200 列。
   前要求停止受影响工作负载。
 - XID 154：驱动报告动作优先。Catalog 的 `Xid 154 linkage` 描述联动上报版本，不是原始 Xid 的最低支持版本；旧驱动或缺少版本信息不因此阻止 Xid 48/63/79/94/95 等原始规则。NVLink5 的 R575 位格式边界和必需解码证据仍保留。DCGM 字段 1523 以状态的形式持有同一个值：取值 1-4 按同标签的 XID 154 判定，XID 154 负责该 GPU 的恢复时只作证据（见下文「依据（Evidence）：DCGM 字段审计补入的规则」）。
 - `DRAIN_P2P`：禁止调度、停止关联任务、quiesce、确认无 GPU 客户端后，由独立 `RECOVER_DRAIN_P2P` operation 检查目标 GPU 的 persistence 已关闭并重读 GPU Recovery Action。`None` 不 reset；`Reset`、`Drain and Reset`、仍为 `Drain P2P` 时复用既有受保护的 GPU reset；任一目标要求 `Reboot` 时不先 reset 其他目标，转节点重启。未知动作、缺失/重复 GPU、persistence 未释放等不授权 reset/reboot，交人工处理。独立 operation 让旧 Agent 拒绝不认识的请求，不能静默退化为 `STOP_WORKLOADS` 或无条件 reset。
-- XID 159 `CHECK_UVM`：事件显式带 `uvm_in_use=true` 时 reset，`false` 时 ignore；缺少该证据时 `BLOCKED_MISSING_EVIDENCE`
-  + `safety_action=QUARANTINE`（本系统的 fail-closed 选择）。产品自带的采集器不提供该字段，因此采集到的 XID 159 目前都按缺证据处理。
+- XID 159 `CHECK_UVM`：事件显式带 `uvm_in_use=true` 时 reset，`false` 时 ignore；缺少该证据时 `BLOCKED_MISSING_EVIDENCE` +
+  `safety_action=QUARANTINE`（本系统的 fail-closed 选择）。产品自带的采集器不提供该字段，因此采集到的 XID 159 目前都按缺证据处理。
 - XID 144-150：按驱动 R575 边界选择 V1/V2 `IntrInfo` pattern，同时匹配
   Error Status 和 Action 2。主动作与 Action 2 可以使用不同的位模式，分别匹配；
   RXPIPE 次级模式命中仍须满足同一表项的 Error Status，不能先要求主模式也命中。
@@ -390,8 +390,8 @@ SXID 恢复依据 Fabric Manager User Guide（`https://docs.nvidia.com/datacente
 - always-fatal（Table 23 钉死的 20 码）：执行 `REBOOT_NODE`，事前 cordon 并停止任务，不需要 fabric_partition
   或 GPU inventory；不在钉死表内的码声明 Always-Fatal 或 Fatal 时一律阻塞（`BLOCKED_MISSING_EVIDENCE`），不凭
   客户端给出的分级授权任何破坏性恢复。
-- `RESTART_VM`（11004、12028，Shared NVSwitch/vGPU 场景）：裸金属没有 guest VM 生命周期，`BLOCKED_WORKFLOW`（隔离是本系统的 fail-closed 选择）
-  + `safety_action=QUARANTINE`；`CHECK_MECHANICALS`（20012）：`ESCALATE_OPERATOR`，编译为 FREEZE_EVIDENCE → CHECK_MECHANICALS（通知并等待人工确认，不 cordon、不停任务）。
+- `RESTART_VM`（11004、12028，Shared NVSwitch/vGPU 场景）：裸金属没有 guest VM 生命周期，`BLOCKED_WORKFLOW` +
+  `safety_action=QUARANTINE`（隔离是本系统的 fail-closed 选择）；`CHECK_MECHANICALS`（20012）：`ESCALATE_OPERATOR`，编译为 FREEZE_EVIDENCE → CHECK_MECHANICALS（通知并等待人工确认，不 cordon、不停任务）。
 - Blackwell 系列（B100/GB200 产品系列，含 B200/B300、GB200/GB300）：传统 SXID 不适用，判 `NOT_APPLICABLE`（investigatory
   `USE_DCGM_NVSDM_TELEMETRY`）+ `safety_action=QUARANTINE`（本系统的 fail-closed 选择）；产品不属于任何已知系列时
   `BLOCKED_MISSING_EVIDENCE`（`VERIFY_GPU_PRODUCT_GENERATION`）。

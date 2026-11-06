@@ -426,8 +426,8 @@ the artifact `src/gpu_fault/data/nvidia-fabric-manager-sxid-2025-11-14.yaml` pin
 - always-fatal (the 20 codes pinned by Table 23): executes `REBOOT_NODE`, cordoning and stopping the job beforehand, and
   needs neither fabric_partition nor a GPU inventory; a code outside the pinned tables that declares Always-Fatal or Fatal
   always blocks (`BLOCKED_MISSING_EVIDENCE`): a client-supplied severity never authorises a destructive recovery.
-- `RESTART_VM` (11004, 12028, the Shared NVSwitch/vGPU case): bare metal has no guest VM lifecycle, so `BLOCKED_WORKFLOW`
-  + `safety_action=QUARANTINE` (the isolation is this system's fail-closed choice); `CHECK_MECHANICALS` (20012):
+- `RESTART_VM` (11004, 12028, the Shared NVSwitch/vGPU case): bare metal has no guest VM lifecycle, so `BLOCKED_WORKFLOW` +
+  `safety_action=QUARANTINE` (the isolation is this system's fail-closed choice); `CHECK_MECHANICALS` (20012):
   `ESCALATE_OPERATOR`, compiled to FREEZE_EVIDENCE → CHECK_MECHANICALS (notify and wait for an operator's acknowledgement,
   no cordon, no stop).
 - The Blackwell families (B100/GB200 product families: B200/B300, GB200/GB300): the traditional SXIDs do not apply,
