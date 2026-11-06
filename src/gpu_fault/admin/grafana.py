@@ -793,10 +793,17 @@ class _GrafanaApi:
             return response.status, {}
 
 
+def _datasource_name(region: str) -> str:
+    """The name the data source is created with; the dashboards bind it by
+    ``DATASOURCE_UID``, never by this name."""
+
+    return f"GPU Fault AMP ({region})"
+
+
 def _datasource_document(amp_workspace_id: str, region: str) -> dict[str, Any]:
     return {
         "uid": DATASOURCE_UID,
-        "name": f"GPU Fault AMP ({region})",
+        "name": _datasource_name(region),
         "type": "prometheus",
         "access": "proxy",
         "url": (
@@ -1076,7 +1083,7 @@ def ensure_grafana_dashboards(
             exc, GrafanaIdentityError
         ):
             raise
-        return _failed(exc, {})
+        return _failed(exc, {}, region=cpu.region)
     try:
         summary = provision_grafana(
             runner,
@@ -1087,7 +1094,7 @@ def ensure_grafana_dashboards(
             http=http,
         )
     except (BootstrapError, ValueError) as exc:
-        return _failed(exc, workspace)
+        return _failed(exc, workspace, region=cpu.region)
     workspace_id = str(workspace["workspace_id"])
     viewer: dict[str, Any] = {}
     if settings.viewer_sso_user_id:
@@ -1111,7 +1118,7 @@ def ensure_grafana_dashboards(
     except GrafanaIdentityError:
         raise
     except (BootstrapError, TimeoutError) as exc:
-        return _failed(exc, {**workspace, **summary, **viewer})
+        return _failed(exc, {**workspace, **summary, **viewer}, region=cpu.region)
     return {
         "status": "PROVISIONED",
         **workspace,
@@ -1349,13 +1356,17 @@ def _grant_role(
         )
 
 
-def _failed(error: Exception, workspace: Mapping[str, Any]) -> dict[str, Any]:
+def _failed(
+    error: Exception, workspace: Mapping[str, Any], *, region: str
+) -> dict[str, Any]:
     reason = diagnostic_text(str(error))
     print(
         "WARNING: Grafana dashboards were not provisioned; the alerting path is "
         f"unaffected and the deploy continues. Reason: {reason}. Fix the cause "
         f"and re-run deploy, or import {DASHBOARDS_DIRECTORY}/*.json by hand "
-        "(Dashboards -> New -> Import, data source 'GPU Fault AMP').",
+        "(Dashboards -> New -> Import; the panels bind the data source by uid "
+        f"'{DATASOURCE_UID}', which deploy creates as "
+        f"'{_datasource_name(region)}').",
         file=sys.stderr,
         flush=True,
     )

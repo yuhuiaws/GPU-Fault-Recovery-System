@@ -3537,7 +3537,8 @@ Then, with a one-shot service account token (15 minutes, deleted after use, neve
 Region refuses the creation (for example no IAM Identity Center instance), the automatically resolved workspace is not ACTIVE, or the
 Grafana API refuses a step, the result is recorded as `DEGRADED` (`reason_code` `PRESENTATION_UNAVAILABLE`, task report status
 `degraded`), a WARNING is printed (stating the reason and the manual fallback: fix the cause and rerun deploy, or in the Grafana UI use
-Dashboards -> New -> Import and import the JSON files above one by one, choosing `GPU Fault AMP (<region>)` as the data source; when the
+Dashboards -> New -> Import and import the JSON files above one by one -- the panels bind the data source by uid `gpu-fault-amp`,
+which deploy creates as `GPU Fault AMP (<region>)`; when the
 creation was refused the reason also says to create an IAM Identity Center-authenticated, `CUSTOMER_MANAGED` workspace in the console and
 rerun with `--grafana-workspace-id <id>`) and the deployment continues; deploy ends by printing `Grafana dashboards: DEGRADED; <reason>`.
 While the result is not `PROVISIONED` the read-only probe asks for a rerun, so the next deploy retries. The result is written to

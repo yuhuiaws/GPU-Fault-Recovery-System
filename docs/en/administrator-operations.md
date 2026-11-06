@@ -4230,7 +4230,8 @@ iterates over all rules asserting this, and asserts the thresholds too); a thres
 
 Import path: the Grafana provisioning step of `gpu-fault-admin deploy` imports them automatically at deployment into
 the "GPU Fault Recovery" folder and binds the Prometheus (AMP) data source with uid `gpu-fault-amp`;
-the manual fallback is Grafana -> Dashboards -> New -> Import -> upload the corresponding JSON -> choose the AMP data source.
+the manual fallback is Grafana -> Dashboards -> New -> Import -> upload the corresponding JSON (the panels bind the data source by
+uid `gpu-fault-amp`, so the import asks for none; deploy creates it as `GPU Fault AMP (<region>)`).
 Every dashboard has `control_plane_cluster` / `region` variables at the top, and those drawing per-cluster metrics also have
 a `cluster_id` multi-select variable (default All).
 

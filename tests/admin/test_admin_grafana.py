@@ -939,6 +939,25 @@ def test_a_refused_http_call_fails_soft_but_keeps_the_created_workspace(
     assert "401" in result["reason"]
 
 
+def test_the_manual_fallback_names_the_data_source_the_deploy_creates(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The dashboards bind their data source by uid, and the deploy names it
+    after the region: the warning's hand-import fallback names both, never a
+    bare name no data source carries."""
+
+    runner = Runner([])
+    http = Http({("GET", "/api/org"): HttpResponse(401, "Unauthorized")})
+
+    result = _ensure(runner, _settings(), tmp_path, http=http)
+
+    assert result["status"] == "DEGRADED"
+    err = capsys.readouterr().err
+    assert f"uid '{DATASOURCE_UID}'" in err, f"the binding uid is not named: {err}"
+    assert f"'GPU Fault AMP ({REGION})'" in err, f"the created name is not: {err}"
+    assert "'GPU Fault AMP'" not in err, "a name no data source carries"
+
+
 def test_a_probe_reproves_a_provisioned_workspace_read_only(tmp_path: Path) -> None:
     runner = Runner([_tagged(HYPERPOD_WORKSPACE, **{"gpu-fault:site-id": SITE})])
     previous = {"status": "PROVISIONED", "workspace_id": "g-5b81a13d97"}
