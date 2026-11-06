@@ -7886,7 +7886,10 @@ sudo /opt/gpu-fault/uninstall
 | `GPU_FAULT_AGENT_ENDPOINT_ALLOWED_HOST_SUFFIXES` | Empty | Additional endpoint domain suffixes allowed beyond the node's own name/private address |
 | `GPU_FAULT_AGENT_ENDPOINT_ALLOWED_CIDRS` | Empty | Single-cluster/Canary compatibility path only; regional production uses `agent_endpoint_allowed_cidrs` of each cluster registration |
 
-Recommended phased allowlist:
+In regional production `GPU_FAULT_ALLOWED_OPERATIONS` lives in the source Manifest
+(`deploy/control-plane/base/control-plane-deployment.yaml`) and is rendered into every role's core ConfigMap with every
+operation except `RESTART_VM`; a regional site phases capabilities in through the Runtime Profile (section 10) instead of
+editing the allowlist. The phased allowlist below is for a single-cluster/Canary control plane:
 
 ```text
 # Phase 1: evidence and isolation only
@@ -7955,7 +7958,7 @@ companion, and the 30 s `PENDING_CORRELATION` window is unchanged.
 | `GPU_FAULT_NODE_AGENT_ENDPOINTS` | `{}` | Static JSON (node -> URL) used only without an Agent registry; with the registry, only the heartbeat-registered endpoints are used |
 | `GPU_FAULT_EVIDENCE_OWNER` | `gpu-fault-control-plane` | Evidence step owner |
 | `GPU_FAULT_VALIDATION_OWNER` | `gpu-fault-validation-adapter` | validation owner |
-| `GPU_FAULT_VALIDATION_REQUIRE_RDMA` | false | Set true on RDMA clusters |
+| `GPU_FAULT_VALIDATION_REQUIRE_RDMA` | false (true in the regional manifests) | Set true on RDMA clusters |
 | `GPU_FAULT_POST_ACTION_VALIDATION_MAX_SAMPLE_AGE_SECONDS` | 420 | Validation window after actions such as RESET/REBOOT; must be no less than `GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS`; the default covers one 300 s edge-filter period plus transport jitter |
 | `GPU_FAULT_MANAGED_RECOVERY_OWNERS` | The two HyperPod owners | Comma-separated (`hyperpod-managed-node-recovery,hyperpod-managed-job-recovery`); empty by default when the process has `GPU_FAULT_CLUSTER_PROVIDER=eks-managed` (plain EKS has no HyperPod managed recovery) |
 | `GPU_FAULT_REMOTE_EXECUTION_OWNERS` | The four adapter owners: Kubernetes, Node Agent, HyperPod, EKS | In regional mode the steps of these owners become remote commands for the target cluster's cluster executor; empty refuses to start in regional mode |
@@ -11754,7 +11757,7 @@ request, ~1,000 concurrent connections per api-ha process) parks most of its con
 the service listening socket -- with four processes and 4,250 connections the queue held a median of 3,874 and a
 maximum of 3,943 while the processes held only 550-740 each -- and the kubelet's probe connection joins that FIFO, so
 its wait is queue depth over accept rate (3.6 s locally at 1,090 req/s while the request itself took 0.1 s in-app;
-~11 s at the live scale of 4,266 connections per Pod and ~390 req/s per Pod). A 5 s x 2 probe therefore restarted every
+~11 s at a 50-cluster burst of 4,266 connections per Pod and ~390 req/s per Pod). A 5 s x 2 probe therefore restarted every
 replica at once while every request was being answered 202 (0 non-2xx). Under the same burst the event loop's longest
 single stall was one gen-2 garbage collection (0.15-0.6 s); GIL contention was not the mechanism (32 vs 8 decode
 threads and 16 vs 8 flush slots gave identical results). On the dedicated port the probe under the same burst had a
@@ -11792,7 +11795,7 @@ accept queue; the `--workers 1` spool-worker uses the same launcher). The local 
 req/s, client p50 3.66/3.68 vs 3.73/3.74 s and p99 4.18/4.03 vs 4.32/4.51 s, service-port first byte p50 3.3/3.2 vs
 3.3/3.0 s; the kernel spreads arrivals evenly (each worker serves 24.7-25.2%), the four queues' busiest/quietest depth
 ratio is 1.13-1.30, total depth median 3,900 vs 3,750. The difference appears once the connections exceed the Pod
-namespace's `somaxconn` (4096) -- which the live 50-cluster burst did, at 4,266 per Pod: at 50 x 110 workers (5,500
+namespace's `somaxconn` (4096) -- which a 50-cluster burst does, at 4,266 per Pod: at 50 x 110 workers (5,500
 connections) the shared socket's queue pins at 4,097, new SYNs are dropped and retransmitted after 1/3/7/15 s, 961 req/s,
 73 503s, client p99 27.9 s, max 31.6 s; four per-worker sockets hold 5,089 queued connections (1,051-1,186 each, far
 below 4096), 1,117 req/s, 0 non-2xx, p99 5.35 s, max 5.44 s. The costs are the hash itself: a connection is pinned to the
@@ -12428,7 +12431,9 @@ registry; upgrades scan live objects and merge-refresh, without requiring admini
   migration, and at the same time
   `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_RELEASE_ID` matching the current `GPU_FAULT_RELEASE_ID` must be set, as well as
   a `GPU_FAULT_NODE_ACTION_RESULT_SIGNATURE_MIGRATION_EXPIRES_AT` that is an ISO-8601 time with a time zone, not yet passed and
-  no more than 14 days out; otherwise the Agent refuses to start.
+  no more than 14 days out; otherwise the Agent refuses to start. An Agent with the final-ownership gate (the production Node
+  Agent's default, `require_final_ownership=True`) requires signed result queries whatever this switch says, so on a
+  production Agent it does not open unsigned queries.
 - By default `/metrics` exposes only the collector aggregates, the fixed Top-N (`GPU_FAULT_METRICS_COLLECTOR_TOP_N`, default 20) and
   `gpu_fault_collector_metrics_snapshot_age_seconds`. That metric family is exported only by
   `GPU_FAULT_SERVICE_ROLE=all/ingress`; a custom scrape configuration must include ingress,
@@ -12477,12 +12482,12 @@ export GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS=2
 export GPU_FAULT_PROCESSOR_CLEANUP_INTERVAL_SECONDS=60
 export GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS=600
 export GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE=1000
-export GPU_FAULT_STORE_IO_WORKERS=8
-export GPU_FAULT_STORE_IO_MAX_IN_FLIGHT=64
-export GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS=2
-export GPU_FAULT_POSTGRES_POOL_MIN_SIZE=1
-export GPU_FAULT_POSTGRES_POOL_MAX_SIZE=8
-export GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS=2
+export GPU_FAULT_STORE_IO_WORKERS=28
+export GPU_FAULT_STORE_IO_MAX_IN_FLIGHT=1024
+export GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS=30
+export GPU_FAULT_POSTGRES_POOL_MIN_SIZE=2
+export GPU_FAULT_POSTGRES_POOL_MAX_SIZE=40
+export GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS=10
 export GPU_FAULT_DCGM_EXPORTER_MODE=auto
 export GPU_FAULT_DCGM_EDGE_FILTER_ENABLED=true
 export GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS=300
@@ -12506,8 +12511,9 @@ export GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES=2
 # existing mode may use a node address template:
 # export GPU_FAULT_DCGM_METRICS_URL='http://{node_ip}:9400/metrics'
 export GPU_FAULT_NVSWITCH_TOPOLOGY_MAX_AGE_SECONDS=300
-# On platforms such as A100 that may have trunks, configure after installing the site query adapter:
-# export GPU_FAULT_NVSWITCH_TOPOLOGY_COMMAND="/path/to/site-topology-query --json"
+# On platforms such as A100 that may have trunks, configure after installing the site query adapter, through the node
+# installer flag (a node-side variable that deploy.sh does not pass on):
+#   install-gpu-fault-collector.sh ... --nvswitch-topology-command "/path/to/site-topology-query --json"
 
 # Aurora, adjustable by capacity
 export AURORA_CLUSTER_ID=gpu-fault-aurora
@@ -12535,17 +12541,17 @@ Parameter description:
 | `AURORA_ENGINE_VERSION` | `16.8` | Must be an Aurora PostgreSQL version supported in the target region |
 | `GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS` | `20` | Should be less than the Agent stale window |
 | `GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS` | `1800` | Covers the actual node replacement duration; it is also used as the per-step wait cap of those two actions, so adjusting it adjusts the cap too |
-| `GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS` | `60` | After the new boot, Agent and HyperPod Running, keep waiting for kubelet, GPU and EFA device plugin registration to settle before resuming training |
+| `GPU_FAULT_HYPERPOD_POST_REBOOT_STABILIZATION_SECONDS` | `60` | After the new boot, Agent and HyperPod Running, keep waiting for kubelet, GPU and EFA device plugin registration to settle before resuming training; comes from the generated recovery ConfigMap, deploy.sh does not read an exported value |
 | `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER` | `false` | Enable only after spare labels, capacity and drills are ready |
 | `GPU_FAULT_DEFAULT_RESTART_BUDGET` | `1` | Cluster default; a per-job annotation may override |
 | `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS` | `5` | Initial aggregation wait for multi-node recovery of the same job/attempt and cross-type DCGM metric, XID, SXID recovery; `0` disables |
 | `GPU_FAULT_PROCESSOR_DRAIN_MAX_WAIT_SECONDS` | `30` | Maximum time to wait for the same GPU cluster's processor queue to drain after the aggregation window expires; released on expiry to avoid workflow starvation by continuous telemetry |
 | `GPU_FAULT_PROCESSOR_WORKERS` | deploy.sh `24`; bare application default `4` | Number of parallel lanes per active consumer process; fault/workflow changes are serialised per cluster, periodic telemetry is parallel per cluster, node and endpoint. Also the default source for the four pools `PROCESSOR_FAULT_WORKERS` / `_OBSERVATION_WORKERS` / `_GPU_TELEMETRY_WORKERS` / `_HOST_TELEMETRY_WORKERS` when not set explicitly (each takes `//4`). **These variables take effect only in the worker tier that consumes the queue**: the thread pools are created by `run_processor`, and with `SERVICE_ROLE=ingress` that thread does not start, so setting them on ingress neither takes effect nor should be counted in capacity |
-| `GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS` | `120` (deploy.sh does not set it, taking the bare application default; regional manifest ingress/spool 30, worker 150) | Active lane lease cap; the actual lease does not exceed the remaining execution deadline of this request |
+| `GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS` | Bare application default `120`; deploy.sh shares the generated processor ConfigMaps with the regional deployment: ingress/spool 30, worker 150 | Active lane lease cap; the actual lease does not exceed the remaining execution deadline of this request |
 | `GPU_FAULT_PROCESSOR_REQUEST_RENEW_SECONDS` | `5` | Renewal interval of an executing active lane; must be less than the request lease |
-| `GPU_FAULT_PROCESSOR_REQUEST_MAX_EXECUTION_SECONDS` | `30` (deploy.sh does not set it, taking the bare application default; regional manifest ingress/spool 20, worker 120) | Hard deadline of a single processing; a timed-out result is dropped, claiming new requests stops, and after the lane expires another Pod takes over with fencing |
+| `GPU_FAULT_PROCESSOR_REQUEST_MAX_EXECUTION_SECONDS` | Bare application default `30`; the generated processor ConfigMaps: ingress/spool 20, worker 120 | Hard deadline of a single processing; a timed-out result is dropped, claiming new requests stops, and after the lane expires another Pod takes over with fencing |
 | `GPU_FAULT_PROCESSOR_RETRYABLE_RESPONSE_MAX_AGE_SECONDS` | `300` | Maximum request age for releasing the request/lane and retrying when internal replay returns 408/425/429/5xx; beyond that age the terminal response is kept, avoiding a permanent poison queue |
-| `GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS` | ingress `20` / worker `130` / spool-worker `30` | Exit deadline shared by all background threads; the worker value covers a 120-second legitimate processor request, the 5-second deadline exit grace and 5 seconds of wrap-up. The corresponding termination grace is 120/240/130 seconds respectively |
+| `GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS` | ingress `20` / worker `130` / spool-worker `30` | Exit deadline shared by all background threads; the worker value covers a 120-second legitimate processor request, the 5-second deadline exit grace and 5 seconds of wrap-up. The corresponding termination grace is 140/240/130 seconds respectively |
 | `GPU_FAULT_PROCESSOR_GPU_INVENTORY_STALE_SECONDS` | `180` | PENDING GPU inventory older than this is explicitly completed as `STALE_SUPERSEDED`, no longer executing policy with an old device mapping |
 | `GPU_FAULT_PROCESSOR_HEALTH_SUMMARY_STALE_SECONDS` | `420` | Applies only to GPU/Host health summaries without edges/errors; anomaly, recovery and fault events are not dropped by this TTL |
 | `GPU_FAULT_PROCESSOR_OBSERVATION_STALE_SECONDS` | `120` | When a Workload Observation is older than this and the control plane has saved a newer snapshot, the old request terminates as `STALE_SUPERSEDED` |
@@ -12573,12 +12579,12 @@ Parameter description:
 | `GPU_FAULT_HTTP_CONNECTION_IDLE_SECONDS` | `90` | Idle ceiling of the node-side connection pool, below the NLB's 350 s; an idler connection is closed and replaced before reuse |
 | `GPU_FAULT_HTTP_CONNECTION_MAX_AGE_SECONDS` | `1800` | Longest life of a node-side connection (+-10% jitter); replaced at expiry so clients re-spread over Pods and workers; 0 unbounded |
 | `GPU_FAULT_HTTP_TCP_KEEPALIVE_SECONDS` | `60` | TCP keepalive idle time of node-side connections (probes every 15 s, 4 probes); 0 disables it |
-| `GPU_FAULT_STORE_IO_WORKERS` | `8` | Bounded number of threads per API process executing synchronous Aurora/store transactions |
-| `GPU_FAULT_STORE_IO_MAX_IN_FLIGHT` | `64` | Total store calls allowed executing and waiting per API process |
-| `GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS` | `2` | Time to wait for a slot when store I/O is saturated; on timeout returns 503 with `Retry-After` |
-| `GPU_FAULT_POSTGRES_POOL_MIN_SIZE` | `1` | Lower bound of resident PostgreSQL connections per API Pod |
-| `GPU_FAULT_POSTGRES_POOL_MAX_SIZE` | `8` | PostgreSQL connection cap per **uvicorn process**; the cluster total cap is this value × `--workers` × replicas, and it should not be less than `GPU_FAULT_STORE_IO_WORKERS` |
-| `GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS` | `2` | Maximum wait to obtain a database connection |
+| `GPU_FAULT_STORE_IO_WORKERS` | deploy.sh `28` (ingress only; control-worker fixed at 8); bare application default `8` | Bounded number of threads per API process executing synchronous Aurora/store transactions |
+| `GPU_FAULT_STORE_IO_MAX_IN_FLIGHT` | deploy.sh `1024` (ingress; control-worker 48); bare application default `64` | Total store calls allowed executing and waiting per API process |
+| `GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS` | deploy.sh `30` (ingress; control-worker 5); bare application default `2` | Time to wait for a slot when store I/O is saturated; on timeout returns 503 with `Retry-After` |
+| `GPU_FAULT_POSTGRES_POOL_MIN_SIZE` | deploy.sh `2`; bare application default `1` | Lower bound of resident PostgreSQL connections per uvicorn process |
+| `GPU_FAULT_POSTGRES_POOL_MAX_SIZE` | deploy.sh ingress `40` (override alone with `GPU_FAULT_INGRESS_POSTGRES_POOL_MAX_SIZE`), control-worker `24` (`GPU_FAULT_WORKER_POSTGRES_POOL_MAX_SIZE`); bare application default `8` | PostgreSQL connection cap per **uvicorn process**; the cluster total cap is this value × `--workers` × replicas, and it should not be less than `GPU_FAULT_STORE_IO_WORKERS` |
+| `GPU_FAULT_POSTGRES_POOL_TIMEOUT_SECONDS` | deploy.sh `10`; bare application default `2` | Maximum wait to obtain a database connection |
 | `GPU_FAULT_POSTGRES_POOL_MAX_IDLE_SECONDS` | `300` | Idle connections are closed after this time, falling back to `POOL_MIN_SIZE`; `0` means no reclamation |
 | `GPU_FAULT_POSTGRES_POOL_MAX_LIFETIME_SECONDS` | `3600` | Maximum connection lifetime; also reclaims connections pointing at the old writer after an Aurora failover |
 | `GPU_FAULT_POSTGRES_STATEMENT_TIMEOUT_SECONDS` | `60` | Server-side `statement_timeout` and `idle_in_transaction_session_timeout`; bootstrap DDL exempts itself |
@@ -12604,8 +12610,8 @@ Parameter description:
 | `GPU_FAULT_HOST_HISTORY_MAX_POINTS` | `20` | Cap on in-node memory history points attached to Host candidate batches |
 | `GPU_FAULT_DCGM_METRICS_URL` | `http://127.0.0.1:9400/metrics` | Node-local endpoint; supports `{node_ip}` and `{node_name}` |
 | `GPU_FAULT_DCGM_REQUIRED_METRICS` | The set of critical fault fields | Comma means all required, `|` means alternative fields; trim only after confirming the control plane does not depend on them |
-| `GPU_FAULT_NVSWITCH_TOPOLOGY_MAX_AGE_SECONDS` | `300` | Maximum age of the SXID port topology snapshot |
-| `GPU_FAULT_NVSWITCH_TOPOLOGY_COMMAND` | Empty | Node-local topology query command that must output canonical JSON; the command is not run through a shell |
+| `GPU_FAULT_NVSWITCH_TOPOLOGY_MAX_AGE_SECONDS` | `300` | Maximum age of the SXID port topology snapshot; deploy.sh always writes 300, an exported value has no effect |
+| `GPU_FAULT_NVSWITCH_TOPOLOGY_COMMAND` | Empty | Node-local topology query command that must output canonical JSON; the command is not run through a shell; written into collector.env by the node installer flag `--nvswitch-topology-command` |
 
 The current script requires the namespace to be fixed at `gpu-fault-system`.
 
@@ -12623,12 +12629,13 @@ kubectl -n gpu-fault-system set env \
 ```
 
 The repository provides `deploy/migrations/postgres-schema-ensure-job.yaml` to run the same step before rolling the Deployments.
-The current schema version is 18 (`control-state-legacy-copy-reset-without-truncate`),
-with `src/gpu_fault/schema_migrations.py` as the source of truth. v15 to v18 contain the remote-command/workflow
+The current schema version is 23 (`processor-queue-detached-payloads-replays-and-cluster-partitions`),
+with `src/gpu_fault/schema_migrations.py` (`LATEST_POSTGRES_SCHEMA_VERSION`) as the source of truth. v15 to v18 contain the remote-command/workflow
 dedicated tables and separate cutover guards; do not fall back to old-style state migrations or cleanups that modify only `gpu_fault_objects`.
 Large indexes are built online with `gpu-fault-store-migrate --build-indexes-concurrently`; the read-only validation at replica startup
 now refuses to start on **missing, INVALID (left behind by an interrupted concurrent index build) or definition-drifted indexes**,
-and the `gpu-fault-admin` preflight reports `indexes.missing` / `indexes.invalid` /
+and the schema preflight (`gpu-fault-store-migrate --schema-preflight`, which the release engine and deploy.sh run before a
+roll through `deploy/migrations/postgres-schema-preflight-job.yaml`) reports `indexes.missing` / `indexes.invalid` /
 `indexes.drifted` accordingly; drifted indexes are dropped first and then rebuilt concurrently.
 
 The high-frequency state dedicated-table migration must be run in the following order; you cannot jump from `legacy` straight to `dedicated`:
@@ -12701,12 +12708,18 @@ By default the following fault-decision-critical fields are validated:
 DCGM_FI_DEV_ROW_REMAP_FAILURE
 DCGM_FI_DEV_ECC_DBE_VOL_TOTAL
 DCGM_FI_DEV_PCIE_REPLAY_COUNTER
-DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL
-  or DCGM_FI_DEV_NVLINK_ERROR_DL_CRC
-  or (HGX B200/B300, batch 235) DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS,
-     DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS, DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS
-     or their DCGM 4.6 names
+DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL      or DCGM_FI_DEV_NVLINK_ERROR_DL_CRC
+DCGM_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL      or DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY
+DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL        or DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY
+  (on HGX B200/B300 each of the three NVLink groups is also satisfied by
+   DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_SUCCESSFUL_EVENTS, DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_FAILED_EVENTS,
+   DCGM_FI_DEV_NVLINK_COUNT_LINK_RECOVERY_EVENTS or their DCGM 4.6 names)
+DCGM_FI_DEV_CLOCK_THROTTLE_REASONS                 or DCGM_FI_DEV_CLOCKS_EVENT_REASONS
+DCGM_FI_DEV_POWER_MGMT_LIMIT
 ```
+
+(The default set is the output of `gpu_fault.dcgm_fields.dcgm_exporter_required_expression()`, which deploy.sh uses as the
+default of `GPU_FAULT_DCGM_REQUIRED_METRICS`.)
 
 Each of the three NVLink groups (CRC, recovery, replay) takes the NVLink5 link-recovery counters as alternatives: NVML does not
 report the data-link counters on Blackwell. This can be overridden via `GPU_FAULT_DCGM_REQUIRED_METRICS`, but validating only HTTP 200 or arbitrary
@@ -12731,18 +12744,22 @@ deploy/hyperpod/deploy.sh deploy
 
 The script completes in order:
 
-1. Updates the kubeconfig and validates the EKS API.
-2. Discovers the HyperPod `NodeRecovery`.
+1. Updates the kubeconfig and validates the EKS API; discovers the HyperPod `NodeRecovery`.
+2. Validates the SES administrator email configuration.
 3. Creates the namespace, execution token and node-action secret.
-4. Creates a least-privilege IRSA when the self-built lifecycle needs it.
+4. Configures the control plane's HyperPod and SES IRSA.
 5. Creates or takes over the encrypted Aurora Serverless v2, writer and cross-AZ reader tagged with the current `site-id`.
-6. Builds the wheel, node installer package and ConfigMaps.
-7. Deploys the 3-replica control plane, Service, RBAC and PDB.
-8. Registers the Runtime Profile.
-9. Deploys the Completion Watcher and reuses, creates or disables the DCGM Exporter per the selected mode.
-10. Runs a privileged installation Job on every HyperPod node, installing the systemd collectors/Agent.
-11. Checks Aurora, API, DCGM, Agent, version and config digest.
-12. Runs the passive-recovery E2E that requests no GPU and performs no reset/reboot/replace.
+6. Pauses the processor workers when the Agent pins need a migration.
+7. Builds the wheel, node installer package and ConfigMaps, and provisions a node-scoped action key per node.
+8. Deploys the role-split control plane (3 ingress replicas, control-worker, spool-worker at 0 replicas by default), Service,
+   RBAC and PDB, and the Aurora managed-password refresh CronJob.
+9. Registers the Runtime Profile.
+10. Deploys the Completion Watcher and reuses, creates or disables the DCGM Exporter per the selected mode.
+11. Runs a privileged installation Job on every HyperPod node, installing the systemd collectors/Agent; then deploys the node
+    installer reconciler.
+12. Finalizes the Agent compatibility window and resumes the processor workers.
+13. Checks Aurora, API, DCGM, Agent, version and config digest.
+14. With `RUN_E2E=true`, runs the passive-recovery E2E that requests no GPU and performs no reset/reboot/replace.
 
 <a id="54-观察部署"></a>
 ### A.4 Observing the Deployment
@@ -12775,7 +12792,7 @@ The selection table, field replacement requirements and the configuration/packag
 - `config/runtime-profile.regional-hyperpod-safe.example.yaml`: used by the regional CPU control plane;
   workload/scheduler actions are handed to the GPU cluster Executor; the regional production installer guarantees the Node Agent,
   signing key and fleet readiness converge, so `diagnosticBundleCapture`, `gpuReset`,
-  `fabricManagerRestart` and `fabricReset` are `OWN/node-action`.
+  `fabricManagerRestart`, `fabricReset` and `efaDriverRemediation` are `OWN/node-action`.
   Node capabilities whose tools or switches are not enabled, such as `nvlinkDiagnostics`, `memoryDiagnostics`, `driverRemediation` and
   `softwareFirmwareUpdate`, stay `OBSERVE`;
   `nodeReboot` is executed by the provider reboot API; `nodeReplace`, although sharing the
@@ -12970,9 +12987,9 @@ It is not "wait for the workflow to reach a terminal state", nor "wait for the r
 path, not a failure fallback.
 In `src/gpu_fault/orchestration/workflow_builder.py::WorkflowBuilder.catalog_operations`,
 `RESET_GPU`/`REBOOT_NODE`/`REPLACE_NODE` share one branch whose first statement is
-`operations.append(MARK_UNSCHEDULABLE)`; the `CHECK_MECHANICALS`,
-`UPDATE_SWFW`, `RESET_ALL_GPUS_AND_NVSWITCHES` and
-`ESCALATE_OPERATOR` branches likewise isolate first.
+`operations.append(MARK_UNSCHEDULABLE)`; the `UPDATE_SWFW`, `RESET_ALL_GPUS_AND_NVSWITCHES`,
+`DRAIN_P2P` and `ESCALATE_OPERATOR` branches likewise isolate first. `CHECK_MECHANICALS` is the exception: it is an operator
+inspection that only notifies and waits for the acknowledgement, without a cordon or a workload stop.
 
 How to query:
 
@@ -13013,7 +13030,7 @@ Early documentation suggested "avoiding the window in which `spare_coordinator.a
 `release()`d"; that advice **was wrong and has been withdrawn**. Code facts:
 
 - `SPARE_RESERVATION_ANNOTATION = "gpu-fault.io/spare-reservation"` stores the
-  **incident_id**, not a node reference (`hyperpod_spares.py:576-588`);
+  **incident_id**, not a node reference (`HyperPodSpareCoordinator._reserve_and_activate`);
 - Spare identification is **node-local**:
   `src/gpu_fault/hyperpod_spares.py::HyperPodSpareCoordinator.allocate`
   filters by the spare's own
@@ -13021,9 +13038,10 @@ Early documentation suggested "avoiding the window in which `spare_coordinator.a
 
 The faulty node and the spare are two independent objects; keeping the faulty node isolated, sending it for repair or permanently decommissioning it does not break an existing
 spare reservation, nor does it constitute a reason to call provider replace. The successful warm-spare path
-**deliberately does not call** `release()`; only
-the exception branch of `src/gpu_fault/adapters/hyperpod/lifecycle.py::HyperPodLifecycleStepAdapter.execute` releases the reservation,
-because after success the spare has become a working node. The only residual effect is the capacity waste of "consuming one more spare",
+**deliberately does not call** `release()`; only the exception branches of
+`HyperPodLifecycleStepAdapter._run_spare_failover` in `src/gpu_fault/adapters/hyperpod/lifecycle.py`, and
+`release_spare_reservations`, which releases the spares activated by REPLACE_NODE steps that did not succeed when the workflow
+ends, release the reservation, because after success the spare has become a working node. The only residual effect is the capacity waste of "consuming one more spare",
 which is not a window that needs avoiding.
 
 ##### Permitted Remediation Steps
@@ -13043,10 +13061,11 @@ false "provider replace is prohibited; use warm spare or §8.2"
 
 ##### Cleaning Up Fleet Records After a Node Disappears Through External Repair or Permanent Decommissioning
 
-After a node disappears, the control plane's agent record **does not disappear automatically**. The stale record still takes part in the
-comparison set of the fleet consistency gate (`fleet.py:666-680`), misjudging "the whole fleet has upgraded" as
-"N nodes still run the old value", distorting the `NODE_STALE` / `PIN_AHEAD_OF_FLEET` classification,
-and all subsequent node actions FAIL at the gate.
+In single-cluster mode the control plane's agent record **does not disappear automatically** after a node disappears (the
+departed-node cleanup of a regional control plane runs only in `regional` mode). The stale record stays in the fleet list until
+the retention sweep and confuses reconciliation and coverage checks; `FleetRegistry._annotate_pin_drift` counts only agents
+that are still alive as evidence that a pin shipped, so it no longer misreads pin drift as `NODE_STALE` /
+`PIN_AHEAD_OF_FLEET`.
 
 Reconcile first, then clean up:
 
@@ -13076,7 +13095,7 @@ curl -X POST -H "X-GPU-Fault-Execution-Token: $TOKEN" \
 ⚠ Three pitfalls:
 
 1. **You must drain before revoke, and the `transition_id` of both requests must be identical.**
-   `fleet.py:787-793`: a state other than `DRAINING` or a mismatched `transition_id` returns
+   `FleetRegistry.revoke_agent`: a state other than `DRAINING` or a mismatched `transition_id` returns
    `409 agent must be drained by the same transition`. A direct revoke always fails.
 2. `expected_generation` is an optimistic lock and must be the **current** `generation`.
 3. **Check `lifecycle_state` first: if it is already `REVOKED`, leave it alone.** A node automatically revoked by the workflow's
@@ -13086,11 +13105,13 @@ curl -X POST -H "X-GPU-Fault-Execution-Token: $TOKEN" \
 
 ##### Adding an Independently Repaired and Re-accepted Node to the Spare Pool
 
-`health_reasons()` (`hyperpod_spares.py:462`) rejects a "schedulable" candidate spare with the reason
+`HyperPodSpareCoordinator.health_reasons()` rejects a "schedulable" candidate spare with the reason
 `"unreserved spare is schedulable"`. So a new node entering the pool needs **both the label and the cordon**; with only the label and no cordon,
 that spare is judged unhealthy and never selected.
 The supported declaration action is `gpu-fault-admin config spare`; **do not hand-run `kubectl label` /
-`kubectl cordon`** -- manual operations leave no baseline, and there is nothing to restore exactly at release time:
+`kubectl cordon`** -- manual operations leave no baseline, and there is nothing to restore exactly at release time. The verb
+reads the managed site under `--state-dir`, so it works only for a site that `gpu-fault-admin deploy` manages; a single cluster
+deployed by `deploy.sh` has no such site:
 
 ```bash
 # Read-only check: reports item by item what this node still lacks (Ready, HyperPod health, reservation,
@@ -13124,8 +13145,9 @@ Console output lands, like the other mutating verbs, in `<state-dir>/logs/mutati
 
 ##### Manual Cleanup of Isolation Residue (Only When the Workflow Never Reached `RESTORE_SCHEDULING`)
 
-When a workflow succeeds, `RESTORE_SCHEDULING` automatically cleans up the isolation state -- measured: the taint,
-`unschedulable` and the three `gpu-fault.io` isolation annotations all disappear, with no human intervention.
+When a workflow succeeds, `RESTORE_SCHEDULING` automatically cleans up the isolation state -- it removes the isolation
+taints, restores `unschedulable` from the baseline and deletes the three `gpu-fault.io` isolation annotations, with no human
+intervention.
 **Only when the workflow FAILED / BLOCKED midway and will never reach that step** do you need to manually reproduce the semantics of
 `_restore()` in
 `src/gpu_fault/adapters/kubernetes/node_operations.py::KubernetesNodeOperationsMixin._restore`:
@@ -13142,16 +13164,17 @@ kubectl patch node <node> --type=merge -p '{
 ```
 
 ⚠ `"taints": []` clears **all** taints. If the node still has business taints unrelated to this solution,
-you must instead read the taints array, filter out only the entries with `key == gpu-fault.io/quarantined`
-and write it back
-(which is what `src/gpu_fault/adapters/kubernetes/node_operations.py::KubernetesNodeOperationsMixin._restore`
+you must instead read the taints array, filter out only the entries with the key `gpu-fault.io/quarantined` or
+`gpu-fault.io/quiesce` and write it back
+(which is what `src/gpu_fault/adapters/kubernetes/node_operations.py::KubernetesNodeOperationsMixin._node_restore_patch`
 does).
-The target value of `unschedulable` should be taken from the `gpu-fault.io/previous-unschedulable` annotation;
-this solution writes `false` by default.
+The target value of `unschedulable` should be taken from the `gpu-fault.io/previous-unschedulable` annotation
+(`false` when absent); a declared warm spare that no incident holds must stay cordoned.
 
-⚠ **Do not delete the four `gpu-fault.io/installer-*` annotations**
-(`installer-config-digest`, `installer-node-uid`, `installer-state`,
-`installer-version`) -- they belong to the node installer and are unrelated to isolation.
+⚠ **Do not delete the node installer's annotations** (the `gpu-fault.io/installer-*` family such as `installer-version`,
+`installer-config-digest`, `installer-artifact-sha256`, `installer-node-uid` and `installer-state`, plus
+`gpu-fault.io/node-key-activation` / `node-key-activated`; the full list is
+`gpu_fault.node_installer_reconciler.INSTALLER_NODE_ANNOTATIONS`) -- they belong to the node installer and are unrelated to isolation.
 
 ##### Known Gap: No Notification When Isolation Completes
 
@@ -13207,14 +13230,14 @@ a warm-spare switch (a restart is useless); (b) a **new incident** escalated aft
 does not solve the problem. And a workflow whose official action is `RESET_GPU`/`REBOOT_NODE` never
 plans a `REPLACE_NODE` step at all.
 
-The minimal implementation change: `ADVISORY_OPERATION_PRIORITY` at `notification_service.py:42-46`
+The minimal implementation change: `ADVISORY_OPERATION_PRIORITY` in `src/gpu_fault/notification_preview.py`
 already ranks `REPLACE_NODE` as the highest priority (30), and
 `src/gpu_fault/notification_preview.py::NotificationPreviewService.preview`
 already implements "pick the highest-priority step to notify", but the whole path is blocked by
 `step.execution_owner.startswith(MANAGED_HYPERPOD_OWNER_PREFIX)` --
 `MANAGED_HYPERPOD_OWNER_PREFIX = "hyperpod-managed-"`, while under the hard constraint
 `NodeRecovery=None` the node action owner is `gpu-fault-hyperpod-adapter`, the prefix does not
-match, and `try_preview()` silently returns `None` (measured injection response
+match, and `try_preview()` silently returns `None` (the injection response carries
 `advisory_notification_id: null`). If that notification is added, this solution's adapter owner should be added to
 the checked whitelist, and a new template version explicitly stating "warm-spare only, provider replace forbidden" should be used;
 the priority selection and `save_notification_if_absent` deduplication can be reused, and the old provider-replace wording
