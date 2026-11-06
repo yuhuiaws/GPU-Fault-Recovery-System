@@ -1332,7 +1332,7 @@ workflow. Only once the node's GPU-metrics collector has sent error batches back
 for `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (`GpuMetricsThresholds.collection_error_sustain_seconds`,
 default 180, 15-900; measured on batch `observed_at` from the streak's first error batch) does it escalate to
 `RUN_DIAGNOSTICS` and open exactly one NODE_HEALTH incident through the existing path (an action change is an
-activation, the thermal consecutive-breach model). The streak start lives in the finding itself: its `observed_at` and
+activation, `gpu_metric_models.gpu_finding_transition`). The streak start lives in the finding itself: its `observed_at` and
 `finding_id` are the first error batch's, the state's `observed_at` follows the latest batch, so the stores need no
 extra column; one streak has one event id
 (`gpu-<first batch id>-dcgm-fields`), replays are idempotent, late batches are still dropped by the state's time
@@ -1402,7 +1402,6 @@ legitimate maintenance is reported once and becomes the baseline.
 
 **⑨ Configuration parameters**: all DCGM decision thresholds can be overridden via env; production values are in the
 `gpu-fault-control-worker-config-telemetry` ConfigMap, for example
-`GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES=2` (a composite rule requires two consecutive samples to hold),
 `GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS=45`,
 `GPU_FAULT_DCGM_POWER_LIMIT_RATIO=0.95` with
 `GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT=80` (power pegged at the cap under low utilization

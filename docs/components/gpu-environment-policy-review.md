@@ -62,8 +62,9 @@ warning 的历史次数不计入 critical；重复/旧采样不推进；来源�
 
 `10000us` 最小增量、`0.1%` 最小占空比和 `105%` 合理性上限仍是本站噪声/有效性边界。
 DCGM 的 violation 字段按 ns 转为内部 us；nvidia-smi 文档中的 clocks-event counters
-本身为 us，两者不能混用。旧 `thermal_violation_drain_consecutive_samples` 配置仍能解析，
-但不再授权仅凭 duration 计数 DRAIN。
+本身为 us，两者不能混用。旧的 `GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES` 与
+`GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES` 已退役：进程仍接受（启动时记一条 warning）但不读取，
+duration 计数不能授权 DRAIN。
 
 ## 新工作流
 

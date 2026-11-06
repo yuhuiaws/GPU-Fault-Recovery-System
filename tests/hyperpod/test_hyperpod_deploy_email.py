@@ -203,6 +203,12 @@ def test_hyperpod_deploy_wires_gpu_metric_thresholds() -> None:
         "GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL",
         "GPU_FAULT_POWER_VIOLATION_DELTA_WARNING_US",
         "GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US",
-        "GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES",
     ):
         assert name in script
+    # Retired: no grade counts thermal samples any more, so the legacy path
+    # neither validates nor sets them (env_validation.RETIRED_ENVIRONMENT).
+    for retired in (
+        "GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES",
+        "GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES",
+    ):
+        assert retired not in script, f"{retired} is retired and must not be wired"

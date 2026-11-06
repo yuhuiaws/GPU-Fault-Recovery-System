@@ -914,7 +914,7 @@ A GPU metric finding stores `policy_source`, `policy_version`,
 - Device temperature limit derivation rules (absolute and T.Limit scale) use `SITE_NVIDIA_DEVICE_LIMIT_DERIVED`;
   reaching the device operating limit uses `DRAIN`, and the fixed temperatures serve only as the `SITE_DCGM_METRIC`
   fallback when the device exposes no usable limit, or T.Limit thresholds without a T.Limit reading.
-- The first thermal violation increase goes to diagnostics; once consecutive increases reach the configured count it escalates to `DRAIN`.
+- A thermal violation increase grades Warning and goes to diagnostics; time alone never escalates to `DRAIN` (there is no configurable consecutive count any more).
 - When a finding escalates from warning to critical or its automatic action changes, a `new_finding` is emitted again so that the existing
   attempt workflow can escalate in place or create a successor.
 - A replacement finding at the same severity and action (still breaching when a newer batch re-judged it; new `finding_id`) emits no
@@ -1594,7 +1594,7 @@ from it (`app/ingest/gpu_findings`: event id `gpu-<finding id>` → `inc-gpu-<fi
 
 | Rule ID | Required correlated signals | Conclusion and action |
 |---|---|---|
-| `THERMAL_STRESS` | GPU/HBM temperature finding + thermal violation or thermal throttle bit | Diagnostics first; `DRAIN` after 2 consecutive hits by default |
+| `THERMAL_STRESS` | GPU/HBM temperature finding + thermal violation or thermal throttle bit | Diagnostics while the temperature component is a Warning; Critical `DRAIN` once it is a confirmed Critical (no consecutive-count escalation) |
 | `POWER_LIMIT_THROTTLING` | power violation + power usage reaching the configured ratio of the limit + high utilization + no temperature finding | Power-limit context, diagnostics; does not directly rule hardware damage |
 | `GPU_MEMORY_DEGRADATION` | DBE/uncorrectable remap + pending/failed repair or pending retired page | `DRAIN`, Field Diagnostic/RMA evidence |
 | `PCIE_XID_LINK_FAILURE` | PCIe replay rate finding (or a confirmed `pcie_link_downtrain` or `pcie_correctable_error_total` rate finding) + XID 32/79 on the same GPU inside the window (a trusted kernel event, or a change of the DCGM last-XID gauge inside the window; an expired gauge does not join) | `DRAIN` and retain the combined PCIe/XID evidence |
@@ -1607,21 +1607,20 @@ Thermal slowdown uses the software/hardware thermal slowdown bits `0x20/0x40` of
 GPU idle, application clocks or a power cap and does not produce a thermal finding.
 
 violation-class counters carry a **dimensional plausibility gate**. The semantics of these fields is "microseconds spent in the violating state",
-so the per-minute increment cannot exceed one minute; `MAX_PLAUSIBLE_VIOLATION_US_PER_MINUTE`
-is `60_000_000 × 1.05` (the extra margin absorbs sampling skew). After the delta crosses the threshold, `_throttle_decision`
-first checks the rate: when it exceeds this upper bound **no finding is produced**, because the counter claims a violation
-duration longer than the elapsed time, which shows it is not in this unit on this machine, and an uninterpretable quantity cannot serve as a criterion.
-This gate is necessary rather than conservative: a thermal violation crossing the bound 2 consecutive times escalates to `DRAIN`,
-so letting an uninterpretable rate through here would **evict a healthy node**. The power finding path
-(`POWER_LIMIT_THROTTLING`) does not add this gate: it already requires the power/limit ratio and high
-utilization to hold at the same time, and adding the gate would only drop true positives.
+so the per-minute increment cannot exceed one minute; the upper bound is `60_000_000 × 1.05` µs/min (the extra margin absorbs
+sampling skew). After the delta crosses the threshold, `_throttle_decision` (`gpu_environment_policy.thermal_duration_decision`)
+first checks the rate: below `60_000` µs/min (a 0.1 % duty) or above that bound **no finding is produced**; above it the counter
+claims a violation duration longer than the elapsed time, which shows it is not in this unit on this machine, and an uninterpretable
+quantity cannot serve as a criterion. A grade on time alone is only a Warning diagnostic, never `DRAIN`. The power finding path
+(`gpu_power_policy.power_violation_decision`) uses the same rate band and also requires the power/limit ratio and high
+utilization to hold at the same time.
 
 GPU validation treats `gpu_temperature_c`, `memory_temperature_c`,
 `thermal_violation_total_us`, `clock_throttle_reasons` and
 `composite:THERMAL_STRESS` as one thermal cooldown set. Only when every active
 finding in the set is Warning does it return `WAITING` within the grace period; if any finding escalates to Critical,
 a finding of another category appears, or the grace period expires without clearing, it immediately returns `FAILED` and triggers the existing
-`DRAIN` escalation. This way the first thermal throttle cannot bypass the consecutive-sampling state machine.
+`DRAIN` escalation. This way a thermal throttle cannot pass validation before it clears or the grace period expires.
 
 Corrected-memory counters use the positive increment between adjacent samples, not the cumulative absolute value, so old errors are not misjudged:
 

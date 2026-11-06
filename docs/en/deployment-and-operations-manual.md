@@ -8019,10 +8019,10 @@ version, policy/profile versions, heartbeat age and TLS are still read at proces
 | `GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL` | 1; > 0 | Increment threshold between adjacent samples of an NVLink error counter (NVLink5 counters included); a breach is a Warning with read-only diagnostics |
 | `GPU_FAULT_POWER_VIOLATION_DELTA_WARNING_US` | 10000; > 0 | Minimum increment (µs) of the power violation time (DCGM 240) between adjacent samples; the power and utilisation conditions apply too (table below) |
 | `GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US` | 10000; > 0 | Minimum increment (µs) of the thermal violation (DCGM 241) and HW thermal slowdown (DCGM 1423) times |
-| `GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES` | 2; ≥ 2 | Still parsed and validated, but no longer affects grading: thermal violation time only ever grades Warning, never `DRAIN` |
+| `GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES` | `<retired: ignored>` | Retired: a process still accepts it (one start-up warning) but nothing reads it, so no value affects grading; thermal violation time only ever grades Warning, never `DRAIN` |
 | `GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` | 120; minimum 15 | VALIDATE_GPU cool-down window for temperature/thermal Warnings, counted from the workflow's creation |
 | `GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS` | 45; 15-300 | Event time window for correlated analysis |
-| `GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES` | 2; 2-10 | Still parsed and validated, but no longer affects grading: `THERMAL_STRESS` is Critical `DRAIN` only once its temperature component is a confirmed Critical |
+| `GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES` | `<retired: ignored>` | Retired: a process still accepts it (one start-up warning) but nothing reads it, and the control-plane ConfigMaps no longer set it; `THERMAL_STRESS` is Critical `DRAIN` only once its temperature component is a confirmed Critical |
 | `GPU_FAULT_DCGM_POWER_LIMIT_RATIO` | 0.95; (0, 1] | Ratio of power usage to the enforced limit |
 | `GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT` | 80; 0-100 | Minimum GPU utilisation for the power rule |
 | `GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS` | 120; minimum 15 | VALIDATE_GPU observation window for corrected-memory and power Warnings |
@@ -12507,7 +12507,6 @@ export GPU_FAULT_MEMORY_TEMP_CRITICAL_C=95
 export GPU_FAULT_GPU_TEMP_WARNING_MARGIN_C=5
 export GPU_FAULT_GPU_TEMP_SHUTDOWN_MARGIN_C=3
 export GPU_FAULT_MEMORY_TEMP_WARNING_MARGIN_C=5
-export GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES=2
 # existing mode may use a node address template:
 # export GPU_FAULT_DCGM_METRICS_URL='http://{node_ip}:9400/metrics'
 export GPU_FAULT_NVSWITCH_TOPOLOGY_MAX_AGE_SECONDS=300

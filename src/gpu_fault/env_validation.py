@@ -25,10 +25,18 @@ TRAINING_HEALTH_MONITOR_ENV = "GPU_FAULT_ENABLE_TRAINING_HEALTH_MONITOR"
 # no reader reads them, and a process that receives one names it once at
 # start-up.
 _STORM_BREAKER = "each GPU cluster's remediation storm breaker (design 9.5)"
+# The thermal sample counts once escalated violation time and THERMAL_STRESS
+# to DRAIN; neither grade counts samples any more (gpu_environment_policy).
+_CONFIRMED_TEMPERATURE = (
+    "the confirmed critical temperature: thermal violation time alone grades "
+    "Warning, never DRAIN"
+)
 RETIRED_ENVIRONMENT = {
     "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": _STORM_BREAKER,
     "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": _STORM_BREAKER,
     "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": _STORM_BREAKER,
+    "GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES": _CONFIRMED_TEMPERATURE,
+    "GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES": _CONFIRMED_TEMPERATURE,
 }
 
 

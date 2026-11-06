@@ -25,7 +25,7 @@
   ],
   "files": {
     "deploy/control-plane/tools/render_control_plane_role_split.py": 1516,
-    "deploy/hyperpod/deploy.sh": 3322,
+    "deploy/hyperpod/deploy.sh": 3305,
     "deploy/node/install-gpu-fault-collector.sh": 1827,
     "scripts/e2e/regional/audit_regional_command_protocol_live.py": 2192,
     "scripts/e2e/regional/probes/collector_node_probe.py": 4113,
@@ -48,7 +48,7 @@
     "deploy/control-plane/tools/render_control_plane_role_split.py:main": 629,
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 254,
     "deploy/hyperpod/deploy.sh:build_artifacts": 270,
-    "deploy/hyperpod/deploy.sh:deploy_control_plane": 366,
+    "deploy/hyperpod/deploy.sh:deploy_control_plane": 364,
     "deploy/hyperpod/deploy.sh:ensure_aurora": 302,
     "scripts/e2e/regional/capacity_queued_lease.py:run_queued_lease_proof": 209,
     "scripts/e2e/regional/capacity_scrape_companion.py:capture_scrape_source": 210,

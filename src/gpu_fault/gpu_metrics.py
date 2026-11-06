@@ -182,13 +182,15 @@ class GpuMetricsThresholds(StrictModel):
     pcie_replay_rate_warning_per_minute: float = Field(default=8, ge=0)
     nvlink_error_delta_critical: float = Field(default=1, gt=0)
     power_violation_delta_warning_us: float = Field(default=10000, gt=0)
+    # Thermal violation time alone grades Warning, and THERMAL_STRESS is
+    # Critical only on a confirmed critical temperature (gpu_environment_policy):
+    # no thermal grade counts samples, so the two counts that once escalated
+    # them to DRAIN are retired (env_validation.RETIRED_ENVIRONMENT).
     thermal_violation_delta_warning_us: float = Field(default=10000, gt=0)
-    thermal_violation_drain_consecutive_samples: int = Field(default=2, ge=2)
     # How long a collection-error streak lasts before it asks for diagnostics
     # (gpu_collection_errors): the 6th consecutive failure of the 15 s scrape.
     collection_error_sustain_seconds: int = Field(default=180, ge=15, le=900)
     correlation_window_seconds: int = Field(default=45, ge=15, le=300)
-    composite_consecutive_samples: int = Field(default=2, ge=2, le=10)
     power_limit_ratio: float = Field(default=0.95, gt=0, le=1)
     power_correlation_min_utilization_percent: float = Field(default=80, ge=0, le=100)
     ecc_sbe_delta_warning: float = Field(default=1, gt=0)
@@ -238,14 +240,6 @@ class GpuMetricsThresholds(StrictModel):
             values[field_name] = (
                 float(raw) if raw is not None else getattr(defaults, field_name)
             )
-        raw_consecutive = os.getenv(
-            "GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES"
-        )
-        values["thermal_violation_drain_consecutive_samples"] = (
-            int(raw_consecutive)
-            if raw_consecutive is not None
-            else defaults.thermal_violation_drain_consecutive_samples
-        )
         raw_sustain = os.getenv("GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS")
         values["collection_error_sustain_seconds"] = (
             int(raw_sustain)
@@ -257,12 +251,6 @@ class GpuMetricsThresholds(StrictModel):
             int(raw_window)
             if raw_window is not None
             else defaults.correlation_window_seconds
-        )
-        raw_consecutive = os.getenv("GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES")
-        values["composite_consecutive_samples"] = (
-            int(raw_consecutive)
-            if raw_consecutive is not None
-            else defaults.composite_consecutive_samples
         )
         raw_power_ratio = os.getenv("GPU_FAULT_DCGM_POWER_LIMIT_RATIO")
         values["power_limit_ratio"] = (

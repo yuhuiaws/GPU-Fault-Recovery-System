@@ -110,7 +110,7 @@ logs one warning, but no code reads it.
 | `GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI` | Core/Other | text | `''` | `gpu_fault.admin.site`<br>`gpu_fault.settings` |
 | `GPU_FAULT_CONTROL_RECORD_RETENTION_DAYS` | Core/Other | integer | `'0'` | `gpu_fault.admin.site`<br>`gpu_fault.settings` |
 | `GPU_FAULT_CUDA_VERSION` | Core/Other | text | `<implicit>` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.collectors.context` |
-| `GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES` | Telemetry | text | `<implicit>` | `gpu_fault.gpu_metrics` |
+| `GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES` | Telemetry | text | `<retired: ignored>` | `gpu_fault.env_validation` |
 | `GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES` | Telemetry | integer | `<implicit>` | `gpu_fault.gpu_metrics` |
 | `GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS` | Telemetry | integer | `<implicit>` | `gpu_fault.gpu_metrics` |
 | `GPU_FAULT_DCGM_ECC_SBE_DELTA_WARNING` | Telemetry | text | `<implicit>` | `gpu_fault.gpu_metrics` |
@@ -646,7 +646,7 @@ logs one warning, but no code reads it.
 | `GPU_FAULT_TELEMETRY_SPOOL_WORKERS` | Telemetry | integer | `str(default_workers), str(pools.default_pool * 2)` | `gpu_fault.app.admission_runtime`<br>`gpu_fault.processor.settings` |
 | `GPU_FAULT_TEMPERATURE_WARNING_GRACE_SECONDS` | Core/Other | integer | `'120'` | `gpu_fault.app.context` |
 | `GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US` | Core/Other | text | `<implicit>` | `gpu_fault.gpu_metrics` |
-| `GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES` | Core/Other | text | `<implicit>` | `gpu_fault.gpu_metrics` |
+| `GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES` | Core/Other | text | `<retired: ignored>` | `gpu_fault.env_validation` |
 | `GPU_FAULT_TRAINING_HEALTH_SCAN_SECONDS` | Core/Other | number | `'15'` | `gpu_fault.app.lifespan_workers`<br>`gpu_fault.app.periodic_services` |
 | `GPU_FAULT_TRAINING_HEARTBEAT_TIMEOUT_SECONDS` | Core/Other | integer | `'120'` | `gpu_fault.training_health` |
 | `GPU_FAULT_TRAINING_LOG_PATHS` | Core/Other | text | `''` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.collectors.logs.node` |

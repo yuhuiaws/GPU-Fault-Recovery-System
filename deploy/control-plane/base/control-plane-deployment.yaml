@@ -517,8 +517,6 @@ spec:
               value: "180"
             - name: GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS
               value: "45"
-            - name: GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES
-              value: "2"
             - name: GPU_FAULT_DCGM_POWER_LIMIT_RATIO
               value: "0.95"
             - name: GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT

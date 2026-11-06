@@ -8,6 +8,8 @@ from threading import Barrier
 import pytest
 from pydantic import ValidationError
 
+from gpu_fault import env_validation
+from gpu_fault.env_validation import unknown_gpu_fault_environment
 from gpu_fault.gpu_metrics import (
     GpuHealthFinding,
     GpuHealthSeverity,
@@ -216,9 +218,7 @@ def test_metric_thresholds_are_configurable(monkeypatch) -> None:
     monkeypatch.setenv("GPU_FAULT_GPU_TEMP_WARNING_C", "82")
     monkeypatch.setenv("GPU_FAULT_GPU_TEMP_CRITICAL_C", "88")
     monkeypatch.setenv("GPU_FAULT_GPU_TEMP_WARNING_MARGIN_C", "7")
-    monkeypatch.setenv("GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES", "3")
     monkeypatch.setenv("GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS", "60")
-    monkeypatch.setenv("GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES", "3")
     monkeypatch.setenv("GPU_FAULT_DCGM_POWER_LIMIT_RATIO", "0.9")
     monkeypatch.setenv("GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT", "75")
     monkeypatch.setenv("GPU_FAULT_DCGM_ECC_SBE_DELTA_WARNING", "2")
@@ -236,9 +236,7 @@ def test_metric_thresholds_are_configurable(monkeypatch) -> None:
     assert thresholds.gpu_temperature_warning_c == 82
     assert thresholds.gpu_temperature_critical_c == 88
     assert thresholds.gpu_temperature_warning_margin_c == 7
-    assert thresholds.thermal_violation_drain_consecutive_samples == 3
     assert thresholds.correlation_window_seconds == 60
-    assert thresholds.composite_consecutive_samples == 3
     assert thresholds.power_limit_ratio == 0.9
     assert thresholds.power_correlation_min_utilization_percent == 75
     assert thresholds.ecc_sbe_delta_warning == 2
@@ -246,6 +244,43 @@ def test_metric_thresholds_are_configurable(monkeypatch) -> None:
     assert thresholds.retired_pages_dbe_delta_critical == 1
     assert thresholds.row_remap_correctable_delta_warning == 3
     assert thresholds.correctable_memory_drain_consecutive_samples == 4
+
+
+RETIRED_THERMAL_COUNTS = {
+    "GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES": (
+        "thermal_violation_drain_consecutive_samples"
+    ),
+    "GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES": "composite_consecutive_samples",
+}
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "1", "2"])
+def test_retired_thermal_sample_counts_are_never_read(monkeypatch, value) -> None:
+    """No grade counts thermal samples any more: violation time alone is a
+    Warning and THERMAL_STRESS is Critical only on a confirmed critical
+    temperature. The two counts are retired, so an older role ConfigMap, a
+    rollback or a site override that still sets them -- to anything, even a
+    value the old parser refused -- changes nothing and stops no process."""
+
+    for name in RETIRED_THERMAL_COUNTS:
+        monkeypatch.setenv(name, value)
+
+    thresholds = GpuMetricsThresholds.from_environment()
+
+    assert thresholds == GpuMetricsThresholds(), (
+        "a retired count must leave every threshold at its default"
+    )
+    for name, field_name in RETIRED_THERMAL_COUNTS.items():
+        assert field_name not in GpuMetricsThresholds.model_fields, (
+            f"{field_name} has no reader and must not look configurable"
+        )
+        assert name in env_validation.RETIRED_ENVIRONMENT, (
+            f"{name} must stay known as retired so a process receiving it starts"
+        )
+    unknown = unknown_gpu_fault_environment(
+        dict.fromkeys(RETIRED_THERMAL_COUNTS, value)
+    )
+    assert unknown == [], f"a retired name must never refuse start-up: {unknown}"
 
 
 def test_metrics_service_evaluates_absolute_health_rules() -> None:
