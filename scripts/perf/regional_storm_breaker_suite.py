@@ -57,6 +57,7 @@ if TYPE_CHECKING or __package__:
         seed,
     )
     from .regional_capacity_recovery import (
+        abort_on_signals,
         cleanup_signal_guard,
         resume_identity,
         write_aborted_status,
@@ -104,6 +105,7 @@ else:
         seed,
     )
     from regional_capacity_recovery import (
+        abort_on_signals,
         cleanup_signal_guard,
         resume_identity,
         write_aborted_status,
@@ -614,6 +616,7 @@ def write_run_record(
     )
 
 
+@abort_on_signals
 def main(argv: list[str] | None = None) -> int:
     options = parser()
     args = options.parse_args(argv)
@@ -704,7 +707,8 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 summary = step.run(fleet_ready_at=time.monotonic())
             finally:
-                exit_record = step.close_breaker()
+                with cleanup_signal_guard():  # the cleanup starts here
+                    exit_record = step.close_breaker()
                 # Every poll, also when a phase raised: the evidence of what it saw.
                 (artifacts / "storm-breaker-history.json").write_text(
                     json.dumps(step.history, indent=2, sort_keys=True) + "\n"
@@ -719,7 +723,7 @@ def main(argv: list[str] | None = None) -> int:
     except BaseException as exc:
         failure = exc
     finally:
-        with cleanup_signal_guard():
+        with cleanup_signal_guard() as late:
             try:
                 if (artifacts / "registry-registration-intent.json").exists():
                     teardown(
@@ -737,6 +741,7 @@ def main(argv: list[str] | None = None) -> int:
                     failure = exc
                 else:
                     failure.add_note(f"storm breaker teardown also failed: {exc}")
+        failure = late.abort(failure)
     if failure is not None:
         write_aborted_status(
             artifacts,

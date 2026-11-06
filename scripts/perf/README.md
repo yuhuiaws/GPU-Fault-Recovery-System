@@ -228,11 +228,17 @@ healthy GPU/NVLink/RDMA samples, and fresh `load1_per_cpu`,
 stamped with its own write time. Host sample timestamps must cross the
 completed reboot barrier so `VALIDATE_HOST` cannot pass on stale telemetry.
 
-Integrated cleanup ignores subsequent `SIGINT`, `SIGTERM`, and `SIGHUP` while
-its bounded `finally` block deletes both Jobs and their Pods, purges database
-rows, and removes the synthetic registry revision. A completed teardown writes
-`cleanup-workloads.json`, `cleanup-residuals.json`, and
-`registry-postflight.json`; any residual keeps the run aborted.
+Every runner holds `SIGINT`, `SIGTERM`, and `SIGHUP` for the whole round
+(`regional_capacity_recovery.abort_on_signals`; a signal ignored at start, such
+as `SIGHUP` under `nohup`, stays ignored). The first signal before the teardown
+aborts the round where it is and the bounded `finally` block still deletes both
+Jobs and their Pods, purges database rows, and removes the synthetic registry
+revision; later signals, and any signal once the teardown has begun, are only
+recorded, so they cannot interrupt the cleanup, but a signal during the
+teardown still leaves the run aborted. The process exits with 128 + the signal
+number. A completed teardown writes `cleanup-workloads.json`,
+`cleanup-residuals.json`, and `registry-postflight.json`; any residual keeps the
+run aborted.
 
 The integrated evidence distinguishes final client failures from recovered
 first-attempt transport failures. Each ingress path reports
@@ -284,6 +290,12 @@ is split by responsibility:
   load stop.
 - `regional_capacity_placement.py`: the run's Aurora writer, its Availability
   Zone and the control-plane node zones.
+- `regional_capacity_pods.py`: the control-plane Pod runtime snapshot and the
+  lifecycle comparison the integrated verdict reads (replaced, added,
+  restarted, not Ready, readiness flaps).
+- `regional_capacity_recovery.py`: the bounded teardown retries, the logged
+  recovery command, and the termination-signal guard every runner holds for
+  its round (`abort_on_signals`, `cleanup_signal_guard`).
 - `regional_validation_telemetry.py`: the integrated and correlated runners'
   event-driven validation telemetry session (the correlated one publishes a
   node's node-return package right after its reboot step is recorded; the

@@ -58,10 +58,12 @@ from scripts.e2e.regional.regional_live_fixture import component_python
 if TYPE_CHECKING or __package__:
     from . import regional_capacity_registry as registry
     from . import regional_storm_breaker as storm
+    from .regional_capacity_recovery import cleanup_signal_guard
     from .regional_validation_telemetry import ValidationTelemetryWatcher
 else:
     import regional_capacity_registry as registry
     import regional_storm_breaker as storm
+    from regional_capacity_recovery import cleanup_signal_guard
     from regional_validation_telemetry import ValidationTelemetryWatcher
 
 PERF_DIR = Path(__file__).resolve().parent
@@ -454,27 +456,29 @@ def synthetic_fleet(
         raising = True
         raise
     finally:
-        stopped = heartbeat.stop()
-        document["heartbeat"] = heartbeat.heartbeat_summary(
-            stop_confirmed=bool(stopped.get("stop_confirmed"))
-        )
-        try:
-            census = fleet_census(
-                run_id=run_id, clusters=plan["clusters"], control_fn=control_fn
+        # The run's cleanup starts here: a signal no longer interrupts it.
+        with cleanup_signal_guard():
+            stopped = heartbeat.stop()
+            document["heartbeat"] = heartbeat.heartbeat_summary(
+                stop_confirmed=bool(stopped.get("stop_confirmed"))
             )
-        except Exception as exc:  # noqa: BLE001 - recorded, and fails the verdict
-            census = {"error": f"{type(exc).__name__}: {exc}"}
-        document["census"] = census
-        document["breaker_exits"] = close_open_breakers(
-            census, run_id=run_id, control_fn=control_fn
-        )
-        errors = fleet_errors(
-            plan, census, document["heartbeat"], expected_trips=expected_trips
-        )
-        document["errors"] = errors
-        document["notes"] = fleet_notes(plan, census)
-        document["verdict"] = "FAIL" if errors else "PASS"
-        write_document(artifacts, FLEET_ARTIFACT, document)
+            try:
+                census = fleet_census(
+                    run_id=run_id, clusters=plan["clusters"], control_fn=control_fn
+                )
+            except Exception as exc:  # noqa: BLE001 - recorded, fails the verdict
+                census = {"error": f"{type(exc).__name__}: {exc}"}
+            document["census"] = census
+            document["breaker_exits"] = close_open_breakers(
+                census, run_id=run_id, control_fn=control_fn
+            )
+            errors = fleet_errors(
+                plan, census, document["heartbeat"], expected_trips=expected_trips
+            )
+            document["errors"] = errors
+            document["notes"] = fleet_notes(plan, census)
+            document["verdict"] = "FAIL" if errors else "PASS"
+            write_document(artifacts, FLEET_ARTIFACT, document)
         if errors and not raising:
             raise RuntimeError("synthetic fleet: " + "; ".join(errors))
 

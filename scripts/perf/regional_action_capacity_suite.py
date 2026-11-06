@@ -18,7 +18,11 @@ if TYPE_CHECKING or __package__:
         optional_placement_section,
         optional_start_placement,
     )
-    from .regional_capacity_recovery import write_aborted_status
+    from .regional_capacity_recovery import (
+        abort_on_signals,
+        cleanup_signal_guard,
+        write_aborted_status,
+    )
     from .regional_capacity_registry import (
         STORE_DSN_SNIPPET,
         dataplane_identity,
@@ -77,7 +81,11 @@ else:
         optional_placement_section,
         optional_start_placement,
     )
-    from regional_capacity_recovery import write_aborted_status
+    from regional_capacity_recovery import (
+        abort_on_signals,
+        cleanup_signal_guard,
+        write_aborted_status,
+    )
     from regional_capacity_registry import (
         STORE_DSN_SNIPPET,
         dataplane_identity,
@@ -1206,6 +1214,7 @@ def execute_capacity_run(
     return measured_exit(0 if occupancy["passed"] else BUDGET_LIMIT_EXCEEDED, summary)
 
 
+@abort_on_signals
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clusters", type=int, default=8)
@@ -1350,28 +1359,32 @@ def main(argv: list[str] | None = None) -> int:
     except BaseException as exc:
         failure = exc
     finally:
-        if (registration_pending or run_validated) and (
-            artifacts / "registry-registration-intent.json"
-        ).exists():
-            try:
-                # Executors, data, then registry: all inside the retried teardown
-                # (live 2026-10-13: a single purge before it raised once and left
-                # perf-cap-000..031 in the live registry).
-                teardown(
-                    purge=True,
-                    deregister_clusters=True,
-                    allow_live_registry=args.allow_live_registry,
-                    live_registry_confirmation=args.confirm_live_registry,
-                    artifacts=artifacts,
-                    run_id=run_id,
-                )
-                verify_fleet_cleanup(artifacts, run_id=run_id, clusters=args.clusters)
-            except Exception as exc:
-                cleanup_error = exc
-                if failure is not None:
-                    failure.add_note(f"action capacity teardown also failed: {exc}")
-                else:
-                    failure = exc
+        with cleanup_signal_guard() as late:
+            if (registration_pending or run_validated) and (
+                artifacts / "registry-registration-intent.json"
+            ).exists():
+                try:
+                    # Executors, data, then registry, all in the retried teardown
+                    # (live 2026-10-13: a single purge before it raised once and
+                    # left perf-cap-000..031 in the live registry).
+                    teardown(
+                        purge=True,
+                        deregister_clusters=True,
+                        allow_live_registry=args.allow_live_registry,
+                        live_registry_confirmation=args.confirm_live_registry,
+                        artifacts=artifacts,
+                        run_id=run_id,
+                    )
+                    verify_fleet_cleanup(
+                        artifacts, run_id=run_id, clusters=args.clusters
+                    )
+                except Exception as exc:
+                    cleanup_error = exc
+                    if failure is not None:
+                        failure.add_note(f"action capacity teardown also failed: {exc}")
+                    else:
+                        failure = exc
+        failure = late.abort(failure)
 
     if failure is not None:
         write_aborted_status(

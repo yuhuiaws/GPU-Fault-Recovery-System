@@ -26,6 +26,7 @@ if __package__:
     )
     from .regional_capacity_data import invoke
     from .regional_capacity_recovery import (
+        abort_on_signals,
         cleanup_signal_guard,
         resume_identity,
         write_aborted_status,
@@ -97,6 +98,7 @@ else:
     )
     from regional_capacity_data import invoke
     from regional_capacity_recovery import (
+        abort_on_signals,
         cleanup_signal_guard,
         resume_identity,
         write_aborted_status,
@@ -1263,6 +1265,7 @@ def write_run_record(
     )
 
 
+@abort_on_signals
 def run(args: argparse.Namespace) -> int:
     if args.clusters not in FORMAL_MODELS:
         raise ValueError("formal integrated run requires 32 or 50 clusters")
@@ -1383,7 +1386,7 @@ def run(args: argparse.Namespace) -> int:
     except BaseException as exc:
         failure = exc
     finally:
-        with cleanup_signal_guard():
+        with cleanup_signal_guard() as late:
             try:
                 if (artifacts / "registry-registration-intent.json").exists():
                     teardown(
@@ -1426,6 +1429,7 @@ def run(args: argparse.Namespace) -> int:
                     failure = exc
                 else:
                     failure.add_note(f"integrated teardown also failed: {exc}")
+        failure = late.abort(failure)
     if failure is not None:
         write_aborted_status(
             move_to_aborted(args.artifact_root, artifacts),

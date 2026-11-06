@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import shlex
+import signal
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -26,6 +27,7 @@ from tests.regional._perf_caller_support import (
     CapacityWire,
     action_args,
     capacity_args,
+    deliver_signal,
 )
 
 SUITES: dict[str, Callable[[Path], int]] = {
@@ -208,3 +210,57 @@ def test_teardown_backs_off_between_its_bounded_attempts(
         "teardown attempt 1/4 failed (RuntimeError: command failed (1): kubectl "
         "exec RuntimeError: capacity cleanup left run-owned data); retrying in 15 s"
     ) in capsys.readouterr().out, "each retry logs its reason on one line"
+
+
+SIGNALLED_STEP = {
+    "action": (action, "execute_capacity_run"),
+    "capacity": (capacity, "execute_case"),
+}
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP])
+@pytest.mark.parametrize("suite", sorted(SUITES))
+def test_a_signal_during_the_run_tears_it_down_and_aborts_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suite: str, signum: int
+) -> None:
+    """``kill`` or a closed terminal used to end the runner with its load and
+    synthetic registry left on the site; now it ends through the teardown."""
+
+    wire = CapacityWire(tmp_path, monkeypatch)
+    module, step = SIGNALLED_STEP[suite]
+    monkeypatch.setattr(module, step, lambda *_args, **_kwargs: deliver_signal(signum))
+
+    assert SUITES[suite](tmp_path) == 128 + signum, "the exit status names the signal"
+
+    assert wire.events[-4:] == TEARDOWN_TAIL, "the signal still runs the whole teardown"
+    assert not wire.registered() and wire.objects == {}, (
+        "no registration, token or load resource is left on the site"
+    )
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert status["status"] == "aborted", "a signalled run is aborted"
+    assert status["reason"] == (
+        f"RunTerminated: received {signal.Signals(signum).name}"
+    ), status
+
+
+@pytest.mark.parametrize("suite", sorted(SUITES))
+def test_a_signal_during_the_teardown_does_not_interrupt_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, suite: str
+) -> None:
+    wire = CapacityWire(tmp_path, monkeypatch)
+    finish = wire.teardown
+
+    def signalled_teardown(**kwargs: object) -> None:
+        deliver_signal(signal.SIGTERM)
+        finish(**kwargs)
+
+    for module in (capacity, action):
+        monkeypatch.setattr(module, "teardown", signalled_teardown)
+
+    assert SUITES[suite](tmp_path) == 128 + signal.SIGTERM, "the run is not ok"
+
+    assert wire.events[-4:] == TEARDOWN_TAIL, "the teardown ran to its end"
+    assert not wire.registered() and wire.objects == {}, "and left nothing behind"
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert status["status"] == "aborted", status
+    assert status["reason"] == "RunTerminated: received SIGTERM during the teardown"

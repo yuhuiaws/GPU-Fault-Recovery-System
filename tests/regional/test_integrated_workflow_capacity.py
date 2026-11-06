@@ -989,11 +989,13 @@ def test_integrated_heartbeat_refresher_is_throttled(
     assert calls[1]["lease_seconds"] == 2700
 
 
-def test_integrated_cleanup_signal_guard_ignores_and_restores_signals(
+def test_integrated_cleanup_signal_guard_records_and_restores_signals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The guard lives in regional_capacity_recovery now (the storm breaker
-    step's cleanup shares it); the integrated runner still uses it."""
+    """The guard lives in regional_capacity_recovery (every runner's teardown
+    shares it): during the cleanup a termination signal is recorded for the
+    run's result instead of acting on it (test_perf_termination_signals), and
+    the previous handlers come back."""
 
     guarded = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP"))
     original = {value: object() for value in guarded}
@@ -1004,9 +1006,9 @@ def test_integrated_cleanup_signal_guard_ignores_and_restores_signals(
         signal, "signal", lambda value, handler: active.__setitem__(value, handler)
     )
 
-    with suite.cleanup_signal_guard():
-        assert all(active[value] is signal.SIG_IGN for value in guarded), (
-            "cleanup did not ignore termination signals"
+    with suite.cleanup_signal_guard() as late:
+        assert all(active[value] is late for value in guarded), (
+            "cleanup does not record the termination signals"
         )
 
     assert active == original

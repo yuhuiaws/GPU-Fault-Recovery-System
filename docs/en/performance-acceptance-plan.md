@@ -1233,11 +1233,16 @@ registry-postflight.json removed equals this round's registered count (its synth
 every workflow and command is terminal
 ```
 
-Once the runner enters the teardown in `finally` it ignores `SIGINT`, `SIGTERM` and `SIGHUP` (a signal arriving then is
-dropped and changes no result) and explicitly waits until both Jobs and all their Pods are deleted; any remaining
-resource or database/registry residue still fails the round. Before the teardown, `SIGINT` interrupts the round as a
-KeyboardInterrupt, which still goes through the teardown and is recorded aborted; `SIGTERM` and `SIGHUP` have no handler
-and end the process without a teardown, which the §8.1 recovery command then completes.
+Every runner (burst, action, correlated, integrated and the storm breaker step) holds `SIGINT`, `SIGTERM` and `SIGHUP`
+for the whole round (`regional_capacity_recovery.abort_on_signals`; a signal already ignored at start, such as `SIGHUP`
+under `nohup`, stays ignored): the first signal before the teardown raises `RunTerminated` where the round is, the round
+goes through `finally` into the teardown as usual, `status.json` records it `aborted` (reason `RunTerminated: received
+SIGTERM` and so on) and the process exits with 128 + the signal number; any later signal, and every signal once the
+teardown has begun, is only recorded and cannot interrupt the cleanup the first one started (the storm breaker step's
+breaker hand-over and the fleet's exit are part of that cleanup). A signal during the teardown does not interrupt it but
+still changes the round's result to `aborted` (reason `... during the teardown`). The runner explicitly waits until both
+Jobs and all their Pods are deleted; any remaining resource or database/registry residue still fails the round. Only a
+`SIGKILL`, which cannot be caught, ends the process without a teardown, which the §8.1 recovery command then completes.
 
 After the measurement window ends, the runner reads load/executor Pod logs with at most 16-way
 concurrency and sorts them by Indexed Job completion index before writing artifacts and
@@ -1379,8 +1384,8 @@ durations one workflow takes about 140 s (the 120-s reboot dominates), so the re
 dispatcher's pickup of the held rows.
 
 A phase that times out fails the step; the release still runs after a `hold` timeout, so a missing alert never strands
-the held work. Whatever ends the step -- `PASS`, `FAIL`, an exception or `SIGINT` (`SIGTERM`/`SIGHUP` end the process
-before the cleanup, see §8.4) -- its cleanup reads the breaker and,
+the held work. Whatever ends the step -- `PASS`, `FAIL`, an exception or a termination signal (`SIGINT`, `SIGTERM`,
+`SIGHUP`, see §8.4; a signal once the cleanup has begun is only recorded) -- its cleanup reads the breaker and,
 when it is still open, hands the held work over (`abort`) and releases it, then reads it `CLOSED`
 (`storm-breaker-exit.json`); the fleet's exit checks once more; the teardown then purges and deregisters the cluster and
 `fleet-cleanup.json` proves no Agent and no breaker record is left. `summary.json.checks` lists each criterion

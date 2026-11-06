@@ -16,7 +16,12 @@ if __package__:
         optional_placement_section,
         optional_start_placement,
     )
-    from .regional_capacity_recovery import resume_identity, write_aborted_status
+    from .regional_capacity_recovery import (
+        abort_on_signals,
+        cleanup_signal_guard,
+        resume_identity,
+        write_aborted_status,
+    )
     from .regional_capacity_registry import (
         CONNECTION_SECRET,
         NAMESPACE,
@@ -68,7 +73,12 @@ else:
         optional_placement_section,
         optional_start_placement,
     )
-    from regional_capacity_recovery import resume_identity, write_aborted_status
+    from regional_capacity_recovery import (
+        abort_on_signals,
+        cleanup_signal_guard,
+        resume_identity,
+        write_aborted_status,
+    )
     from regional_capacity_registry import (
         CONNECTION_SECRET,
         NAMESPACE,
@@ -1003,6 +1013,7 @@ def wait_for_scenario_job(
     return wait, job, job_status
 
 
+@abort_on_signals
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clusters", type=int, required=True)
@@ -1174,12 +1185,14 @@ def main() -> int:
     except BaseException as exc:
         failure = exc
     finally:
-        cleanup_error = scenario_teardown(args, artifacts, run_id)
+        with cleanup_signal_guard() as late:
+            cleanup_error = scenario_teardown(args, artifacts, run_id)
         if cleanup_error is not None:
             if failure is None:
                 failure = cleanup_error
             else:
                 failure.add_note(f"scenario teardown also failed: {cleanup_error}")
+        failure = late.abort(failure)
     if failure is not None:
         write_aborted_status(
             move_to_aborted(args.artifact_root, artifacts),

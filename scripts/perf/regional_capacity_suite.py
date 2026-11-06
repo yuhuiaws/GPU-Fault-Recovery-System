@@ -45,6 +45,7 @@ if TYPE_CHECKING or __package__:
     from . import regional_capacity_database as capacity_database
     from . import regional_capacity_pg_activity as capacity_pg_activity
     from . import regional_capacity_placement as capacity_placement
+    from . import regional_capacity_pods as capacity_pods
     from . import regional_capacity_recovery as capacity_recovery
     from . import regional_capacity_registry as capacity_registry
     from . import regional_capacity_repeat as capacity_repeat
@@ -65,6 +66,7 @@ else:
     import regional_capacity_database as capacity_database
     import regional_capacity_pg_activity as capacity_pg_activity
     import regional_capacity_placement as capacity_placement
+    import regional_capacity_pods as capacity_pods
     import regional_capacity_recovery as capacity_recovery
     import regional_capacity_registry as capacity_registry
     import regional_capacity_repeat as capacity_repeat
@@ -378,82 +380,10 @@ METRIC_PATTERN = re.compile(
 
 
 def control_pod_runtime_snapshot() -> dict[str, dict]:
-    document = json.loads(control("get", "pod", "-o", "json"))
-    snapshot: dict[str, dict] = {}
-    for pod in document.get("items") or []:
-        metadata = pod.get("metadata") or {}
-        name = str(metadata.get("name") or "")
-        if not name.startswith(CONTROL_POD_PREFIXES):
-            continue
-        status = pod.get("status") or {}
-        conditions = {item.get("type"): item for item in status.get("conditions") or []}
-        ready = (conditions.get("Ready") or {}).get("status") == "True"
-        containers = {}
-        restart_count = 0
-        for item in status.get("containerStatuses") or []:
-            container_name = str(item.get("name") or "")
-            restarts = int(item.get("restartCount") or 0)
-            restart_count += restarts
-            running = (item.get("state") or {}).get("running") or {}
-            terminated = (item.get("lastState") or {}).get("terminated") or {}
-            containers[container_name] = {
-                "ready": bool(item.get("ready")),
-                "restart_count": restarts,
-                "running_started_at": running.get("startedAt"),
-                "last_termination": (
-                    {
-                        "reason": terminated.get("reason"),
-                        "exit_code": terminated.get("exitCode"),
-                        "started_at": terminated.get("startedAt"),
-                        "finished_at": terminated.get("finishedAt"),
-                    }
-                    if terminated
-                    else None
-                ),
-            }
-        snapshot[name] = {
-            "role": (metadata.get("labels") or {}).get("app"),
-            "phase": status.get("phase"),
-            "ready": ready,
-            "ready_since": (conditions.get("Ready") or {}).get("lastTransitionTime"),
-            "restart_count": restart_count,
-            "containers": dict(sorted(containers.items())),
-        }
-    return dict(sorted(snapshot.items()))
+    return capacity_pods.runtime_snapshot(control)
 
 
-def control_pod_lifecycle(
-    before: dict[str, dict],
-    after: dict[str, dict],
-) -> dict[str, object]:
-    before_names = set(before)
-    after_names = set(after)
-    restarted_pods: dict[str, int] = {}
-    counter_regressions: dict[str, dict[str, int]] = {}
-    readiness_flaps: list[str] = []
-    for name in sorted(before_names & after_names):
-        if before[name].get("ready_since") != after[name].get("ready_since"):
-            readiness_flaps.append(name)  # left Ready (api-ha: NLB target out)
-        before_count = int(before[name].get("restart_count", 0))
-        after_count = int(after[name].get("restart_count", 0))
-        if after_count > before_count:
-            restarted_pods[name] = after_count - before_count
-        elif after_count < before_count:
-            counter_regressions[name] = {
-                "before": before_count,
-                "after": after_count,
-            }
-    return {
-        "restart_count_delta": sum(restarted_pods.values()),
-        "restarted_pods": restarted_pods,
-        "missing_pods": sorted(before_names - after_names),
-        "added_pods": sorted(after_names - before_names),
-        "counter_regressions": counter_regressions,
-        "not_ready_after": sorted(
-            name for name, item in after.items() if not item.get("ready")
-        ),
-        "readiness_flaps": readiness_flaps,
-    }
+control_pod_lifecycle = capacity_pods.lifecycle
 
 
 def ingress_process_model_preflight() -> dict[str, object]:
@@ -1134,6 +1064,7 @@ def validate_registered_resources(artifacts: Path, run_id: str, count: int) -> N
         raise RuntimeError("capacity token Secret changed since registration")
 
 
+@capacity_recovery.abort_on_signals
 def execute_capacity_command(
     args: argparse.Namespace,
     *,
@@ -1219,30 +1150,32 @@ def execute_capacity_command(
         cleanup_required = registration_pending or (
             run_validated and (args.command != "register" or failure is not None)
         )
-        if (
-            cleanup_required
-            and (artifacts / "registry-registration-intent.json").exists()
-        ):
-            try:
-                registered_cluster_ids(artifacts, suite_id)
-                teardown(
-                    purge=args.command == "purge" or not args.no_purge,
-                    deregister_clusters=args.command != "purge"
-                    and (
-                        not args.keep_registration
-                        or (failure is not None and args.command == "register")
-                    ),
-                    allow_live_registry=args.allow_live_registry,
-                    live_registry_confirmation=args.confirm_live_registry,
-                    artifacts=artifacts,
-                    run_id=suite_id,
-                )
-            except Exception as exc:
-                cleanup_error = exc
-                if failure is not None:
-                    failure.add_note(f"capacity teardown also failed: {exc}")
-                else:
-                    failure = exc
+        with capacity_recovery.cleanup_signal_guard() as late:
+            if (
+                cleanup_required
+                and (artifacts / "registry-registration-intent.json").exists()
+            ):
+                try:
+                    registered_cluster_ids(artifacts, suite_id)
+                    teardown(
+                        purge=args.command == "purge" or not args.no_purge,
+                        deregister_clusters=args.command != "purge"
+                        and (
+                            not args.keep_registration
+                            or (failure is not None and args.command == "register")
+                        ),
+                        allow_live_registry=args.allow_live_registry,
+                        live_registry_confirmation=args.confirm_live_registry,
+                        artifacts=artifacts,
+                        run_id=suite_id,
+                    )
+                except Exception as exc:
+                    cleanup_error = exc
+                    if failure is not None:
+                        failure.add_note(f"capacity teardown also failed: {exc}")
+                    else:
+                        failure = exc
+        failure = late.abort(failure)
 
     if failure is not None:
         capacity_recovery.write_aborted_status(

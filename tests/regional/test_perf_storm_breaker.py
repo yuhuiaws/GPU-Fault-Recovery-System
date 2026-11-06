@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -47,6 +48,7 @@ from tests.execution._budget_hold_support import (
     ScriptedAdapter,
     budget_dispatcher,
 )
+from tests.regional._perf_caller_support import deliver_signal
 from tests.regional.test_regional_action_capacity import release_agent_identity
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -975,3 +977,38 @@ def test_a_step_that_raises_still_closes_the_breaker_and_tears_down(
     assert history == [{"phase": "trip"}], "the polls survive the failure"
     status = json.loads((orchestration.artifacts / "status.json").read_text())
     assert status["status"] == "aborted"
+
+
+def test_a_signal_during_the_step_closes_the_breaker_and_tears_down(
+    orchestration: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A SIGTERM used to end the step with the breaker open, its held work
+    parked and the synthetic cluster registered; now it ends through the
+    step's cleanup and the teardown, and a second signal there is only
+    recorded."""
+
+    def signalled(step: FakeStep, *, fleet_ready_at: float) -> dict[str, Any]:
+        step.events.append("step-run")
+        deliver_signal(signal.SIGTERM)
+        return {}
+
+    def close_breaker(step: FakeStep) -> dict[str, Any]:
+        deliver_signal(signal.SIGINT)  # must not cut the hand-over short
+        step.events.append("close-breaker")
+        return {"state_before": "OPEN", "state_after": "CLOSED"}
+
+    monkeypatch.setattr(FakeStep, "run", signalled)
+    monkeypatch.setattr(FakeStep, "close_breaker", close_breaker)
+
+    assert suite.main(ARGS) == 128 + signal.SIGTERM, "the exit status names SIGTERM"
+
+    assert orchestration.events[-5:] == [
+        "step-run",
+        "close-breaker",
+        "fleet-exit",
+        "teardown",
+        "fleet-cleanup",
+    ], "the breaker hand-over, the fleet exit and the teardown all ran"
+    status = json.loads((orchestration.artifacts / "status.json").read_text())
+    assert status["status"] == "aborted", status
+    assert status["reason"] == "RunTerminated: received SIGTERM", status

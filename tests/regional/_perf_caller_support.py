@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import copy
 import json
+import signal
 import subprocess
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -27,6 +28,19 @@ TEARDOWN_TAIL = [
 
 
 PLACEMENT = {"aurora": {"cluster_id": "test-aurora", "writer_instance_id": "test-w"}}
+
+
+def deliver_signal(signum: int) -> None:
+    """Send this process ``signum`` as ``kill`` would, once the code under test
+    holds a handler for it: without one SIGTERM and SIGHUP end the process on
+    the spot (no ``finally``, no teardown), so the test fails instead."""
+
+    handler = signal.getsignal(signum)
+    assert handler not in (signal.SIG_DFL, signal.SIG_IGN, None), (
+        f"no {signal.Signals(signum).name} handler: the signal would end the run "
+        "without its teardown, leaving its load and registry on the site"
+    )
+    signal.raise_signal(signum)
 
 
 class SeriesStub:
