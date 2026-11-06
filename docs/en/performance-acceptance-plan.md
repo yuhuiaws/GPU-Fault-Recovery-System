@@ -652,7 +652,8 @@ is set, and otherwise run as before with `recorded=false` in `summary.json.place
 Every step also records `summary.json.aurora_measurement` for the writer it resolved at its start:
 `serverless_capacity_acu` and `cpu_utilization_percent` with `at_step_start` (the one-minute datapoint
 holding the moment the writer was resolved), `at_window_start` (the load start) and `max_during_window`,
-and the named cluster's `database_connections_max_during_window`. `aurora.json` is therefore read from the
+and the named cluster's `database_connections_max_during_window`. The Aurora series (`aurora.json` from the burst
+runner, `summary.json.aurora` from the action, correlated and integrated runners) is therefore read from the
 step start (at most three hours before the window); `aurora_capacity_max` and `aurora_cpu_max` keep the
 load-window range they always had. A named cluster whose `DatabaseConnections` datapoints in the window are
 all zero is not the cluster the control plane uses -- rounds named an orphan cluster (0.5 ACU, no
@@ -730,12 +731,16 @@ scripts/perf/regional_capacity_suite.py register \
 scripts/perf/regional_capacity_suite.py run \
   --case burst \
   --clusters 32 \
-  --suite-id "${SUITE_ID}"
+  --suite-id "${SUITE_ID}" \
+  --run-dir '<the run directory register wrote>'
 ```
 
-`run` requires the registration count, run ID and TTL to all match and cleans up by default
-when it finishes. A standalone `register` must refuse to execute without an explicit
-`--keep-registration`.
+A separate `run`, `purge` or `teardown` requires the original `--suite-id` and `--run-dir` (the directory holds the
+registration intent, the cluster inventory, the release identity and the resource ownership receipts); `run` further
+requires the resume fields of `run.json` (suite id, registry scope, namespaces, Secret names and the release, wheel and
+module digests) unchanged, and the registry's synthetic clusters to match `--clusters` in number, all belong to that
+suite id and none be expired; it cleans up by default when it finishes. A standalone `register` must refuse to execute
+without an explicit `--keep-registration`.
 
 Registration and cleanup first update the bootstrap Secret, then atomically publish a new
 generation through `/v1/regional/registry/revisions` and wait for all CPU processes to ACK the
@@ -761,7 +766,7 @@ The single-cluster 1000-node test uses the following fixed model, and all record
 and the same `cluster_id`:
 
 ```bash
-scripts/perf/regional_capacity_suite.py run \
+scripts/perf/regional_capacity_suite.py all \
   --case burst \
   --clusters 1 \
   --nodes-per-cluster 1000 \
@@ -818,8 +823,11 @@ These values are allowed only for the isolated raw-capacity tier and are not pro
 recommendations. The configuration switch must go into the formal release/site configuration and
 complete a rollout; it must not be applied to some Pods temporarily with `kubectl set env`.
 `run.json` must save the five budget tiers, the tested tier and whether workflows were given a
-failure domain. The runner reads the five budget tiers from one control-worker Pod, classifies the
-run as `raw-capacity`, `production-budget` or `unbounded` per the table above and writes it to
+failure domain (today `run.json` has no field for the latter, and the seed sets no `fabric_partition`). The runner reads
+the five budget tiers from the environment of one Running control-worker Pod (that Pod only: a `kubectl set env` on some
+Pods goes unnoticed) and classifies the run on the Region, per-cluster and per-resource-class rows of the table above:
+all three unset is `unbounded`, an unset row counts as satisfied, all satisfied is `raw-capacity`, anything else
+`production-budget`; the per-node and per-failure-domain rows take no part. It writes the result to
 `run.json.remediation_budget`; in both tiers the executor concurrency lower bound only requires
 progress (1), and each executor's concurrency peak `max_concurrent_commands` is recorded as
 evidence rather than a pass condition — the per-node and failure-domain limits deliberately
@@ -827,30 +835,38 @@ serialize same-cluster workflows. The executor wall clock and the Job `activeDea
 follow `--timeout-seconds` (the runner's default is 900 s); the production-budget tier 32×4 takes
 about 23 minutes by the §4.3 model, about 27 minutes by the ratio of the latest measured round to
 the model, and should be given `--timeout-seconds 3600` explicitly (2400 leaves only about 1.5
-times headroom).
+times headroom). `--synthetic-ttl-seconds` (default 3600) must exceed `--timeout-seconds` by at least 600 or the runner
+exits with a usage error, so pass `--synthetic-ttl-seconds 4200` or more with it.
 
-On every sample (`history.json`, about every 2 seconds) the runner counts the run's `RUNNING`
-workflows whose claims list a scope (whatever their lease, as the store's occupancy rule does;
-the model makes no preemption handoff), and records the holders
-of the busiest scope of each kind as `budget_holders_max` (region, cluster, class; node and
-domain are evidence only). A claim is held until its workflow ends, so every sample must stay
+On every sample (`history.json`; a 2-second sleep plus the time of one in-Pod snapshot) the runner counts the run's
+`RUNNING` workflows whose claims list a scope (whatever their lease; the store also counts a BLOCKED record whose node
+action may still run and a SUPERSEDED predecessor reserved for its successor, neither of which this model produces), and
+records the holders of the busiest scope of each kind, by scope prefix, as `budget_holders_max`. On the current release
+the claims are `node`, `job` and `domain` (the model carries no `fabric_partition`, so only the first two appear) and
+are evidence only; the region, cluster and class kinds exist only on releases before the fixed limits' retirement. A claim is held until its workflow ends, so every sample must stay
 within the limits, not only the admissions: `summary.json.remediation_budget_occupancy` judges
 against `run.json.remediation_budget.limits`, and the run fails when any sample holds the region
 with more workflows than the Region limit, a cluster with more than the per-cluster limit, or a
 (cluster, resource class) with more than the per-resource-class limit (`violations` lists each
 one, the runner exits with 3 and `status.json` gives the reason `remediation budget occupancy
 exceeded a configured limit`); an unset limit is not checked, and a history without any
-occupancy sample fails as well. Under the production-budget tier 32×4 (20/5/2) this is RUNNING ≤
-20 and ≤ 2 per cluster (every workflow of the model claims all three resource classes); the
-raw-capacity and integrated workflow thresholds are unchanged.
+occupancy sample fails as well -- on the current release none of the three limits is set, so the verdict reduces to
+"at least one occupancy sample". Under the pre-retirement production-budget tier 32×4 (20/5/2) this is RUNNING ≤ 20 and
+≤ 2 per cluster (every workflow of the model claims all three resource classes); the raw-capacity and integrated
+workflow thresholds are unchanged.
 
-Every entry point must name the target kubeconfig/context explicitly. Production registry tokens
-and Secrets must not be written into artifacts; the registry baseline may keep only cluster IDs
-and token digests.
-Action capacity teardown must also delete the synthetic workflows matching
-`workflow-actionperf-*` that carry no `cluster_id`, and then delete the `perf-cap-*` incident,
-command, Agent and queue records; otherwise orphan workflows with missing incidents remain and
-keep triggering dispatcher errors.
+Every entry point must name the target kubeconfig/context explicitly: only `regional_capacity_suite.py` refuses an
+empty `GPU_FAULT_DATAPLANE_CONTEXT`, `GPU_FAULT_CONTROL_KUBECONFIG` defaults to `/tmp/gpu-fault-control-plane.kubeconfig`,
+and the other runners use kubectl's current context when the context is empty. Production registry tokens and Secrets
+must not be written into artifacts: `registry-baseline.json` keeps every field of the production registrations except
+the plaintext token, recorded only as `token_sha256`, and `registry-secret-baseline.json` holds only the digest and the
+serialized shape.
+Action capacity teardown uses the run-owned data purge every suite shares (`regional_capacity_settle.purge_run_data`): it
+starts from the records of the run's clusters and follows references (`incident_id`, `workflow_request_id` and the like,
+plus the `workflow-reboot-after-<key>` successors), so the `workflow-actionperf-*` workflows that carry no `cluster_id`
+are reached through their `incident_id`, and it deletes the incidents, workflows, commands, Agents and queue records in
+one transaction; leaving them would leave orphan workflows with missing incidents that keep triggering dispatcher
+errors.
 After the executor Job is deleted, the processor queue is drained and registry ownership is
 verified, teardown may also delete this round's own non-terminal workflow/command records (the
 `forced_nonterminal` count is written into the cleanup result): the LEASED/PENDING commands left
