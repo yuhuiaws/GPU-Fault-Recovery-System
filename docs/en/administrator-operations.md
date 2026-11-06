@@ -1586,32 +1586,32 @@ Semantics and boundaries of `eks-managed`:
   objects differ from the render (`join-cluster` applies only the GPU cluster's observability objects); the next
   deploy's control-plane release settles it.
 
-  **Mixed-site join walkthrough** (an existing `hyperpod-v1` site joining the plain EKS cluster `gpu-eks-cluster`):
+  **Mixed-site join walkthrough** (an existing `hyperpod-v1` site joining the plain EKS cluster `<eks>`):
 
   ```bash
   # 0. label the GPU managed node group for this site (check the site id with site-id); wait until describe-nodegroup shows it
   gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN> --state-dir /secure/gpu-fault
-  aws eks update-nodegroup-config --cluster-name gpu-eks-cluster \
-    --nodegroup-name gpu-p5en-efa-spot-node-group \
+  aws eks update-nodegroup-config --cluster-name <eks> \
+    --nodegroup-name <gpu-nodegroup> \
     --labels addOrUpdateLabels={gpu-fault.io/control-plane=<site id>}
   # 1. discovered as eks-managed (ARNs only; refused here without a labelled GPU node group), needs eks-v1 ->
   #    writes profile-plan.json and stops (no AWS mutation)
   gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
-    --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/gpu-eks-cluster
+    --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/<eks>
   # 2. review /secure/gpu-fault/release-deploy/profile-plan.json, record plan_sha256 on the change request
   # 3. rerun the same command with the approval: token, Executor IAM (ec2 Describe/Reboot + eks Describe),
   #    NAT EIP whitelist, Route53 association, Node Action keys, eks-v1 registration, data plane, activation
   gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
-    --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/gpu-eks-cluster \
+    --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/<eks> \
     --approve-profile-plan <plan_sha256> --reference CHG-<id>
   ```
 - Compile-time owner of node lifecycle steps: the control plane compiles `RESTART_NODE`/`REPLACE_NODE` against the
   **cluster's registration** (`RegionalClusterRegistration.provider` and `runtime_profile_version`), not against the
   profile version a finding or observation carries (`orchestration/provider_lifecycle_owner.py`). On a mixed site a
-  workload submitted under the site profile stamped `hyperpod-v1` on its observation, the synthetic replacement
-  finding repeated it, and the eks cluster's `REPLACE_NODE` compiled with `gpu-fault-hyperpod-adapter` as owner:
-  nothing claimed it, it failed on the unclaimed deadline 932 s later and the hand-off drained a healthy node
-  (gpu-eks-cluster DESTR-003). The cluster's own pinned profile now replaces the named version (the incident reasons
+  workload submitted under the site profile stamps `hyperpod-v1` on its observation and the synthetic replacement
+  finding repeats it; compiled from that, the eks cluster's `REPLACE_NODE` would get `gpu-fault-hyperpod-adapter` as
+  owner, nothing would claim it, and it would fail on the step deadline and hand a healthy node to the drain. The
+  cluster's own pinned profile therefore replaces the named version (the incident reasons
   record `runtime profile re-pinned from … to …`), and a provider step whose owner is not this cluster's provider
   adapter (`PROVIDER_NODE_REBOOT_OWNERS`) is refused **at plan time** as BLOCKED with the reason in words, never waited
   for. `gpu-fault-training-submit --runtime-profile-version` also accepts any cluster's own pinned version
@@ -1637,9 +1637,9 @@ Semantics and boundaries of `eks-managed`:
   hand either (`kubectl delete pod --force --grace-period=0`), and keep `maxSurge` unset on the plugin DaemonSets (both
   charts' default): either way the replacement can register while the hung plugin is still connected, and kubelet (up to
   v1.36) drops the replacement when the hung plugin's stream ends -- a Ready plugin Pod beside an allocatable of 0 that
-  never recovers by itself (live GF-GENERAL-LIVE-014 `efa_plugin`, plain EKS). To recover that state delete the plugin
+  never recovers by itself (acceptance GF-GENERAL-LIVE-014 `efa_plugin`). To recover that state delete the plugin
   Pod once more without `--force`: the hung instance is gone by then, so the next replacement registers and stays
-  (detailed design v2 §3.8, b212).
+  (detailed design v2 §3.8).
 - DCGM: the HyperPod AMI runs DCGM as a host service and the exporter DaemonSet dials the node's nv-hostengine at
   `127.0.0.1:5555`; the plain EKS AL2023 NVIDIA AMI has no host nv-hostengine (a `dcgmi` binary may still be present,
   from the image or installed by hand), so in the default embedded mode an `eks-managed` cluster's
@@ -1692,18 +1692,18 @@ Semantics and boundaries of `eks-managed`:
   and host processes are never swept and stay in `unswept_device_holders` for VERIFY to refuse. A QUIESCE that fails with an
   error starting `workload_container_ids_by_node …` (a value that is not a 64-hex runtime id, more than 64 per node, or the wrong
   type) means the plan itself is wrong; it fails before the fail-safe is armed or any service stopped, the node is untouched.
-  **An `eks-managed` quiesce never stops `kubelet` or `containerd`** (2026-10-05, gpu-eks-cluster DESTR-001: stopping
-  kubelet took the node NotReady, and a plain EKS node has no HyperPod health agent to carry it): the installer Job adds
+  **An `eks-managed` quiesce never stops `kubelet` or `containerd`** (stopping
+  kubelet takes the node NotReady, and a plain EKS node has no HyperPod health agent to carry it): the installer Job adds
   `--cluster-provider eks-managed` (Agent environment `GPU_FAULT_CLUSTER_PROVIDER=eks-managed`), the Agent skips the two
   protected services at quiesce time (`protected_services` in the receipt and the state file), and the configured service
   list and the Agent config digest are unchanged; GPU client containers are still stopped through containerd, kubelet
   restarts them with its back-off, and the `/dev/nvidiaN` holder check before the reset plus the sweep on each retry cover
   that window; `RESTORE_GPU_SERVICES` starts only what the quiesce really stopped. HyperPod passes neither switch; its
   environment file and Agent config digest are byte for byte unchanged.
-  **An `eks-managed` quiesce window taints the node `gpu-fault.io/quiesce=<incident value>:NoExecute`** (2026-10-05,
-  gpu-eks-cluster DESTR-001, second round: with kubelet up, the DaemonSet Pods of the product's own DCGM exporter
-  (embedded hostengine), the NVIDIA device plugin and GPU feature discovery were back seconds after the quiesce stopped
-  them, and `VERIFY_NO_GPU_CLIENTS` retried for seven minutes before FAILING with "quiesce maintenance window
+  **An `eks-managed` quiesce window taints the node `gpu-fault.io/quiesce=<incident value>:NoExecute`** (with
+  kubelet up, the DaemonSet Pods of the product's own DCGM exporter
+  (embedded hostengine), the NVIDIA device plugin and GPU feature discovery come back seconds after the quiesce stops
+  them, and `VERIFY_NO_GPU_CLIENTS` can only retry until it FAILS with "quiesce maintenance window
   expired"): the Executor applies the taint **before** it dispatches QUIESCE_GPU_SERVICES (if it cannot, the step
   FAILS without sending the Agent anything, `details.quiesce_taint_error`), DaemonSet Pods that do not tolerate it are
   evicted for the window; it removes the taint **before** it dispatches RESTORE_GPU_SERVICES (if it cannot, the host
@@ -1715,10 +1715,10 @@ Semantics and boundaries of `eks-managed`:
   it together with the cordon and the quarantine taint; `workflow-reconcile`, the orphaned-annotation cleanup and
   `config spare` all treat it as isolation still in place. HyperPod never gets this taint (its quiesce stops kubelet;
   nothing restarts the containers). **The reboot rung lifts it itself**: the RESTART_NODE a failed RESET_GPU escalates to inside the same record
-  retires the RESTORE_GPU_SERVICES that would have lifted the taint, and taints survive a reboot (2026-10-07,
-  gpu-eks-cluster DESTR-025: the exporter could not return to the node, VALIDATE_GPU waited out its 600 s with
-  `quiesce_taint_present`, the ladder climbed to a REPLACE_NODE no spare could serve, and the exhausted branch
-  quarantined the node -- the same chain passed on HyperPod, which has no taint). The provider lifecycle adapter now
+  retires the RESTORE_GPU_SERVICES that would have lifted the taint, and taints survive a reboot (with the taint
+  left in place the exporter cannot return to the node, VALIDATE_GPU waits out its 600 s with
+  `quiesce_taint_present`, the ladder climbs to a REPLACE_NODE no spare can serve, and the exhausted branch
+  quarantines the node -- the same chain passes on HyperPod, which has no taint). The provider lifecycle adapter therefore
   strips every `gpu-fault.io/quiesce` taint of the node when the reboot is confirmed (explicit operation id, or
   provider Running plus a new Agent incarnation) and records it in the RESTART_NODE's
   `details.quiesce_taint_removed_nodes`, one path for both providers (a HyperPod node carries none and gets no
@@ -1740,14 +1740,14 @@ Semantics and boundaries of `eks-managed`:
   REBOOT_NODE withheld: ...` naming the withheld request and the bound that failed the step; the operator checks
   the node's gpu-fault DaemonSets/collectors first, then reruns the diagnostic or acts by hand. A validation that
   had observed the node failing before the cap, or whose verdict is the adapter's own, escalates as designed.
-  (2026-10-25, plain EKS, GF-GENERAL-LIVE-013 `link_inactive`: with the collectors dark the validation waited out
-  the cap and the REBOOT_NODE request rebooted a node nothing had been learned about.) An inventory count the host
+  (With the collectors dark, a REBOOT_NODE after the validation waited out
+  the cap would only reboot a node nothing had been learned about.) An inventory count the host
   collector reported since the action is such a verdict even while the collector's status is erroring on another
   contributor (`details.host_collector_errors` names the errors beside it), so a function that is unbound again
   after the rebind ends the chain FAILED on `efa_inventory_active_count=15,expected=16` and opens the reboot rung
-  instead of this hand-off (2026-10-27, both clusters, GF-GENERAL-LIVE-013 `post_repair_failure`: the 15/16 count
-  arrived seconds after TRIGGER_HEALTH_SNAPSHOT, the `_rdma` coverage error of the same batches kept it unread for
-  600 s, and the reboot was withheld).
+  instead of this hand-off (a 15/16 count
+  arriving seconds after TRIGGER_HEALTH_SNAPSHOT is not left unread for 600 s by an `_rdma` coverage error of the same
+  batches, withholding the reboot).
   **A workload restart waits for device-plugin health first**: before it creates the new attempt, RESTART_WORKLOAD
   reads, for every target node (the nodes the Pod templates pin with `nodeName`/`kubernetes.io/hostname`, plus the
   nodes this workflow repaired, minus `avoid_node_ids`), the `nvidia.com/gpu` `capacity` and `allocatable`, the
@@ -1758,10 +1758,10 @@ Semantics and boundaries of `eks-managed`:
   `reason=DEVICE_PLUGIN_UNHEALTHY` past the step parameter `device_plugin_health_timeout_seconds` (default 180 s),
   submitting no attempt. The SUCCEEDED record then carries `details.device_plugin_health`, a per-node receipt
   (capacity/allocatable/plugin Pod/heartbeat/ready time); a node without GPU capacity reads `not_applicable`, and a
-  restart that pins nothing and repaired nothing reads no node. (2026-10-07, gpu-eks-cluster DESTR-015: the PyTorchJob
-  Pods restarted one second after RESTORE_SCHEDULING were refused by kubelet with `UnexpectedAdmissionError: Allocate
-  failed due to no healthy devices present` -- upstream nvdp 0.17.1 still reported the just-reset GPUs unhealthy and
-  node allocatable returned to 8/8 only a little later; HyperPod's plugin timing never exposed the window.) **Every exit of the window removes the taint**: every QUIESCE outcome
+  restart that pins nothing and repaired nothing reads no node. (Without the wait, PyTorchJob
+  Pods restarted one second after RESTORE_SCHEDULING are refused by kubelet with `UnexpectedAdmissionError: Allocate
+  failed due to no healthy devices present` -- upstream nvdp 0.17.1 still reports the just-reset GPUs unhealthy and
+  node allocatable returns to 8/8 only a little later; HyperPod's plugin timing does not expose the window.) **Every exit of the window removes the taint**: every QUIESCE outcome
   (WAITING/FAILED/SUCCEEDED) records `details.quiesce_taint_nodes`; a quiesce the Agent refused or whose window expired
   untaints at once and records `quiesce_taint_removed_nodes`; a QUIESCE that tainted but never completed owes the
   RESTORE_GPU_SERVICES compensation like a completed one (`execution/node_action_uncertainty.unrestored_quiesces` reads
@@ -1781,7 +1781,7 @@ Semantics and boundaries of `eks-managed`:
   running and had nothing to stop, e.g. `nvidia-fabricmanager` on an instance without NVSwitches) and RESTORE carries
   `restored_services`. When the reset still answers "In use by another client" while no process in `/proc` holds any
   device node, the Agent unloads the idle display stack after the first busy refusal (`nvidia_drm` at refcount 0, then
-  `nvidia_modeset` -- live the only holder was `nvidia_modeset refcount=1 used_by nvidia_drm`), retries at once and
+  `nvidia_modeset` -- the typical holder is `nvidia_modeset refcount=1 used_by nvidia_drm`), retries at once and
   loads it back with `modprobe nvidia_drm` after the reset whatever its outcome (`released_kernel_modules`/
   `reloaded_kernel_modules`/`display_stack_restored`); with a process holding a device node no module is
   touched -- except the `nvidia-persistenced` the window kept (holding only the other GPUs and `/dev/nvidiactl`) and the
@@ -1852,8 +1852,8 @@ Semantics and boundaries of `eks-managed`:
   later validation; the residual risk is the in-kernel tail of an nvidia-smi killed at its deadline, and the restarted
   services attach only once the GPU answers). The judgement reads **the restore's own nodes only**
   (`unresolved_actions_for`): a sibling branch's reset still in its busy-retry loop never holds this node's restore
-  (gpu-eks-cluster DESTR-015: branch A's restore was refused `NODE_ACTION_OUTCOME_UNRESOLVED` two seconds before branch
-  B's reset returned, the branch was read as exhausted and the hand-off quarantined a node whose own reset had succeeded).
+  (otherwise branch A's restore would be refused `NODE_ACTION_OUTCOME_UNRESOLVED` before branch
+  B's reset returned, the branch would read as exhausted and the hand-off would quarantine a node whose own reset had succeeded).
   While an action on the restore's own node may still be executing on the Agent (a command PENDING/LEASED, a reset in its
   retry loop, a step wait that ran out over an open command) the restore is recorded WAITING (`restore_gpu_services_held`,
   `awaiting_step_indexes`) and re-reads the terminal result on the next tick, bounded by the step's own waiting cap
@@ -1871,7 +1871,7 @@ Semantics and boundaries of `eks-managed`:
   reset still fails with `In use by another client`) and must tolerate being stopped inside the window; otherwise keep
   them off nodes carrying the `gpu-fault.io/quarantined` taint by their own affinity. When `nvidia-smi --gpu-reset`
   still answers `In use by another
-  client` (2026-10-05, gpu-eks-cluster, XID 46: named containers stopped, no `/dev/nvidiaN` holder, busy on all three
+  client` (for example named containers stopped, no `/dev/nvidiaN` holder, busy on all three
   retries), the step's `details.gpu_client_holders` records, at the moment of failure, every holder of any NVIDIA device
   node (`nvidiactl`, `nvidia-uvm`, a `(deleted)` replaced node included) with its cgroup/container attribution,
   `--query-compute-apps`, and the `nvidia*`/`gdrdrv` kernel module reference counts; the error text ends with
@@ -1883,24 +1883,23 @@ Semantics and boundaries of `eks-managed`:
   provider-rejection path writes step `details.revoked_agents`/`reactivated_agents`; the exception path keeps the
   executor's own failure/retry classification and logs an Executor WARNING `agent <cluster>/<node> reactivated`) and
   the Agent keeps heartbeating under its incarnation. A recorded submission (INTENDED/UNKNOWN/SUBMITTED) or a partial
-  acceptance keeps the Agent REVOKED: the provider may still reboot it. Releases
-  before 2026-10-05 left the Agent REVOKED with every heartbeat answered 409 `agent incarnation has been retired`.
+  acceptance keeps the Agent REVOKED: the provider may still reboot it. An Agent left REVOKED gets every
+  heartbeat answered 409 `agent incarnation has been retired`.
   Recovery **without rebooting the node**: read `generation` and `transition_id` (the revoking
   `<workflow>/<step>/<op>/hyperpod-lifecycle`) from `GET /v1/fleet/agents/{cluster_id}/{node_id}`, then
   `POST /v1/fleet/agents/{cluster_id}/{node_id}/reactivate` (dual credentials) with body
   `{"expected_generation": <generation>, "transition_id": "<transition_id>", "reason": "<CHG>"}`; or run the
   `REACTIVATE_AGENT` snippet of `scripts/e2e/regional/warm_spare_fixture.py` inside the CPU Pod
   (`context.fleet_registry.reactivate_agent`). The Executor's own route is
-  `POST /v1/regional/executors/agents/{node_id}/reactivate` (cluster-token). The same day's other gap: the
+  `POST /v1/regional/executors/agents/{node_id}/reactivate` (cluster-token). The
   `hyperpod-submissions/*` routes compare the submission's `cluster_name` with the registration's **provider cluster
-  name** -- `hyperpod_cluster_name` on HyperPod, the `cluster_id` itself on `eks-managed` (`EksProviderConfig.cluster_name`);
-  until then every eks-managed RESTART_NODE was refused 403.
+  name** -- `hyperpod_cluster_name` on HyperPod, the `cluster_id` itself on `eks-managed` (`EksProviderConfig.cluster_name`).
 - Restore when the ladder is exhausted: the in-place branch escalation replaces the failed branch -- its completed QUIESCE
   and pending RESTORE_GPU_SERVICES included -- with a reboot rung; when the reboot is refused and no spare is declared the
   workflow ends `node branch escalation exhausted: ...`. The Executor now appends the owed `RESTORE_GPU_SERVICES` as a new
   step of the record and runs it first (`parameters.compensation_for_step_indexes` names the restored QUIESCE step
   indexes; the owner is the chain's RESTORE owner); `terminal_failure_reason` stays the exhaustion reason, and a failed
-  restore ends the error with `; restore compensation failed: <reason>`. Until then the node's GPU services waited for
+  restore ends the error with `; restore compensation failed: <reason>`. Otherwise the node's GPU services would wait for
   the Agent's quiesce fail-safe timer. A command the cluster executor refused before dispatch
   (`remote_status_source=executor-rejected`: a stale fencing token, a cluster mismatch, no adapter, a namespace out of
   scope) is not a node failure: the branch ladder appends no reboot/replace rung for it (the exhaustion reason reads
@@ -1928,7 +1927,7 @@ Semantics and boundaries of `eks-managed`:
 - Join prerequisite: every `allowedNamespaces` entry (the workload namespaces the Executor/watcher act in) other than
   the control-plane namespace must already exist on the target cluster -- the release renders a Role/RoleBinding per
   namespace and server-dry-runs it, so a missing one failed the join deep inside the release and rolled it back
-  (2026-10-04: `namespaces "training" not found`). The join now checks on its first read of the GPU cluster, before it
+  (for example `namespaces "training" not found`). The join therefore checks on its first read of the GPU cluster, before it
   creates anything, and refuses with the remedy: `kubectl create namespace <name>` first, or `--allowed-namespace
   <name>` (repeatable) naming only namespaces that exist. The default list is the one the site's existing GPU clusters
   share (`gpu-fault-system, training` on a fresh site); the historical default `training` is no longer forced onto a
@@ -1960,11 +1959,11 @@ HMA signals, `UpdateClusterSoftware` re-imaging, HyperPod advisory notifications
 node group in the cluster. An existing `dcgm-exporter` in the cluster must not bind host ports 9400/5555 over
 hostNetwork (ours binds only `127.0.0.1:9400` and dials the host nv-hostengine).
 
-**The join window of a replacement node (both providers; live 2026-10-07, managed node group roll).** After the old
+**The join window of a replacement node (both providers).** After the old
 node is terminated: the control plane's departed-node cleanup retires the old Agent record after the 10-minute guard
 (§10.1.1; by hand: `workflow-reconcile --retire-departed-agents`); the
-`gpu-fault-node-installer-reconciler` then creates an installer Job per new node (live: about 20 minutes after node
-creation, completing within minutes); within about one sync period (`GPU_FAULT_NODE_KEY_SYNC_SECONDS`, default 60 s)
+`gpu-fault-node-installer-reconciler` then creates an installer Job per new node (the install itself completes within
+minutes); within about one sync period (`GPU_FAULT_NODE_KEY_SYNC_SECONDS`, default 60 s)
 of the new node entering the cluster's node selector the cluster executor adds its key to `gpu-fault-node-action-keys`
 (§6), the waiting installer Pod then mounts it -- a `FailedMount ... references non-existent secret key` event seen
 before that is transient -- and the Agent registers at the end of the install, no deploy needed. With updateStrategy
@@ -1975,14 +1974,14 @@ launched, so the group runs that node short from the termination until the repla
   the Store for it;
 - the Kubernetes watcher (`kubernetes-node-resources`) judges no device-plugin resource loss on a node whose creation or
   `Ready=True` transition is younger than `GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS` (default 600 s) -- the
-  device-plugin Pods register `nvidia.com/gpu` / `vpc.amazonaws.com/efa` minutes after the join. It used to open an EFA
-  incident 19 seconds after node creation and plan `RESTART_GPU_DEVICE_PLUGIN`;
+  device-plugin Pods register `nvidia.com/gpu` / `vpc.amazonaws.com/efa` minutes after the join; without the grace an EFA
+  incident would open seconds after node creation and plan `RESTART_GPU_DEVICE_PLUGIN`;
 - a workflow created for the new node inside the window stays `PENDING` until the Agent registers (the fleet preflight
   does not dispatch it) and is dispatched right after; if the executor does not yet see the node's action key, the node
   action step waits with `node_action_state=KEY_PENDING` (at most `NODE_ACTION_KEY_PROPAGATION_GRACE`, 10 minutes
-  after the Agent's first registration) and retries instead of failing terminally -- `RESTART_GPU_DEVICE_PLUGIN` used
-  to fail with `node action secret is unavailable for <node>` in the very second the installer Job completed, and a
-  destructive action failing that way would have quarantined a healthy node. Outside the grace it still fails closed.
+  after the Agent's first registration) and retries instead of failing terminally with `node action secret is
+  unavailable for <node>` -- a destructive action failing that way would quarantine a healthy node. Outside the grace it
+  still fails closed.
 
 **A node that leaves or joins while a release runs (both providers).** When `deploy` starts, the snapshot records each
 cluster's Agent node set (`agent_identities[<cluster>].node_ids`), and when each cluster's roll starts the fleet deployment
@@ -2025,8 +2024,8 @@ healthy release:
   but the release's it is `artifact drift` -- and `status` exempts nothing: a newcomer still reads `installer is not
   Succeeded` until it is installed.
 - A departure the verify cannot prove at its first look -- the Node still listed NotReady or being deleted, EC2 still
-  `shutting-down`, HyperPod still listing the instance, the Agent lease not lapsed yet (live 2026-11-04: five minutes after a
-  spot interruption the Node was still listed) -- is waited out by the forward path's rule in every cluster whose findings fail
+  `shutting-down`, HyperPod still listing the instance, the Agent lease not lapsed yet (minutes after a spot interruption
+  the Node can still be listed) -- is waited out by the forward path's rule in every cluster whose findings fail
   the verify (the target of a join, every cluster of a `deploy` / `config`): re-read every 30 s for at most the product's
   10-minute departure guard (log `departure-undecided`); excused once Kubernetes no longer lists the node and the proof holds,
   with the evidence in `release_churn.departure_evidence` (log `departed-node-excluded phase=verify`), and counted otherwise --
@@ -2050,16 +2049,14 @@ The join's commit path pays only for the new cluster, and the `evidence` in `sta
   wait for and fail on the joining cluster only; another cluster's open remote commands (the Agent of a node a spot reclaim
   took never claims its commands, which the Store expires after 900 s), its context and its destructive workflows are logged,
   one line each: `not-gating <time> verb=join-cluster targets=<id> cluster=<other> check=<remote_commands_idle|regional_contexts|fleet_wave_safety> finding="..."`.
-- `COLLECTORS_READY`: waits only for the "fast" collectors (configured unconditional reporting period <= 60 s, currently
-  `GPU_INVENTORY`, `HOST_TELEMETRY`) to report once on every node, and requires the Agent row to be alive
-  (`/v1/fleet/readiness`: lease not expired, identity is the current release); kinds with a longer period
-  (the 300 s default health summaries: `GPU_METRICS`, `FABRIC_MANAGER_LOG`, `NODE_LOGS`,
-  `NVIDIA_KERNEL`) only have their systemd unit checked as active, recorded as `verified_as: scheduled`,
-  with the first report confirmed by the later verify/`status` path. The fast/slow split comes from the period
-  variables written by the collector installation script (`GPU_FAULT_*_HEALTH_SUMMARY_SECONDS`, `GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS`,
-  `GPU_FAULT_HOST_INTERVAL_SECONDS`), not a hard-coded list. Evidence fields: `waited_kinds`,
-  `deferred_kinds` (each kind's period, scheduled/reported node counts), `fleet_ready`. A fast kind
-  not reporting within 600 s is still a hard failure.
+- `COLLECTORS_READY`: reads `/v1/collector-readiness/{cluster_id}` through the CPU ingress Pod every 10 s for at most
+  600 s, until every collector kind each `ACTIVE` Agent of the joining cluster needs has a successful post younger than
+  the kind's silence threshold (`GPU_INVENTORY` 180 s; `GPU_METRICS`, `HOST_TELEMETRY` 420 s; `NODE_LOGS`,
+  `NVIDIA_KERNEL`, `FABRIC_MANAGER_LOG` 900 s) and its systemd unit runs (`admin/cluster_readiness.py`,
+  `app/routes/telemetry.py`). A kind that never posted is only marked `pending_first_report` within its threshold and is
+  not ready, so the health summaries (every 300 s by default) wait for their first post too. The evidence records only
+  `nodes` and `ready`; not ready within 600 s is a hard failure whose message carries the last reading. Waiting by a
+  fast/slow split of the reporting periods, checking only the unit of a slow kind, is not implemented.
 - `VERIFIED`: the candidate verify is the full `verify` report of the candidate site, **scoped to the joining cluster(s)**
   (the engine's `verify --joining-cluster-id <id>`, one per cluster of a batch). GPU data-plane clusters are independent, so
   the checks are of two kinds:
@@ -2084,7 +2081,7 @@ The join's commit path pays only for the new cluster, and the `evidence` in `sta
   `details.not_gating`; the report lists every one under `cluster_scope.not_gating_findings`; the join keeps them in
   `evidence.VERIFIED.not_gating_findings` and in its result's `not_gating_findings` (redacted, each capped), and `status`
   shows them (§4, `membership_verify_findings`). Another cluster's collectors are not waited for. `control_api` judges the
-  joining cluster's collector readiness by the fast/slow rule above.
+  joining cluster's collector readiness by the same `/v1/collector-readiness` rule (with the post-roll grace of §4).
 
   The remote-command values are the Store's per-cluster ones (`oldest_unclaimed_age_seconds_by_cluster`,
   `executor_internal_error_total_by_cluster`, `executor_internal_error_last_seen_timestamp_seconds_by_cluster`): a command
@@ -2354,7 +2351,7 @@ The node runtime runs on the host (systemd units, a venv built from `/usr/bin/py
 diagnostics), and the node preflight Job checks these prerequisites inside `chroot /host`: `/usr/bin/python3.12`,
 `curl`, `nvidia-smi`, `ps`, `ss`, `strace`, `systemctl`, `timeout`, plus `/dev/kmsg` and Python 3.12 venv support. The
 EKS `AL2023_x86_64_NVIDIA` AMI ships the NVIDIA driver, `nvidia-smi`, containerd (NVIDIA CDI) and the EFA tools but
-**not `python3.12` or `strace`** (measured on gpu-eks-cluster, 2026-10-04). Install them in the managed node group's
+**not `python3.12` or `strace`**. Install them in the managed node group's
 launch template and roll the node group; do not `dnf install` by hand on a node -- the next replacement loses it.
 
 AL2023 user data is MIME multipart: keep the `nodeadm` `NodeConfig` part as the EKS documentation describes (a managed
@@ -2373,7 +2370,7 @@ apiVersion: node.eks.aws/v1alpha1
 kind: NodeConfig
 spec:
   cluster:
-    name: gpu-eks-cluster
+    name: REPLACE_WITH_CLUSTER_NAME
     apiServerEndpoint: https://REPLACE_WITH_API_SERVER_ENDPOINT
     certificateAuthority: REPLACE_WITH_BASE64_CA
     cidr: 10.100.0.0/16
@@ -2408,6 +2405,10 @@ systemctl daemon-reload
 systemctl enable --now nvidia-dcgm
 --==GPU-FAULT==--
 ```
+
+`prepare-eks-nodegroup` (§5.0.1a) writes the managed version of this shell part: it carries the marker line
+`# gpu-fault.io/user-data-part: node-prerequisites v1`, retries a failed `dnf install` up to 5 times 30 s apart, in host mode
+reads the CUDA major from `nvidia-smi`, and runs `dcgmi discovery -l` once `nvidia-dcgm` is enabled.
 
 Once the user data is in the node group's launch template, the nodes still have to pick it up:
 
@@ -2448,11 +2449,11 @@ Once the user data is in the node group's launch template, the nodes still have 
   aws eks describe-update --name <eks cluster> --nodegroup-name <GPU node group> --update-id <id> \
     --query update.status                                       # until Successful
   ```
-- **Live caveats (2026-10-07, gpu-eks-cluster)**: with the default update strategy (`DEFAULT`, also a group without
+- **Caveats**: with the default update strategy (`DEFAULT`, also a group without
   `updateStrategy`) the roll launches **one** extra instance first (maxUnavailable 1), so a Spot node group needs Spot
-  capacity for one more p5en.48xlarge in its AZ -- when there is none, EKS fails the update with `NodeCreationFailure`
-  after about 17 minutes and reverts the node group to the previous launch-template version with the nodes untouched (two
-  of three attempts on the Spot p5en group went that way; repeat the update later, failed attempts are harmless). That is
+  capacity for one more instance of its type (for example p5en.48xlarge) in its AZ -- when there is none, EKS fails the update
+  with `NodeCreationFailure` after about 17 minutes and reverts the node group to the previous launch-template version with the
+  nodes untouched (repeat the update later, failed attempts are harmless). That is
   why step 4 sets `MINIMAL`: the roll then terminates one node before it launches its replacement, needs no spare
   instance, and the group is one GPU node short (1 of 2 out at a time) until each replacement joins (the join window
   paragraph above); a replacement that cannot launch (Spot capacity) leaves the group short until one does.
@@ -2949,19 +2950,19 @@ daemonsets) for the findings; `ssm:SendCommand`/`ssm:GetCommandInvocation` for t
   blocker record.
 - A mixed-site rollback restores the Runtime Profile per cluster: the control-plane env carries only the site
   profile version, a cluster running its own profile keeps its version and digest through the restored registry
-  registration; the previous-state snapshot records `cluster_runtime_profiles` since 2026-10-04. A transaction
+  registration; the previous-state snapshot records `cluster_runtime_profiles`. A transaction
   opened earlier (no such record) reuses the candidate configuration's per-cluster overrides when its release
   diff moved no profile component, logging `rollback-cluster-profiles source=candidate-config`; otherwise it
   refuses and names the clusters whose previous pins cannot be derived.
-- Converging a site that stopped in `rollback-failed` (`status` shows `next deploy: resume rollback`):
-  1. Rerun the **same** `deploy` with the fixed build (same `--state-dir`/`--cpu-cluster-arn`/`--gpu-cluster-arn`);
+- Converging a site that stopped in `rollback-failed` (the `next deploy:` line of `status` ends in `(resume rollback)`):
+  1. Rerun the **same** `deploy --state-dir` with the fixed build;
      the engine finds the pending rollback, rolls the site back to the last committed release
      and ends with `rollback recovery completed; rerun deploy to start a new transaction` (exit code 2 is expected).
   2. `gpu-fault-admin status --state-dir <dir>`: expect `phase=rolled-back`, every Agent ACTIVE on the previous pins.
   3. Rerun the same `deploy` once more: a new transaction opens from the committed baseline.
      `--supersede-failed-transaction` does not apply to a transaction that is rolling back.
   4. When every rollback stops at `<cluster> rollback validation failed: <cluster> rollback Agent heartbeat mismatch` and
-     that cluster lost a spot node mid-release, hand-edit nothing: resumed with a build carrying this fix, the verification
+     that cluster lost a spot node mid-release, hand-edit nothing: on the resume the verification
      drops the departed node from the snapshot's expected set on a three-way proof (Kubernetes + provider inventory + Agent
      record) and records it under `departed_nodes` (§10.2, "a spot reclaim mid-release"); an unproven departure refuses,
      naming the node and the reason.
@@ -3073,16 +3074,15 @@ site profile first, then the smallest cluster id): the command result carries `r
 cluster's family (no fall back to the HyperPod base for "no cluster"); a new site profile version has no member to
 register under then and is refused at planning -- join a cluster first. Later deploys restore `spec.release` and
 `spec.runtimeProfile` from the last verified release but keep the current registration cluster: it follows membership,
-not the release (that step used to move a registration cluster `remove-cluster` had moved back to the removed one, and
-the next deploy refused).
+not the release.
 
 A version already registered keeps the anchor of its first registration: the control plane stores one copy per
 `profile_version`, labelled with the registration cluster of that time as its `cluster_id`, and the immutable snapshot
 `profiles/<version>.yaml` stays as written. The release's registration check and `status --full`/`verify` compare the
 policy content, not that `cluster_id`, so after the registration cluster changes the same version is neither drift nor
-registered again; later versions register under the new registration cluster. An earlier `remove-cluster` kept a removed
-cluster as the registration cluster, and every later `deploy` then refused with `registration cluster <cluster-id> is not
-among the managed GPU clusters`. The deploy now refuses before the source snapshot and names the way out: while a member
+registered again; later versions register under the new registration cluster. When the registration cluster has left
+the site (for example a site an old removal journal left without moving the anchor), every `deploy` refuses before the
+source snapshot with `registration cluster <cluster-id> is not among the managed GPU clusters` and names the way out: while a member
 of that provider remains, `gpu-fault-admin deploy --state-dir <dir> --registration-cluster <cluster-id> --reference <CHG>`
 checks the departed cluster's COMPLETED `remove-cluster/<id>/state.json`, confirms the target is a member of that
 provider, moves the anchor (journaled in `registration-anchor/journal.json` with the reference) and continues the same
@@ -3191,8 +3191,8 @@ gpu-fault-admin hyperpod-scheduled-update --state-dir /secure/gpu-fault \
   inputs carry the two fields; `ScheduleExpression` is required with a minimum length of 1 (as is `AutoPatchConfig`'s
   `PatchingStrategy`), so neither an empty structure nor an empty expression is a valid request, and the full
   definition without the field is the only request that can say "no schedule". The model does not say whether the
-  service reads an omitted field as "remove" or as "unchanged"; on the live CPU group (2026-11-02) it removed the
-  schedule: accepted, and about 30 s later `describe-cluster` showed no `ScheduledUpdateConfig`, the cluster and the
+  service reads an omitted field as "remove" or as "unchanged"; measured, it removes the
+  schedule: accepted, and about 30 s later `describe-cluster` shows no `ScheduledUpdateConfig`, the cluster and the
   group `InService`. After running the command, run the printed `verify` and compare it with `expect` (a rerun of the
   verb shows the group `none`); if the schedule is still there, do not write it again and again -- the advisory keeps
   reporting it -- and confirm with AWS Support.
@@ -3207,7 +3207,7 @@ aws sagemaker update-cluster-software --cluster-name <HyperPod name> \
 
 `--deployment-config` is the same `DeploymentConfiguration` a rolling schedule carries (API reference, `UpdateClusterSoftware`),
 so it names the rollback batch and the rollback alarms the service required of a rolling schedule on `UpdateCluster` (below;
-not tried live with `update-cluster-software`). The verb prints it per group as `manual_update`: with `--rolling`, with the
+this use of `update-cluster-software` is untested). The verb prints it per group as `manual_update`: with `--rolling`, with the
 wait and the alarms filled in; without, `<seconds>` and `<rollback alarm>` stay placeholders that keep the JSON invalid until
 they are replaced (a number; a quoted alarm name, for example `"gpu-fault-cpu-roll-api-capacity"`).
 
@@ -3261,12 +3261,10 @@ telemetry-spool-worker, ADOT) runs on the nodes of the CPU control-plane cluster
 node may host them. When an instance group of this cluster carries a `ScheduledUpdateConfig`/`AutoPatchConfig`, the service
 updates the platform software of the group's instances on that schedule: the root volume is replaced, the node is `NotReady`
 meanwhile, and HyperPod does not drain the Pods on it first. Without a rolling `DeploymentConfig`, every instance of the group
-was observed to be updated at once (no AWS document states that default) -- one window takes the whole control plane down
-for minutes, and the cron repeats it every week. Live: the CPU instance group (3 x ml.c5.4xlarge) carried
-`cron(0 8 ? * SUN *)` and no `DeploymentConfig`; on 2026-11-01 at about 08:00Z all three nodes went `NotReady` together and
-rebooted 08:02-08:03Z, the api-ha and control-worker Pods were lost or unreachable, acceptance cases' `kubectl exec` hit
-`RequestTimeout` (`no Ready cpu Pod`), and the whole control plane was down for about five minutes; while Kueue restarted with
-the nodes no Pod that had to be created could be, and the control-worker stayed at 4/6 for minutes more (Kueue, below).
+is updated at once, as measured (no AWS document states that default) -- one window takes the whole control plane down
+for minutes (all nodes go `NotReady` together and reboot together, the api-ha and control-worker Pods are lost or
+unreachable), and the cron repeats it; while Kueue is down with the nodes no Pod that has to be created can be, so the
+control-worker stays short of replicas for minutes more (Kueue, below).
 Evidence: AWS documentation, Updating the SageMaker HyperPod platform software, Important
 (https://docs.aws.amazon.com/sagemaker/latest/dg/sagemaker-hyperpod-eks-operate-cli-command-update-cluster-software.html; a
 schedule applies the same platform software update on its cron): "When this API is called, SageMaker HyperPod doesn’t drain
@@ -3290,7 +3288,7 @@ The product announces, it changes no check verdict, and it grades what one windo
   (without --rolling, the one that removes it: then update the group by hand in a maintenance window, one instance at a
   time) (administrator-operations §5.0.5)`; when another instance group or managed node group holds CPU nodes too, the line
   names only the control-plane Pods on that group.
-- A batch smaller than the group: the safe form (live since 2026-11-02: `rolling 1 instance(s) at a time 1800 s apart,
+- A batch smaller than the group: the safe form (for example `rolling 1 instance(s) at a time 1800 s apart,
   rolled back 1 instance(s) at a time on alarm gpu-fault-cpu-roll-api-capacity or gpu-fault-cpu-roll-api-not-restored: the
   safe form ...`; without rollback alarms: `with no rollback alarm (AutoRollbackConfiguration): nothing rolls it back when
   the control plane loses capacity`), still announced with its residual -- the control-plane Pods on each batch go down
@@ -3347,7 +3345,7 @@ The deploy applies the setting in its last step. That step is the engine mode `c
        its state.
      - An alarm that already matches is not put again.
    - An existing alarm of that name is this site's when it carries the site tag. Untagged, but watching this site's
-     NLB (the hand-made live pair), it is adopted with `tag-resource`, because `put-metric-alarm` ignores tags on an
+     NLB (for example a hand-made pair), it is adopted with `tag-resource`, because `put-metric-alarm` ignores tags on an
      update.
    - The step refuses an alarm with another site's tag, an untagged alarm on another load balancer, and a composite
      alarm of that name. Then it touches neither the pair nor the schedule, and the warning names
@@ -3368,7 +3366,7 @@ The deploy applies the setting in its last step. That step is the engine mode `c
      - a write would be refused (the ownership-release refusals of §5.0.0);
      - the next window starts within 3 hours, or the cron cannot be placed in time.
    - Otherwise the step records the group's current `ScheduledUpdateConfig` as the pre-install state, in its journal
-     and in the installation ledger. Then it runs the four steps proven live on 2026-11-02 (below), each read-back
+     and in the installation ledger. Then it runs the four steps proven by measurement (below), each read-back
      waiting at most 900 s:
      1. delete;
      2. read back until the group is `InService` without a schedule;
@@ -3404,7 +3402,7 @@ gpu-fault-admin cpu-rolling-update --state-dir /secure/gpu-fault
 
 The verb runs the same step under the site operation lock, and exits 0 when the step is `DONE` and 1 otherwise.
 
-The live site's group has rolled this way on the hand-made pair since 2026-11-02. The first deploy with this release
+For a group that already rolls this way on a hand-made pair, the deploy
 adopts and tags the two alarms and re-points them only where they differ. The schedule is a `noop`, so no pre-install
 state is recorded.
 
@@ -3429,8 +3427,8 @@ The deploy preflight's `cpu_update_window` check guards the deploy itself:
   while the control plane is being re-imaged -- rerun once SoftwareUpdateStatus is Succeeded or RollbackComplete and
   the group is InService`.
 - It warns, with the times, when the deploy may overlap the group's next scheduled window. It counts a deploy as up
-  to 120 minutes and a window as about `instances x (10 min re-image + wait)`; for the live group that is
-  `2026-11-08T08:00:00+00:00 - about 2026-11-08T10:00:00+00:00`.
+  to 120 minutes and a window as about `instances x (10 min re-image + wait)`, printed as `<window start> - about <window end>` (ISO 8601
+  UTC).
 - It reads the cron in UTC with the rules of the HyperPod guide. The guide's numeric day-of-week counts from Monday in
   its examples and from Sunday in its `#` text, so the check reads it both ways: a window is never placed later than
   the real one.
@@ -3448,10 +3446,10 @@ Uninstall (§3) handles both before it deletes anything else:
   the CPU instance group <group> still names the rollback alarms ... AWS does not document what a scheduled update
   does when a listed alarm does not exist; a reinstall re-creates the alarms under the same names. To remove the
   schedule: gpu-fault-admin hyperpod-scheduled-update --state-dir <state dir> --gpu-cluster-arn <CPU EKS ARN>
-  --instance-group <group> ...`. On the live site this applies, because the deploy found the group rolling and
+  --instance-group <group> ...`. This is the case when the deploy found the group rolling and
   recorded nothing.
 - Between such an uninstall and the next deploy, the schedule names alarms that do not exist. What a window does then
-  is unverified (validation-limitations, batch 240).
+  is unverified (validation-limitations).
 
 The permissions are in the security reference, §2.0. Evidence (read 2026-11-02):
 
@@ -3507,32 +3505,32 @@ cluster (the flag is named `--gpu-cluster-arn`). `--rolling` keeps each group's 
 600; the service model and `aws sagemaker update-cluster help` allow 0-3600) and an `AutoRollbackConfiguration` of the
 `--rollback-alarm` alarms (repeatable, 1 to 10, in the order given). `--rolling` without `--rollback-alarm` is refused before
 any read, with the AWS requirement in the message; the verb never invents an alarm. A group that already rolls this way with
-the same alarms (in any order), or has no schedule, is `none`: no command (the live CPU group since 2026-11-02 reports
+the same alarms (in any order), or has no schedule, is `none`: no command (for example
 `none (rolls this way already: one instance at a time 1800 s apart, rolled back one instance at a time on alarm
 gpu-fault-cpu-roll-api-capacity or gpu-fault-cpu-roll-api-not-restored)`). The definitions are built and refused exactly as
 for a GPU group (above).
 
 What the service accepts differs from the API reference. The reference marks `RollbackMaximumBatchSize` and
 `AutoRollbackConfiguration` "Required: No" (so does the service model, which is why botocore's `ParamValidator` passed), yet
-`UpdateCluster` refused the rolling schedule on the live CPU group three times (ValidationException; the third names the
+`UpdateCluster` refuses, measured, a rolling schedule without them and an in-place change of a schedule (ValidationException; the third names the
 group, `<instance group>` here):
 
-- 2026-11-02T00:16:46Z "RollingUpdatePolicy is missing the RollbackMaximumBatchSize parameter."
-- 2026-11-02T00:19:01Z "AutoRollbackConfiguration is required. Add a list of alarms and try again."
-- 2026-11-02T00:30:16Z "You can't modify the existing ScheduledUpdateConfig for an instance group. To update the
+- "RollingUpdatePolicy is missing the RollbackMaximumBatchSize parameter."
+- "AutoRollbackConfiguration is required. Add a list of alarms and try again."
+- "You can't modify the existing ScheduledUpdateConfig for an instance group. To update the
   configuration, first delete the existing configuration for the <instance group> instance group, and then create a new
   configuration."
 
 Then the definition without `ScheduledUpdateConfig` (accepted; about 30 s later no schedule, the cluster and the group
 `InService`) followed by the rolling definition with the rollback batch and two alarms (accepted; about 30 s later
-`describe-cluster` showed exactly that schedule) worked, and no node was re-imaged (same node names and creation times,
-image 2.0.4 `UpToDate`, count 3). So a group that has a schedule -- any schedule other than the target, other alarms or
+`describe-cluster` shows exactly that schedule) works, and no node is re-imaged (node names, creation times, image
+version and count unchanged). So a group that has a schedule -- any schedule other than the target, other alarms or
 another wait included -- gets four ordered steps in `update_cluster.steps`, and stderr prints them in order:
 
 1. `delete`: `aws sagemaker update-cluster` with the definition without `ScheduledUpdateConfig` (the disable definition; an
    `AutoPatchConfig` stays, `--rolling` touches the schedule only).
 2. `verify-deleted`: a `describe-cluster` read whose `expect` is the cluster and the group `InService` with
-   `ScheduledUpdateConfig` `null`; re-run it until it answers that (about 30 s live), then go on.
+   `ScheduledUpdateConfig` `null`; re-run it until it answers that (about 30 s, measured), then go on.
 3. `create`: `aws sagemaker update-cluster` with the rolling definition (`update_cluster.command`; `update_cluster.instance_groups`
    is this final definition).
 4. `verify`: the read that shows `ScheduleExpression`, `MaximumBatchSize`, `RollbackMaximumBatchSize`, `WaitIntervalInSeconds`
@@ -3555,8 +3553,8 @@ warns when an alarm is `INSUFFICIENT_DATA`, is in `ALARM`, or does not watch tha
 is then off -- and prints `rollback_alarms.suggested`: the `aws cloudwatch put-metric-alarm` commands of the recommended pair
 on the current NLB (on stderr when a warning needs them). It never runs them.
 
-**Which alarm.** The alarm must go to `ALARM` when the CPU control plane loses capacity during the roll. Recommended, and live
-since 2026-11-02: two alarms on the API NLB target group's `AWS/NetworkELB` `HealthyHostCount` (dimensions `TargetGroup` and
+**Which alarm.** The alarm must go to `ALARM` when the CPU control plane loses capacity during the roll. Recommended:
+two alarms on the API NLB target group's `AWS/NetworkELB` `HealthyHostCount` (dimensions `TargetGroup` and
 `LoadBalancer`), statistic `Maximum` (`--statistic Maximum` in the printed commands), period 60 s, no alarm actions, `TreatMissingData` `missing`, with N the api-ha replica
 count (3, which the product pins):
 
@@ -3569,12 +3567,11 @@ Why these: a normal one-instance batch reads N-1 healthy targets for about 5 min
 `DoNotSchedule` per hostname, keeps the evicted replica Pending until its node returns), so neither alarm trips on a healthy
 roll. "Maximum < X for k of k minutes" means fewer than X healthy targets for the whole of every one of those minutes, as
 every load balancer node saw them; Minimum would also count a minute with any momentary dip of one node's distributed health
-checks: over the 14 days to 2026-11-02 01:06Z Minimum was below 3 in 19 minutes and Maximum in 5, and the 2026-11-01 dips at
-08:12-08:15Z and 08:20-08:21Z were sub-minute (Maximum stayed 3 except at 08:14). The healthy targets are also the one
-control-plane signal that saw the 2026-11-01 08:00Z all-at-once re-image: Minimum 0 for 08:01-08:04Z (Maximum 0 for
-08:02-08:03), back to 3 at 08:05, while Container Insights' `cluster_node_count` stayed 3 and `cluster_failed_node_count`
-0, with no data points for 08:01-08:03 -- node counts do not see a re-image, so an alarm on them cannot roll one back. A
-full outage shorter than 5 minutes does not trip the capacity alarm (on 2026-11-01 the Maximum was 0 for 2 minutes): it is
+checks, so Minimum breaches in clearly more minutes than Maximum. The healthy targets are also the control-plane signal that
+sees an all-at-once re-image: Minimum and Maximum both drop to 0 during it and return to N with the nodes, while Container
+Insights' `cluster_node_count` and `cluster_failed_node_count` stay unchanged or have no data points -- node counts do not
+see a re-image, so an alarm on them cannot roll one back. A full outage shorter than 5 minutes does not trip the capacity
+alarm: it is
 for a lasting loss during a roll, and the batch of 1 is what keeps a window from taking every node at once.
 `HealthyHostCount` is reported only while targets are registered; with `TreatMissingData` `missing` a minute without
 registered targets does not count as breaching. The deploy creates and keeps this pair itself (above). After a fresh
@@ -3630,15 +3627,15 @@ Without `--rolling` the verb prints the command that removes the schedule; then 
 with the rollback batch and alarms). One node at a time, api-ha (3 replicas, with a PDB) and the control-worker keep serving
 from the others, while the control-plane Pods of the updated node are killed and re-created elsewhere.
 
-**Kueue's (HyperPod task governance) Pod webhook.** Live (read-only checks): the CPU cluster runs HyperPod task governance
--- the EKS add-on `amazon-sagemaker-hyperpod-taskgovernance` v1.5.0-eksbuild.1, which installs Kueue v0.18.0 (one
-`kueue-controller-manager` replica; the webhook configurations are labelled `app.kubernetes.io/managed-by=Helm` and
-`helm.sh/chart=kueue-1.5.0`, managed by the add-on). Kueue's webhooks `mpod.kb.io` (mutating, Pod CREATE) and `vpod.kb.io`
+**Kueue's (HyperPod task governance) Pod webhook.** When the CPU cluster runs HyperPod task governance (the EKS add-on
+`amazon-sagemaker-hyperpod-taskgovernance`), the add-on installs Kueue (one `kueue-controller-manager` replica; the webhook
+configurations are labelled `app.kubernetes.io/managed-by=Helm`, managed by the add-on; checked below against Kueue v0.18.0 as
+add-on v1.5.0-eksbuild.1 installs it). Kueue's webhooks `mpod.kb.io` (mutating, Pod CREATE) and `vpod.kb.io`
 (validating, Pod CREATE/UPDATE) carry `failurePolicy: Fail`, a 10 s timeout and a namespace selector that excludes only
 `kube-system` and `kueue-system` -- the product namespace `gpu-fault-system` is covered; so are the Deployment, StatefulSet
 and Job webhooks (`mdeployment.kb.io`/`vdeployment.kb.io`, `mstatefulset.kb.io`, `vjob.kb.io`). While the Kueue controller is
 not serving (its node is rebooted or re-imaged), every Pod create in that namespace fails: Pods restarted in place after the
-reboot are unaffected, only Pods that must be created wait (on 2026-11-01, the two deleted control-worker Pods); Deployment
+reboot are unaffected, only Pods that must be created wait (for example deleted control-worker Pods); Deployment
 and Job creates and updates are refused too, so a `deploy` that changes a Deployment or creates a Job fails then as well.
 ReplicaSet events read `FailedCreate ... failed calling webhook "mpod.kb.io": failed to call webhook: Post
 "https://kueue-webhook-service.kueue-system.svc:443/mutate--v1-pod?timeout=10s": no endpoints available for service
@@ -3661,8 +3658,8 @@ Pod that cannot be created the check passes and the header still has the line); 
 records the same for its Deployments. Remedy: first confirm the webhook is back (`kubectl -n kueue-system get endpoints
 kueue-webhook-service` has addresses, `kueue-controller-manager` is Ready), then run the `kubectl annotate` the line prints: a
 metadata-only update, no rollout; the ReplicaSet is the one the Deployment's `Progressing` condition names, else every
-ReplicaSet of the Deployment's selector (`-l app=...`). Evidence: the Kubernetes v1.33.13 source (the live control plane's
-version) `pkg/controller/replicaset/replica_set.go`
+ReplicaSet of the Deployment's selector (`-l app=...`). Evidence: the Kubernetes v1.33.13 source
+`pkg/controller/replicaset/replica_set.go`
 (https://github.com/kubernetes/kubernetes/blob/v1.33.13/pkg/controller/replicaset/replica_set.go: `NewBaseController` builds the
 queue with `workqueue.DefaultTypedControllerRateLimiter[string]()`, a failed sync is re-queued with
 `rsc.queue.AddRateLimited(key)`, and `updateRS` enqueues on every update event: "it is safer to sync any time this function is
@@ -3702,17 +3699,16 @@ rolled back. Evidence: AWS documentation, Understand the Kubernetes version life
 updates can happen at any time after the end of extended support date. You won’t receive any notification before the
 update.", "The auto-upgrade includes only the Kubernetes control plane." and "Note: If you disable extended support, your
 cluster will be auto upgraded at the end of standard support."; Version rollback: "Clusters that were automatically upgraded
-at the end of extended support cannot be rolled back." Live (2026-11-01): the plain EKS GPU cluster `gpu-eks-cluster` runs
-1.31 under `EXTENDED`, whose extended support ends 2026-11-26; the other two EKS clusters run 1.33 (2027-07-29).
+at the end of extended support cannot be rolled back."
 
 The product announces only: the `regional_contexts` check of `status --full` and deploy preflight reads `eks
 describe-cluster` once per site EKS cluster (`version`, `upgradePolicy.supportType`) and `eks describe-cluster-versions
 --cluster-versions <versions...>` once per region (that one selector only, evidence below), and records
 `details.eks_support` (per cluster `version`, `support_type`, `end_of_support` = the UTC date, `days_left`); a cluster within
 90 days of its date, or past it, adds one line
-to the `status --full` header, for example `advisory: EKS cluster gpu-eks-cluster (GPU cluster <id>) runs Kubernetes 1.31 under
-the EXTENDED upgrade policy, whose support ends 2026-11-26 (in 24 day(s)): after that date AWS upgrades its control plane to
-the next version by itself, at any time and without notice -- only the control plane: its nodes stay on 1.31 -- and a cluster
+to the `status --full` header, for example `advisory: EKS cluster <eks> (GPU cluster <id>) runs Kubernetes <version> under
+the EXTENDED upgrade policy, whose support ends <YYYY-MM-DD> (in <n> day(s)): after that date AWS upgrades its control plane to
+the next version by itself, at any time and without notice -- only the control plane: its nodes stay on <version> -- and a cluster
 upgraded that way cannot be rolled back; upgrade it yourself before then, in a maintenance window (control plane first, then
 its nodes and add-ons) (administrator-operations §5.0.5)`. A failed dates read turns into one line `advisory: could not read
 the EKS support dates in <region> (<error>): the end-of-support check of <n> EKS cluster(s) did not run; ...` whose end depends
@@ -3734,17 +3730,14 @@ DescribeClusterVersions (https://docs.aws.amazon.com/eks/latest/APIReference/API
 2017-11-01; the page prints no date, Last-Modified 2026-11-02, fetched 2026-11-02), URI Request Parameters: `clusterVersions`
 "List of specific cluster versions to describe."; `includeAll` "Include all available versions in the response.". The page
 does not say that these parameters cannot be sent together (neither does the service model aws-cli 2.35.21 installs); the
-service itself refuses the combination. Earlier releases sent `--cluster-versions <versions...> --include-all`; the service
-refused that request (InvalidParameterException) from its first live run, the deploy preflight of 2026-11-01, so the
-end-of-support check never ran and the line blamed a missing `eks:DescribeClusterVersions`. Re-checked (aws-cli 2.35.21,
-us-west-2, `--cluster-versions 1.31 --include-all`):
+service itself refuses the combination (InvalidParameterException), for example `--cluster-versions <version> --include-all`
+(aws-cli 2.35.21):
 
-- 2026-11-02T14:21:23Z "Only one of the defaultOnly, clusterVersions, includeAll or status request parameters is accepted at a
+- "Only one of the defaultOnly, clusterVersions, includeAll or status request parameters is accepted at a
   time."
 
 `--cluster-versions` beside `--default-only`, `--status` or `--version-status` is refused the same way (the text does not name
-`versionStatus`). `--cluster-versions` alone lists a named version even past its support (2026-11-02: 1.29 and 1.23,
-`UNSUPPORTED`, with both dates).
+`versionStatus`). `--cluster-versions` alone lists a named version even past its support (`UNSUPPORTED`, with both dates).
 
 **Permissions.** The reads use the identity of the operator running the command: `sagemaker:DescribeCluster` (plus
 `sagemaker:ListClusters` for the helper given an EKS ARN the site does not record), `eks:DescribeNodegroup`,
@@ -3790,7 +3783,8 @@ cluster, and **administrators need to run no command**:
   UID/resourceVersion guards, and both commands wait for the control-worker `rollout status` to complete (<=600 s) before returning.
   **There is no step to run manually after a node change.**
 - The default label priority is `sagemaker.amazonaws.com/instance-group-name` ->
-  `topology.kubernetes.io/zone` -> `failure-domain.beta.kubernetes.io/zone`. When the fleet carries EC2
+  `topology.kubernetes.io/zone` -> `failure-domain.beta.kubernetes.io/zone` (a site with an `eks-managed` cluster adds
+  `eks.amazonaws.com/nodegroup` after the instance group, see §5.0.0). When the fleet carries EC2
   topology labels, declare them in `spec.failureDomainLabels` of `site.yaml` with "the finest domain first" (which layer
   is the rack depends on the instance family, hence no default), for example:
 
