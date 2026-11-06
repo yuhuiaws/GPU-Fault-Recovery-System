@@ -5414,7 +5414,8 @@ CPU HyperPod name, current release, regionally shared Runtime Profile and the cu
 provider (REG-8.1.6). Every GPU entry must explicitly contain the same Region, EKS ARN and
 HyperPod name (an empty string for an eks-managed entry, which also carries `provider: eks-managed` and `node_selector`); there is no
 `us-west-2` or other Region default. Every entry must also carry a non-empty `agent_endpoint_allowed_cidrs` (the GPU node subnet
-CIDRs; the example template does not list the key): without it the engine fails with `<cluster_id> requires Agent endpoint CIDRs`
+CIDRs; the example template holds the documentation-only range `192.0.2.0/24` as a placeholder, which must be replaced with the
+real node subnets): without it the engine fails with `<cluster_id> requires Agent endpoint CIDRs`
 before writing the registry, and the preflight checks that the actual node IPs fall inside these CIDRs. `gpu-fault-admin` does not
 require writing this JSON by hand: every command materializes the same configuration from `site.yaml` (a temporary 0600
 `regional-release.json`) and hands it to the engine.

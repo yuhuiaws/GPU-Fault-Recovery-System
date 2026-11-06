@@ -56,6 +56,9 @@
         "gpu-fault-system",
         "training"
       ],
+      "agent_endpoint_allowed_cidrs": [
+        "192.0.2.0/24"
+      ],
       "control_plane_url": "https://regional-control-plane.example",
       "token_file": "/secure/gpu-prod-a.token",
       "ca_file": "/secure/control-plane-ca.crt",

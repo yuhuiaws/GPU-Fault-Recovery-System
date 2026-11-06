@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import copy
+import hashlib
+import ipaddress
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -14,7 +16,12 @@ from gpu_fault_release import regional_release_orchestration as ORCHESTRATION_MO
 from gpu_fault_release import regional_release_registry as REGISTRY_MODULE
 from gpu_fault_release import regional_release_state as STATE_MODULE
 from gpu_fault_release import rollout as ROLLOUT_MODULE
-from tests.regional._release_orchestrator_support import ingress_pod_list_json
+from tests.regional._release_orchestrator_support import (
+    CPU_EKS_ARN,
+    GPU_EKS_ARN,
+    REGION,
+    ingress_pod_list_json,
+)
 from tests.regional._resource_probe_fakes import resource_probe_result
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -638,3 +645,96 @@ def test_previous_state_falls_back_to_the_candidate_aurora_window() -> None:
 def test_previous_state_refuses_to_invent_an_aurora_window() -> None:
     with pytest.raises(STATE_MODULE.ReleaseError, match="valid live administrator"):
         STATE_MODULE.captured_admin_config(_aurora_snapshot_release(None), {})
+
+
+EXAMPLE = ROOT / "deploy/control-plane/regional/regional-release.example.json"
+# What an operator writes over each placeholder of the example.
+EXAMPLE_VALUES = {
+    "REPLACE_WITH_AWS_REGION": REGION,
+    "REPLACE_WITH_CPU_EKS_ARN": CPU_EKS_ARN,
+    "REPLACE_WITH_CPU_HYPERPOD_CLUSTER_NAME": "gpu-fault-control-plane",
+    "REPLACE_WITH_RUNTIME_PROFILE_PATH": str(
+        ROOT / "config/runtime-profile.regional-hyperpod-safe.example.yaml"
+    ),
+    "REPLACE_WITH_64_HEX_CONFIG_DIGEST": "a" * 64,
+    "REPLACE_WITH_NLB_NAME": "gpu-fault-control-plane",
+    "REPLACE_WITH_PUBLIC_SUBNET_IDS": "subnet-example",
+    "REPLACE_WITH_NLB_SECURITY_GROUP_ID": "sg-0123456789abcdef0",
+    "REPLACE_WITH_ACM_CERTIFICATE_ARN": (
+        f"arn:aws:acm:{REGION}:123456789012:certificate/"
+        "00000000-0000-0000-0000-000000000000"
+    ),
+    "REPLACE_WITH_ROUTE53_HOSTED_ZONE_ID": "Z0123456789ABCDEFGHIJ",
+    "REPLACE_WITH_CONTROL_PLANE_HOSTNAME": "gpu-fault.example.com",
+    "REPLACE_WITH_AMP_WORKSPACE_ID": "ws-00000000-0000-0000-0000-000000000000",
+    "REPLACE_WITH_SNS_TOPIC_ARN": f"arn:aws:sns:{REGION}:123456789012:gpu-fault",
+    "REPLACE_WITH_GPU_EKS_CONTEXT": "gpu-prod-a-context",
+    "REPLACE_WITH_GPU_HYPERPOD_CLUSTER_NAME": "hp-gpu-prod-a",
+    "REPLACE_WITH_GPU_EKS_ARN": GPU_EKS_ARN,
+    "REPLACE_WITH_EXECUTOR_IRSA_ROLE_ARN": "arn:aws:iam::123456789012:role/executor",
+    "REPLACE_WITH_ADOT_IRSA_ROLE_ARN": "arn:aws:iam::123456789012:role/adot",
+}
+# RFC 5737: the example may only show documentation addresses.
+DOCUMENTATION_NETWORKS = tuple(
+    ipaddress.ip_network(value)
+    for value in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+)
+
+
+def _filled(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _filled(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_filled(item) for item in value]
+    if isinstance(value, str) and value.startswith("REPLACE_WITH_"):
+        assert value in EXAMPLE_VALUES, f"the example gained placeholder {value}"
+        return EXAMPLE_VALUES[value]
+    return value
+
+
+def test_the_shipped_regional_release_example_loads_and_registers(
+    tmp_path: Path,
+) -> None:
+    """The example once its placeholders are filled, through the loader and the
+    registry writer the engine uses: an entry the registry refuses (it used to
+    lack agent_endpoint_allowed_cidrs) fails here, not on an operator's site."""
+
+    document = _filled(json.loads(EXAMPLE.read_text(encoding="utf-8")))
+    assert isinstance(document, dict), "the example is a JSON object"
+    artifacts = {}
+    for name, content in (("release.whl", b"wheel"), ("bundle.tar.gz", b"bundle")):
+        (tmp_path / name).write_bytes(content)
+        artifacts[name] = (tmp_path / name, hashlib.sha256(content).hexdigest())
+    manifest = tmp_path / "current-release.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "wheel": str(artifacts["release.whl"][0]),
+                "wheel_sha256": artifacts["release.whl"][1],
+                "bundle": str(artifacts["bundle.tar.gz"][0]),
+                "bundle_sha256": artifacts["bundle.tar.gz"][1],
+            }
+        ),
+        encoding="utf-8",
+    )
+    document["release"]["manifest"] = str(manifest)
+    for cluster in document["clusters"]:
+        token = tmp_path / f"{cluster['cluster_id']}.token"
+        token.write_text("t" * 48, encoding="utf-8")
+        cluster["token_file"] = str(token)
+    path = tmp_path / "regional-release.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    config = ROLLOUT_MODULE.ReleaseConfig.load(path)
+
+    assert config.clusters, "the example declares at least one GPU cluster"
+    for target in config.clusters:
+        entry = REGISTRY_MODULE.registry_entry(target)
+        cidrs = [
+            ipaddress.ip_network(value)
+            for value in entry["agent_endpoint_allowed_cidrs"]
+        ]
+        assert all(
+            any(network.subnet_of(doc) for doc in DOCUMENTATION_NETWORKS)
+            for network in cidrs
+        ), f"{target.cluster_id}: the example shows documentation CIDRs only: {cidrs}"
