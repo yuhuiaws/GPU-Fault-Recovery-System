@@ -16,9 +16,8 @@ It answers "for a fault from appearance to disappearance, who performs each stag
 Both documents share the same factual baseline, the same code (0.10.0); there is no case where "v2 describes new features".
 The motivation for writing this version: when told module by module, readers easily mistake "can collect metrics" for "can repair the machine";
 told by closed loop, whatever is missing at each stage is exposed directly.
-The most recent date on which this document was checked item by item against source code, generated manifests and test contracts is **2026-09-15**
-(that round focused on notifications, the persistent registry, deployment identity, monitoring and retention; the remaining facts continue to be governed by the released source code,
-generated manifests and test contracts).
+This document is checked item by item against the released source code, generated manifests and test contracts; where the
+document and the code disagree, the code governs.
 
 **Division of labor and precedence:**
 
@@ -95,7 +94,8 @@ neither guessing the node nor fabricating node isolation out of nothing. Detaile
 
 | Environment | Status | Notes |
 |---|---|---|
-| SageMaker HyperPod EKS | **Sole production delivery form** | Regional multi-cluster separated deployment, see v1 §7.1 |
+| SageMaker HyperPod EKS GPU cluster (`provider: hyperpod`) | **Production delivery form** (fully accepted) | Regional multi-cluster separated deployment, see v1 §7.1; `NodeRecovery=None` |
+| Plain Amazon EKS GPU cluster with managed node groups (`provider: eks-managed`) | **Production delivery form** (new, less validated) | Part of the same regional deployment as HyperPod clusters and may be managed side by side; node groups must have node auto repair off, reboot goes through EC2 `RebootInstances`, see v1 §2.4 |
 | Single-cluster all-in-one EKS | Historical transition | Migration starting point and limited Canary, not accepted at the same level |
 | Generic Kubernetes | **Not implemented** | Manifests removed from the public tree; enum values and placeholder manifests do not indicate support |
 | HyperPod Slurm | **Not supported** | No scheduler adapter, no isolation evidence read-back, no workload stop/restart; the bring-under-management precheck should refuse |
@@ -117,7 +117,7 @@ Multi-vendor adaptation requires a new device adapter layer implementation; it i
 | Node | Implemented | `cluster_id + node_id`, additionally carrying `node_instance_id` and the agent generation to prevent confusion after replacement |
 | Physical GPU | Implemented | **GPU UUID**; PCI BDF is an evidence field only, not a primary key |
 | NVLink / NVSwitch interconnect | Implemented | SXID + access/trunk fault domain + NVLink pattern (32-bit `0/1/-`) |
-| MIG instance (GI/CI) | **Not implemented** | Only accepts `MIG-`-prefixed values when parsing Pod-visible UUIDs; no MIG-level fault types, no GI/CI fields, no MIG blast-radius computation |
+| MIG instance (GI/CI) | **Not implemented** | Only accepts `MIG-`-prefixed values when parsing Pod-visible UUIDs and the host GPU inventory; no MIG-level fault types, no GI/CI fields, no MIG blast-radius computation |
 
 **EFA/RDMA as the fifth device class** forms its own family (AWS-specific): inventory count, traffic anomaly,
 driver repair and device plugin restart each have an independent path, see §2.1.
@@ -128,26 +128,27 @@ It is not a binary choice between "fully automatic" and "alert only", but graded
 
 | Level | Actions | Status |
 |---|---|---|
-| Alert only | AdvisoryNotification + site notification channel (`GPU_FAULT_NOTIFICATION_CHANNEL`, rendered from `spec.notifications.channel`: new sites default to `sns`, publishing to the site SNS topic; `ses` email is opt-in, and old sites with an existing SES sender keep SES; `disabled` only writes to the outbox) | Implemented, the common foundation of all levels; a persisted notification does not mean it has been sent out |
-| Evidence preservation | `FREEZE_EVIDENCE`, `COLLECT_HUNG_SUMMARY`, `COLLECT_DIAGNOSTIC_BUNDLE`, `COLLECT_HUNG_TRIAGE`, `RUN_DCGM_DIAGNOSTIC` | Implemented; full-task passive survey and bounded active diagnosis are separate stages |
+| Alert only | AdvisoryNotification + site notification channel (`GPU_FAULT_NOTIFICATION_CHANNEL`, rendered from `spec.notifications.channel`: new sites default to `sns`, publishing to the site SNS topic; `ses` email is opt-in, and old sites with an existing SES sender keep SES; with `spec.notifications.allowEmail: false` notifications are only written to the outbox, and the runtime variable also accepts `disabled`) | Implemented, the common foundation of all levels; a persisted notification does not mean it has been sent out |
+| Evidence preservation | `FREEZE_EVIDENCE`, `COLLECT_HUNG_SUMMARY`, `COLLECT_DIAGNOSTIC_BUNDLE`, `COLLECT_HUNG_TRIAGE`, `RUN_DCGM_DIAGNOSTIC`, `TRIGGER_HEALTH_SNAPSHOT` | Implemented; full-task passive survey and bounded active diagnosis are separate stages; `TRIGGER_HEALTH_SNAPSHOT` makes the node collect a fresh snapshot at once, for validation and for the collector-silence refresh |
 | Isolation | `MARK_UNSCHEDULABLE`, `QUARANTINE`, `RESTORE_SCHEDULING` | Implemented |
 | Stop/resume training | `STOP_WORKLOADS`, `RESTART_WORKLOAD`, `CHECKPOINT_WORKLOADS` | Implemented (Job / PyTorchJob / JobSet) |
-| Device-level repair | `RESET_GPU`, `RECOVER_DRAIN_P2P`, `RESET_ALL_GPUS_NVSWITCHES`, `QUIESCE_GPU_SERVICES`, `RESTORE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS` | Implemented, dispatched signed; the installer's bare default disables reset, the current HyperPod production installation enables it explicitly |
-| Fabric Manager repair | `RESTART_FABRIC_MANAGER` | Implemented; the node side has an independent switch, the current HyperPod production installation enables it explicitly, and it verifies no compute client before execution and that the service is active after execution. On a graded NVSwitch node (Hopper SXM, HGX B200/B300) a restart alone loses the fabric state: a solo XID 45 is observe-only there by default (NVIDIA's GPU debug guidelines read it as informational, except on A100; the incident and the investigatory notification are recorded, the node is not touched or cordoned), and with `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` its `RESTART_FM` compiles to the full GPU + NVSwitch reset chain; an ungraded node (A100 included) keeps the Fabric Manager restart; a per-GPU reset's quiesce window keeps Fabric Manager running |
-| Node-level repair | `RESTART_NODE` (HyperPod `BatchRebootClusterNodes`) | Implemented, controlled by `ALLOW_HYPERPOD_REBOOT`; the current regional data-plane production manifest sets it to true |
+| Device-level repair | `RESET_GPU`, `RECOVER_DRAIN_P2P`, `RESET_ALL_GPUS_NVSWITCHES`, `QUIESCE_GPU_SERVICES`, `RESTORE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS` | Implemented, dispatched signed; the installer's bare default disables reset, the current regional production installation (the install Job both providers share) enables it explicitly; on eks-managed the quiesce window additionally taints the node `gpu-fault.io/quiesce` NoExecute |
+| Fabric Manager repair | `RESTART_FABRIC_MANAGER` | Implemented; the node side has an independent switch, the current regional production installation enables it explicitly, and it verifies no compute client before execution and that the service is active after execution. On a graded NVSwitch node (Hopper SXM, HGX B200/B300) a restart alone loses the fabric state: a solo XID 45 is observe-only there by default (NVIDIA's GPU debug guidelines read it as informational, except on A100; the incident and the investigatory notification are recorded, the node is not touched or cordoned), and with `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` its `RESTART_FM` compiles to the full GPU + NVSwitch reset chain; an ungraded node (A100 included) keeps the Fabric Manager restart; a per-GPU reset's quiesce window keeps Fabric Manager running |
+| Node-level repair | `RESTART_NODE` (HyperPod `BatchRebootClusterNodes`; on eks-managed, EC2 `RebootInstances` of the bound instance) | Implemented, controlled by `ALLOW_HYPERPOD_REBOOT` on both providers; the current regional data-plane production manifest sets it to true |
 | Software-plane repair | `REMEDIATE_EFA_DRIVER`, `RESTART_EFA_DEVICE_PLUGIN`, `RESTART_GPU_DEVICE_PLUGIN` | Implemented; the Node installer allows EFA driver remediation by default, and an explicit `--disable-efa-driver-remediation` both disables the permission and removes its operation; does not bypass the Profile, signature and workload-stop gates |
 | Site-script repair | `REMEDIATE_DRIVER`, `UPDATE_SOFTWARE_FIRMWARE` | Implemented but configuration-gated; not added to workflows by default, the applicable SXIDs, target version, absolute-path command and SHA-256 must be configured explicitly |
 | Manual steps | `CHECK_MECHANICALS`, `ESCALATE_SUPPORT` | Implemented; the former waits for an exact annotation, the latter generates a synthetic ticket ID, persists the notification and sends it through the site SNS/SES channel; there is no external ticketing system |
-| Operations maintenance | `COLLECTOR_OUTBOX_MAINTENANCE` | Implemented; `gpu-fault-admin collector-outbox` sends the node-local `gpu-fault-collector outbox {stats,list,requeue-dead}` to the node as a single-step NODE_ACTION workflow, returns metadata only, takes the lock strictly, no remote `--force` (ARCH-G2) |
-| Node replacement | `REPLACE_NODE` | **Warm spare only**; never calls `BatchReplaceClusterNodes` (v1 §2.1 constraint 2) |
-| Planning placeholder | `RESTART_VM` | Not in the production allowlist; HyperPod EKS converts NVIDIA `RESTART_VM` to `RESTART_NODE` only when the controlled mapping holds |
+| Operations maintenance | `COLLECTOR_OUTBOX_MAINTENANCE` | Implemented; `gpu-fault-admin collector-outbox` sends the node-local `gpu-fault-collector outbox {stats,list,requeue-dead}` to the node as a single-step NODE_ACTION workflow, returns metadata only, takes the lock strictly, `requeue-dead` needs `--yes`, no remote `--force` |
+| Node replacement | `REPLACE_NODE` | **Warm spare only**, the same on both providers; never calls `BatchReplaceClusterNodes` (v1 §2.1 constraint 2) and never replaces an EC2 instance; fails closed without enough healthy spares |
+| Planning placeholder | `RESTART_VM` | Not in the production allowlist; when NVIDIA's official action is `RESTART_VM`, it maps to `RESTART_NODE` by the environment of the event's Runtime Profile: HyperPod through `BatchRebootClusterNodes`, eks-managed through EC2 `RebootInstances` (`node_provider.restart_vm_effective_action`; neither is an EC2 stop/start); a bare Kubernetes profile maps nothing and stays BLOCKED |
 
 `WorkflowOperation` in `src/gpu_fault/models.py` has 35 values in total; the production control-plane
 `GPU_FAULT_ALLOWED_OPERATIONS` allowlist admits 34 (see
 `deploy/control-plane/regional/generated/`); the node-side
 application's bare default `GPU_FAULT_NODE_ALLOWED_OPERATIONS` contains only `VERIFY_NO_GPU_CLIENTS`;
 the node install script writes 13 base operations when the Agent is enabled, then appends by EFA, Field Diagnostic,
-driver and firmware capability. The production HyperPod installation additionally enables GPU reset, fabric reset,
+driver and firmware capability (EFA driver remediation is appended by default, so the default node list has 14 entries).
+The regional production install Job (shared by both providers) additionally enables GPU reset, fabric reset,
 service quiesce and Fabric Manager restart explicitly.
 **Present in the allowlist ≠ can actually execute**: the capability must also have a unique executable owner (§7.1).
 
@@ -155,7 +156,7 @@ service quiesce and Fabric Manager restart explicitly.
 
 | Object not handled | What the system actually does |
 |---|---|
-| Pure application OOM, killed user processes | Log rules recognize `out of memory` / `oom-kill` / `killed process` and assign them to the host/system-log family, not treated as GPU hardware faults; on the warm-spare side `src/gpu_fault/spare_health.py` classifies non-hardware causes as `CONFIGURATION`, only sets `SUSPECT` and defers, and triggers no hardware repair |
+| Pure application OOM, killed user processes | Log rules recognize `out of memory` / `oom-kill` / `killed process` and assign them to the host/system-log family, not treated as GPU hardware faults; on the warm-spare side `src/gpu_fault/spare_health.py` classifies occupancy and configuration causes (active GPU Pods or clients, a schedulable or already reserved spare, ...) as `CONFIGURATION` and the other non-hardware causes as `OBSERVATION`, only sets `SUSPECT` and defers, and triggers no hardware repair |
 | Model code errors, hyperparameter problems | No causal analysis. When the training terminal state is FAILED/TIMED_OUT with no matching hardware marker, **no diagnosis is done**; a single restart is performed directly within the same job's restart budget (trigger `no-hardware-evidence:RESTART`); when the profile has no executable workload restart capability it only collects evidence and escalates to manual handling (`no-hardware-evidence:ESCALATE`); when the allocation is missing it records `allocation-missing:INCONCLUSIVE` and only escalates, without restarting |
 | Training framework performance tuning | Only collects the step/throughput/loss/checkpoint channels (`TrainingProgressCollector` is currently not deployed) |
 | Long-term log and metric archiving | The collector's local NDJSON outbox only guarantees event resubmission; it is not a log platform; long-term archiving requires external CloudWatch/S3/shared storage |
@@ -170,15 +171,15 @@ service quiesce and Fabric Manager restart explicitly.
 | P0 (XID/SXID, incident, workflow) acceptance rate | 100% while the hard cap is not reached, `429` = 0 |
 | P0 API p99 | Must be recorded and compared against the latency budget approved for this round; no unified fixed veto line |
 | processor steady-state oldest waiting time | < 5 s |
-| Single-node fault first isolation step p99 | < 10 s |
-| Multi-node fault first isolation step | < aggregation window + 10 s |
+| First isolation step p99 of a single-node fault not waiting for the remediation budget | < 10 s |
+| First isolation step of a multi-node fault not waiting for the remediation budget | < aggregation window + 10 s |
 | Queue returns to steady state after the burst ends | Within 60 s |
 | duplicate claim / stale fencing write / PostgreSQL deadlock | All 0 |
 
 **Time constants that are defined but are not SLOs** (configuration defaults, used for decisions rather than commitments):
 Agent heartbeat 30 s, expiry 90 s; collector silence thresholds `GPU_INVENTORY` 180 s,
 `GPU_METRICS` 420 s, `HOST_TELEMETRY` 420 s; workflow lease 180 s;
-dispatcher one round every 5 s, 100 workflows per batch.
+dispatcher one round every 5 s, 346 rows per batch by default (derived from the dispatch threads and the dispatch lease, bounded to 100–400).
 
 **Undefined** (proposed in the recommendation but with no corresponding measurement in either code or documentation):
 
@@ -205,11 +206,11 @@ Families are grouped by signal source and remediation approach. Within a family,
 |---|---|---|---|---|
 | GPU hardware (XID) | `/dev/kmsg` | `KernelLogCollector` | Fixed-version XID Catalog per-code rules | Per catalog: from `RUN_DIAGNOSTICS` to `RESET_GPU` / `RESTART_NODE` |
 | NVSwitch / NVLink (SXID) | Fabric Manager file/journal | `FabricManagerLogCollector` | SXID catalog + access/trunk fault domain + product-generation gate | `RESET_ALL_GPUS_NVSWITCHES` (H200) or node reboot |
-| Temperature, power and throttling | DCGM / NVML | `DcgmMetricsCollector` | GPU 85/90 ℃ and memory 90/95 ℃ dual thresholds; throttle-reason bitmask; power ratio 0.95 | Escalates to isolation only after 2 consecutive samples cross the critical line |
-| Interconnect and network (EFA/RDMA) | Host sysfs, EFA traffic | `HostTelemetryCollector` | inventory count comparison + traffic state machine (8 states) | inventory mismatch → isolation chain; traffic anomaly → collect evidence first |
+| Temperature, power and throttling | DCGM / NVML | `DcgmMetricsCollector` | Graded by the device's own reported temperature limits first (the T.Limit scale or absolute slowdown/shutdown limits, see `gpu_temperature_policy.py`), falling back to the configured GPU 85/90 ℃ and memory 90/95 ℃ thresholds when the device reports none; throttle-reason bitmask; power ratio 0.95 | Escalates to isolation only after 2 consecutive samples cross the critical line |
+| Interconnect and network (EFA/RDMA) | Host sysfs, EFA traffic | `HostTelemetryCollector` | inventory count comparison (layered by failure mode) + traffic state machine (8 states) | inventory mismatch → driver remediation, diagnostics or the node reboot chain by failure mode (v1 §5.4); traffic anomaly → collect evidence first |
 | Device drop (GPU/EFA ACTIVE inventory) | `nvidia-smi` UUID count + EFA port `4: ACTIVE`+`5: LinkUp` | `HostTelemetryCollector` | Expected values per node instance-type, consecutive anomalies reaching the threshold | Full isolate-reboot-validate chain, see v1 §5.4 |
 | Host and software stack | journal, MCE, storage, NIC | `HostTelemetryCollector`, `NodeLogCollector` (disabled by default) | Multi-rule hit arbitration + persistent-hazard state machine | Mostly alerts and evidence collection; MCE and the like escalate to isolation |
-| Collector silence (health cannot be confirmed) | Control plane reads the persisted collection status | `collector-silence`, default scan interval 60 s, not a loss-of-contact threshold | In active clusters, a required channel of an ACTIVE Agent with a valid heartbeat lease has no success record, or the time since the last successful report exceeds the channel threshold (§2.5) | AdvisoryNotification + site notification channel; no recovery workflow is created for this, **missing monitoring is not treated as healthy** |
+| Collector silence (health cannot be confirmed) | Control plane reads the persisted collection status | `collector-silence`, default scan interval 60 s, not a loss-of-contact threshold | In active clusters, a required channel of an ACTIVE Agent with a valid heartbeat lease has no success record, or the time since the last successful report exceeds the channel threshold (§2.5) | AdvisoryNotification + site notification channel; a silent channel is recorded as observation `UNKNOWN`, with at most one bounded `TRIGGER_HEALTH_SNAPSHOT → VALIDATE_HOST` refresh per node per hour; no recovery workflow is created, **missing monitoring is not treated as healthy** |
 | Training side (terminal state and hang) | Kubernetes watch, EFA zero traffic | `CompletionWatcher`, EFA traffic state machine | Unique TerminalEvent; `HUNG_SUSPECTED`; an idle pass (zero running managed Pods and zero active attempts after a full list) additionally sends a coverage heartbeat `POST /v1/attempts/coverage` (built-in at most one per 120 s), so an idle cluster is judged IDLE rather than UNKNOWN; on a busy cluster the observation stream itself proves the watcher is alive | Terminal states branch per the [passive flow overview](high-level-design.md#passive-terminal-overview): on failure, asynchronous containment, the decision does not wait for the training stop to complete; with a usable marker, reuse/orchestrate the remediation, and if an existing workflow is responsible for the restart there is no duplicate recovery; without a marker, only when the allocation is non-empty and the Profile allows restart does it take a single restart within budget, otherwise it collects evidence and escalates. hang takes the **read-only evidence chain** |
 
 A training-side "usable marker" excludes pure diagnostic markers pointing to an already-stored incident; after skipping one, the
@@ -221,8 +222,10 @@ NVIDIA official recommendations for the 172 XID codes and all SXID codes, this s
 [Fault Categories and Remediation Actions](fault-categories-and-actions.md).
 
 PCIe is covered by the `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER` counters (graded against DCGM's expected
-rate of the current link), from batch 233 the load-gated link downtrain (DCGM 235-238) and the correctable-error rate
-(DCGM 1501), and the `pci_bdfs` evidence field; **there is still no AER decoding or link-loss decision path** (§11).
+rate of the current link), the load-gated link downtrain (DCGM 235-238) and the correctable-error rate
+(DCGM 1501), and the `pci_bdfs` evidence field (`src/gpu_fault/gpu_pcie_link_policy.py`); **there is still no kernel AER log
+decoding and no dedicated link-loss decision path**: a GPU that falls off the bus is found only through an XID (such as 79)
+or the GPU inventory drop path (§11).
 
 ### 2.2 Severity Levels and the Action Ladder
 
@@ -232,7 +235,7 @@ Severity does not directly determine the action; the action is determined by a *
 ```text
 RUN_DCGM_DIAGNOSTIC / RUN_FIELD_DIAGNOSTIC / RESTART_FABRIC_MANAGER (10)
 < RESTART_GPU_DEVICE_PLUGIN / RESTART_EFA_DEVICE_PLUGIN (15)
-< RESTART_WORKLOAD (20) < RESET_GPU (30) < REMEDIATE_EFA_DRIVER (35)
+< RESTART_WORKLOAD (20) < RESET_GPU / RECOVER_DRAIN_P2P (30) < REMEDIATE_EFA_DRIVER (35)
 < RESET_ALL_GPUS_NVSWITCHES (40) < RESTART_NODE (50) < QUARANTINE (60)
 < REMEDIATE_DRIVER / UPDATE_SOFTWARE_FIRMWARE (70) < REPLACE_NODE (75)
 < CHECK_MECHANICALS / ESCALATE_SUPPORT (80)
@@ -287,11 +290,15 @@ is one of v1's design principles.
 ### 2.5 Monitoring Loss of Contact Must Be Unknown
 
 Unknown here expresses "health cannot be confirmed when monitoring is missing"; it is not a unified node-state write.
-The current `collector-silence` task only checks collector silence and generates an `AdvisoryNotification`;
-it does not write the node as `UNKNOWN` for this, nor does it create a recovery workflow.
+The `collector-silence` task checks collector silence, generates an `AdvisoryNotification`, and records the observation
+validity per node and channel as `collector_observation_valid` (`HEALTHY`/`UNKNOWN`); it does not write the node as
+`UNKNOWN`, nor does it create a recovery workflow. For a channel that is really silent (no report at all within the
+threshold) it submits at most one bounded refresh request per node per hour: the non-destructive observability diagnostic
+workflow `TRIGGER_HEALTH_SNAPSHOT → VALIDATE_HOST`, which makes the node collect a fresh snapshot; a channel that still
+reports, only with collection errors, triggers no refresh (`src/gpu_fault/app/collector_silence.py::notify_silent_collectors`).
 
-The control plane schedules the collector silence check at a **60 s interval** by default, reading persisted successful-report times,
-not sending probe requests to nodes. The 60 s is configurable and is the default interval from the end of one round to the scheduling of the next,
+The control plane schedules the collector silence check at a **60 s interval** by default, reading persisted successful-report times;
+the check itself sends no probe request to nodes. The 60 s is configurable and is the default interval from the end of one round to the scheduling of the next,
 not a loss-of-contact decision threshold or an alert delivery deadline; actual execution also depends on the Worker, the Store and the periodic task lease.
 
 The check scope is limited to the required collection channels of **ACTIVE Agents whose heartbeat lease is still valid** in active clusters;
@@ -320,7 +327,7 @@ fourth shape).
 
 ```mermaid
 flowchart LR
-    subgraph DP["Per-GPU-cluster data plane (HyperPod EKS)"]
+    subgraph DP["Per-GPU-cluster data plane (HyperPod EKS or plain EKS)"]
         SRC["Signal sources<br/>kmsg · DCGM · FM log<br/>sysfs · nvidia-smi"]
         COL["4 node collectors<br/>+ 1 cluster collector"]
         WCH["Completion Watcher"]
@@ -329,9 +336,9 @@ flowchart LR
         SRC --> COL
     end
 
-    subgraph CP["Regional control plane (separate CPU EKS)"]
+    subgraph CP["Regional control plane (separate CPU HyperPod EKS)"]
         ING["ingress ×3×4<br/>enqueue only"]
-        AUR[("Aurora PostgreSQL<br/>14 base tables")]
+        AUR[("Aurora PostgreSQL<br/>21 base tables")]
         WRK["worker ×6×4"]
         NRM["Normalization + evidence"]
         POL["Policy engine<br/>catalog 610"]
@@ -350,7 +357,7 @@ flowchart LR
     EXE -- "claim commands / receipts" --> ING
     EXE --> KAPI["Local-cluster Kubernetes API"]
     EXE --> AGT
-    EXE --> HPAPI["SageMaker HyperPod API"]
+    EXE --> HPAPI["SageMaker HyperPod API / EC2 API"]
     AGT --> GPUDEV["GPU / node"]
 ```
 
@@ -366,9 +373,9 @@ events, leases and actions.
 | Control plane | `gpu-fault-control-worker` | 6 × 4 (:8081) | No (no direct cluster connection in the regional form) |
 | Control plane | `gpu-fault-telemetry-spool-worker` | 0 (:8082, scaled on demand) | No |
 | Data plane (node) | metrics / kernel / host / fabric-manager collector | 4 systemd units per node | No |
-| Data plane (node) | node-agent | 1 per node, :9099 | **Yes** (reset disabled by default) |
+| Data plane (node) | node-agent | 1 per node, :9099 | **Yes** (the installer's bare default disables reset, the regional production install enables it) |
 | Data plane (cluster) | cluster-action-executor | 2 | **Yes** |
-| Data plane (cluster) | completion-watcher / node-resource-collector / node-installer-reconciler | 1 each | The watcher modifies workloads only as an emergency fallback |
+| Data plane (cluster) | completion-watcher / node-resource-collector / node-installer-reconciler | 1 each | The watcher modifies workloads only as an emergency fallback; the reconciler creates install Jobs for nodes missing the install and writes node markers back |
 
 "ingress Pod Ready" does not mean anyone is consuming the queue: the two hand over work only through the Aurora queue.
 To judge queue health, look at the worker role.
@@ -395,7 +402,7 @@ The recommendation states this point explicitly, and the implementation agrees w
 
 ## 4. Module Design: Where the Nine Recommended Modules Land
 
-The recommendation listed nine modules. Each is mapped to its real code location below, plus six that the recommendation did not mention but that actually exist.
+The recommendation listed nine modules. Each is mapped to its real code location below, plus seven that the recommendation did not mention but that actually exist.
 
 | Recommended module | Real implementation | Status |
 |---|---|---|
@@ -405,11 +412,11 @@ The recommendation listed nine modules. Each is mapped to its real code location
 | Event normalization | `src/gpu_fault/app/ingest/`, edge filtering in each collector | Implemented |
 | Correlation analysis | `src/gpu_fault/policy/` (XID companion correlation), `src/gpu_fault/completion_controller.py` and its split-out `completion_pod_parsing.py` / `completion_delivery.py` / `completion_reconcile_loop.py` (attempt correlation) | Implemented |
 | Policy engine | `src/gpu_fault/policy/engine.py` + `catalog.py` + `catalog_integrity.py` | Implemented, driven by versioned data |
-| Workflow executor | `src/gpu_fault/orchestration/`, `src/gpu_fault/execution/`, `src/gpu_fault/adapters/` | Implemented |
+| Workflow executor | `src/gpu_fault/orchestration/`, `src/gpu_fault/execution/`, `src/gpu_fault/adapters/`, `src/gpu_fault/eks_provider.py` (the node lifecycle provider of eks-managed) | Implemented |
 | Validation module | `VALIDATE_GPU` / `VALIDATE_HOST` / `VALIDATE_FABRIC` + `RUN_DCGM_DIAGNOSTIC` | Implemented, new samples enforced (§7.7) |
 | Audit and event store | `src/gpu_fault/store/`, `src/gpu_fault/control_record_archive.py` | Implemented |
 
-Six that the recommendation did not mention but that the closed loop or the production lifecycle cannot do without:
+Seven that the recommendation did not mention but that the closed loop or the production lifecycle cannot do without:
 
 | Module | Role | Why it must be listed separately |
 |---|---|---|
@@ -417,8 +424,9 @@ Six that the recommendation did not mention but that the closed loop or the prod
 | Restart Guard | The control-plane precheck atomically reserves the restart budget; the data plane compares the authorization + checks GPU counts before and after | The main anti-flapping force, see §6.6 |
 | Arbitration and DAG branching | `src/gpu_fault/orchestration/arbitration.py`, `dag_branching.py` | Merge, preemption and `SUPERSEDED` when multiple faults on the same node are concurrent, see §6.5 |
 | Notification outbox + Dispatcher | `src/gpu_fault/notification_service.py`, `src/gpu_fault/notifications/` | Notifications must be decoupled from workflow results: an SNS/SES failure must not change step results in reverse |
-| Regional Cluster Registry + Remote Command | `src/gpu_fault/regional.py`, package `src/gpu_fault/cluster_executor/` (five layers: `regional_client` / `lease` / `dispatch` / `executor` / `bootstrap`) | The dispatch protocol across the trust boundary; it is how "the control plane holds no kubeconfig" is realized |
+| Regional Cluster Registry + Remote Command | `src/gpu_fault/regional.py`, package `src/gpu_fault/cluster_executor/` (five layers: `regional_client` / `lease` / `dispatch` / `executor` / `bootstrap`, plus the compound command replay `batching`, the node inventory report `node_inventory`, the Node Action key sync `node_key_sync` and `metrics`) | The dispatch protocol across the trust boundary; it is how "the control plane holds no kubeconfig" is realized |
 | Installation Resource Registry | `src/gpu_fault/installation_resources.py`, `src/gpu_fault/admin/resource_registry.py` | Records the stable identity, ownership, deletion policy, dependencies and state of AWS resources, so that deploy, takeover, remove-cluster and site-wide uninstall use the same source of truth |
+| Departed-node cleanup | `src/gpu_fault/departed_node_cleanup.py`, `src/gpu_fault/departed_nodes.py`, `src/gpu_fault/departed_node_provider.py` | After a Spot reclaim, a scale-in or a provider replacement, once Kubernetes, the provider and the Agent all prove the node gone, retires the Agent and ends the workflows and incidents nobody can run; what is not its to end is recorded and notified (v1 §2.2) |
 
 ---
 
@@ -525,8 +533,9 @@ The proposal requires "idempotency and recovery after controller restart". The i
 2. **Execution idempotency**: remote commands are deduplicated by content digest, and receipts use the same idempotency key; a duplicate receipt produces no second
    side effect, **including no second notification**.
 3. **No leader**: no global service leader is elected (this differs from the "Leader Election" in proposal §9).
-   Every worker process runs the dispatcher and the correlation finalizer, arbitrated by
-   workflow execution lease / epoch, correlation lease, lane lease + fencing.
+   Every worker process runs the dispatcher and the correlation finalizer, arbitrated by the fleet-wide
+   `workflow-dispatch` lease (only its holder scans and dispatches at any moment), workflow execution lease / epoch,
+   correlation lease, lane lease + fencing.
    After a process crash, the lease expires and another process takes over; commits from the old owner are rejected.
 4. **State advances only inside atomic transactions**: step, workflow and incident are updated together;
    there is no intermediate state of "step succeeded but workflow did not move".
@@ -543,7 +552,7 @@ The proposal requires "idempotency and recovery after controller restart". The i
 | Merging multiple faults on the same node | `src/gpu_fault/operation_registry.py` declares `MERGE_INTENT_OPERATIONS` and each operation's `merge_intent`; `src/gpu_fault/orchestration/arbitration.py` derives `merged_gpu_scope` from them |
 | Preemption (a stronger action suppresses a weaker one) | `src/gpu_fault/orchestration/dag_branching.py` computes `superseded_step_indexes` by `recovery_rank` (the field is defined in `src/gpu_fault/models.py`); suppressed steps enter the `SUPERSEDED` terminal state |
 | Coordination of multiple nodes in the same attempt | Within the aggregation window they form **one** workflow; each node is a DAG branch that executes its own node's reset, and a single `join` step restarts the training job only once after all branches complete |
-| Repair concurrency cap | The workflow lease claims persistent node, job-token and fabric-partition budgets in the same transaction (a job or a node without one is one workflow, parallel inside, kept apart from the others per node), and every GPU cluster has a remediation storm breaker that holds the new destructive remediation of a correlated fault; there is no fixed Region, cluster or resource class limit; the executor side additionally has `max_concurrent_commands=5` |
+| Repair concurrency cap | The workflow lease claims persistent node, job-token and fabric-partition budgets in the same transaction (a job or a node without one is one workflow, parallel inside, kept apart from the others per node), and every GPU cluster has a remediation storm breaker that holds the new destructive remediation of a correlated fault (it trips when the nodes newly entering destructive remediation within 600 s reach max(3, 20% of the GPU nodes) across at least 2 workload domains, and only the administrator's `gpu-fault-admin remediation-storm` release / abort clears it, `src/gpu_fault/remediation_storm.py`); there is no fixed Region, cluster or resource class limit; the executor side additionally has `max_concurrent_commands=5` |
 | Processor completion database parallelism | `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` only parallelizes completion transactions of different clusters, range `1..min(8, PostgreSQL pool max size)`; production is 1, **not equal to the repair action concurrency cap** |
 | Single writer per destructive capability | Runtime Profile compilation rejects multiple writers and `AUGMENT` for destructive capabilities |
 
@@ -652,21 +661,23 @@ Correspondingly:
   `pods delete` is granted separately in the device plugin namespace. Therefore `GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES` is no longer the only boundary:
   a command for an out-of-bounds namespace is rejected by both the executor and the API server.
   Here pod delete is used for `RESTART_*_DEVICE_PLUGIN` (deleting the DaemonSet Pod under `kube-system`
-  so it is recreated) and for marking terminated Pods when stopping training.
-- This design **writes only its own** `gpu-fault.io/*` taints and annotations,
+  so it is recreated) and for marking terminated Pods when stopping training. The Completion Watcher's write verbs
+  (`pods` patch, `pods/exec`, `pods/log` and training-object patch) likewise live only in the Roles of the managed
+  workload namespaces; the node-installer-reconciler may additionally delete, only inside `gpu-fault-system`, its own installer Jobs.
+- This design **writes only its own** `gpu-fault.io/*` taints and annotations (`gpu-fault.io/quarantined`
+  NoSchedule; on eks-managed the GPU service quiesce window also uses `gpu-fault.io/quiesce` NoExecute),
   never deletes provider-owned taints, and never writes any `sagemaker.amazonaws.com/*`
   label or taint (to avoid accidentally triggering managed recovery).
 
-> The statement in v1 §8.3 that "Kubernetes RBAC does not grant Node/Pod delete permission" holds for Node,
-> but not for Pod (the executor has `pods delete` in the managed workload and device plugin
-> namespaces). This section is authoritative; see also §11 item 12.
+> v1 §8.3 now agrees with this section: only Node has no delete permission, and `delete` on Pods is granted to the
+> executor only in the managed workload and device plugin namespaces (see §11 item 12).
 
 ### 7.5 Allowlist and Manual Approval
 
 | Gate | Implementation |
 |---|---|
 | Automatic action allowlist | Control-plane `GPU_FAULT_ALLOWED_OPERATIONS` (34 items in production) + node `GPU_FAULT_NODE_ALLOWED_OPERATIONS` (bare application default 1 item; the installer writes a 13-item base list and appends by capability). Not on both allowlists → not executed |
-| High-risk actions | The application/installer bare defaults turn off GPU reset and HyperPod mutation; the current HyperPod production installation explicitly enables GPU reset, fabric reset, Fabric Manager restart and `RESTART_NODE`. `ALLOW_HYPERPOD_REPLACE` and `ALLOW_WITH_AUTOMATIC_NODE_RECOVERY` are **always false** (an invariant, not a default) |
+| High-risk actions | The application/installer bare defaults turn off GPU reset and provider node mutation; the current regional production installation explicitly enables GPU reset, fabric reset and Fabric Manager restart, and the executor manifest enables `RESTART_NODE` (HyperPod and eks-managed share `ALLOW_HYPERPOD_REBOOT`). `ALLOW_HYPERPOD_REPLACE` and `ALLOW_WITH_AUTOMATIC_NODE_RECOVERY` are **always false** (an invariant, not a default; set to true, the provider adapter fails to construct) |
 | Manual approval | A **GPU count change** must be explicitly approved by an administrator with an exact annotation, otherwise `RESTART_WORKLOAD` waits; EFA traffic baseline changes are confirmed by the administrator via `ACCEPT_NEW_BASELINE`/`ACKNOWLEDGE_TRANSIENT` |
 | Maintenance window | There is no general "maintenance window" concept. The only similar mechanism is allowing a pinned agent generation to continue within the window during an SXID quiesce |
 | Manual and configuration gates | `CHECK_MECHANICALS` waits for an annotation; `ESCALATE_SUPPORT` generates a synthetic ticket ID and a persisted notification; driver/firmware fail closed when the site command or version pin is missing; Fabric Manager restart fails closed when the switch is off, compute clients remain, or service validation fails |
@@ -710,7 +721,7 @@ the default-deny model of "every route explicitly declares its bucket". The five
 A new route without a declared bucket
 fails startup at application assembly; at runtime, failing to resolve a bucket always yields 403, but **a path that matches no route answers 404**
 (`ExplicitAuthorizationRegistry.route_exists`): the collector outbox treats 404 as dead-letter and 403 as a
-token-rotation transient to be replayed indefinitely; NET-008's retired-channel records once never dead-lettered because of this.
+transient of a token rotation that it keeps replaying, so a retired entry point must answer 404 for its records to dead-letter.
 
 All three API classes the proposal cares about exist, and the production deployment lifecycle has an additional set of management interfaces:
 
@@ -728,7 +739,7 @@ All three API classes the proposal cares about exist, and the production deploym
 | Manually advance/execute a workflow | `POST /v1/workflows/{request_id}/execute` (execution-token) |
 | Operator queue / close an incident handed to humans | `GET /v1/incidents`, `GET /v1/incidents/{incident_id}`, `POST /v1/incidents/{incident_id}/close` (execution-token; only closes **ESCALATED** to RECOVERED, 409 while a workflow is still open, repeated close is idempotent) |
 | Close an incident / finish a BLOCKED record from the administrator shell | `gpu-fault-admin workflow-reconcile --close-incident ID` / `--close-escalated` / `--close-quarantined` (the latter only finishes QUARANTINED incidents whose node no longer has a cordon, no quarantine taint of this incident and no isolation annotation, and strips residual annotations); the same verb also closes BLOCKED records whose subsequent workflow has recovered |
-| `CHECK_MECHANICALS` disposition / return a manually repaired node to the state store | `gpu-fault-admin submit-remediation --incident-id ID --disposition {inspected,reset-gpu,reboot-node,quarantine,restore}`: confirms the inspection, compiles a new fenced hardware disposition workflow from the record, or (`restore`) creates a validated restore workflow for a manually repaired QUARANTINED node (`VALIDATE_GPU → VALIDATE_HOST → VALIDATE_FABRIC → RESTORE_SCHEDULING`, same incident and fencing token) |
+| `CHECK_MECHANICALS` disposition / return a manually repaired node to the state store / confirm an unknown node action outcome | `gpu-fault-admin submit-remediation --incident-id ID --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action}`: confirms the inspection or compiles a new fenced hardware disposition workflow from the record; `restore` creates a validated restore workflow for manually repaired nodes the incident still isolates (`VALIDATE_GPU → VALIDATE_HOST → VALIDATE_FABRIC → RESTORE_SCHEDULING`, same incident and fencing token; for a QUARANTINED incident, or an ESCALATED/RECOVERED one whose workflows have all ended); `confirm-node-action --node NODE` confirms, on the evidence that the node is Ready with its Agent `ACTIVE` on a changed boot id, a node action whose outcome is unknown (such as `RESTART_NODE`), so the parked BLOCKED record can be restored and reconciled |
 | Declare / release a warm spare | `gpu-fault-admin config spare --node NODE --declare` / `--release` (label + cordon, with a `--confirm` confirmation string and `--reference`) |
 | Write a trusted health marker | `POST /v1/markers` |
 | Take a node agent out of service / revoke / reactivate | `POST /v1/fleet/agents/{cluster_id}/{node_id}/drain` `/revoke` `/reactivate` |
@@ -739,22 +750,25 @@ All three API classes the proposal cares about exist, and the production deploym
 | Query/sync/advance AWS installation resource state, transition a really replaced resource | `GET /v1/installation-resources`, `POST /sync`, `PUT /{site_id}/{resource_key:path}`, `POST /replacements` (`gpu-fault-admin replace-resource`) |
 | Approve a GPU count change | Node annotation (exact value), not an API |
 | Regional operations (claim/renew/receipt/progress, spare health, evidence and notification write-back, cluster registry) | `/v1/regional/*`, 23 endpoints in total (`executors` 17, `registry` 4, `clusters` 1, `node-action-keys` 1) |
+| Exits of the remediation storm breaker | `gpu-fault-admin remediation-storm`: `release` closes and re-arms the breaker and lets the held workflows run; `abort` keeps it open and hands the held workflows to the operator |
 
 **Gap: there is still no first-class entry point for "isolate an arbitrary node" or "terminate a RUNNING workflow"**. Manual isolation currently relies on
 creating/advancing a workflow or cordon+taint directly in the cluster (the latter bypasses the state store and is not recommended);
 `POST /v1/incidents/{id}/close` and `workflow-reconcile --close-*` both refuse incidents that still have an active
 workflow, and a running workflow can only wait until it fails closed or is `SUPERSEDED` by a stronger action.
-Three things have already been filled in: an ESCALATED incident can be closed via `POST /v1/incidents/{id}/close`;
-manual repair of a QUARANTINED node returns to the state store via `submit-remediation --disposition restore`;
+What has already been filled in: an ESCALATED incident can be closed via `POST /v1/incidents/{id}/close`;
+manually repaired isolated nodes return to the state store via `submit-remediation --disposition restore`, and a node action
+with an unknown outcome is confirmed on evidence via `--disposition confirm-node-action`;
 `WAITING` remote commands left behind by terminal workflows are cancelled automatically by the dispatcher's periodic sweep
-(`WorkflowDispatcher.sweep_stuck_records`), no manual command is needed any more.
+(`WorkflowDispatcher.sweep_stuck_records`), and the Agents, workflows and incidents a departed node leaves behind are ended by
+the departed-node cleanup, so no manual command is needed any more.
 
 ### 8.3 Integration Surface with Kubernetes
 
 | Proposed integration point | Implementation |
 |---|---|
-| Node taint | **Written**, but only the own `gpu-fault.io` QUARANTINE_TAINT; provider-owned taints are not removed |
-| Node label / annotation | Own annotations are written (including installation markers); `sagemaker.amazonaws.com/*` is read-only |
+| Node taint | **Written**, but only the own `gpu-fault.io/quarantined` (NoSchedule) and, in the eks-managed quiesce window, `gpu-fault.io/quiesce` (NoExecute); provider-owned taints are not removed |
+| Node label / annotation | Own labels and annotations are written (the warm-spare declaration `gpu-fault.io/spare`, installation markers, isolation annotations, ...); `sagemaker.amazonaws.com/*` is read-only |
 | NodeCondition | **Read-only**. NodeCondition is not written (differs from the proposal, see §11) |
 | Kubernetes Event | **Not written**. Fault conclusions go through the API + site notification channel, not Event objects |
 | Device Plugin / scheduler device disabling | Can only **restart the whole** GPU/EFA device plugin DaemonSet Pod; **there is no GPU-level "mark a single card unavailable" injection capability**. The actual isolation granularity of a single-card fault is the whole node |
@@ -766,7 +780,8 @@ manual repair of a QUARANTINED node returns to the state store via `submit-remed
   Notification Dispatcher + `spec.notifications.channel` (rendered as
   `GPU_FAULT_NOTIFICATION_CHANNEL`). New sites default to `sns`, publishing to `spec.health.snsTopicArn`;
   `ses` (opt-in) sends from a verified sender, and legacy sites with no declared channel but an existing `emailSender`
-  stay on SES; `disabled` only lands in the outbox. Business processing only creates idempotent notifications; the dispatcher claims
+  stay on SES; the site channel accepts only these two values, and with `allowEmail: false` notifications only land in the
+  outbox (the runtime variable also accepts `disabled`). Business processing only creates idempotent notifications; the dispatcher claims
   with owner/epoch/lease and backs off exponentially, an old epoch cannot complete a new lease, and
   **an SNS/SES failure cannot change a workflow step result in reverse**.
   Notifications are still persisted when the channel is disabled at runtime or delivery is disabled; `AdvisoryNotificationService.describe_delivery_mode`
@@ -785,12 +800,15 @@ manual repair of a QUARANTINED node returns to the state store via `submit-remed
 
 ### 9.1 High Availability
 
-- **No leader election** (differs from the proposal). Active-active consumption + lane leases + fencing,
-  see §6.3 item 3 and v1 §4.3.
+- **No leader election** (differs from the proposal). Active-active consumption + lane leases + fencing; workflow
+  dispatch is serialized by the take-over-able `workflow-dispatch` lease, see §6.3 item 3 and v1 §4.3.
 - PDBs are set per role: ingress `minAvailable=2` (3 replicas),
   control-worker and spool-worker `maxUnavailable=1`.
 - Aurora is the shared consistency point; the control plane does not allow a separate SQLite per Pod.
-  Destructive steps must not be executed twice during an Aurora failover (go-live gate item).
+  Destructive steps must not be executed twice during an Aurora failover (go-live gate item). After a failover the
+  writer does not move back by itself; `gpu-fault-admin aurora-failback` lets the operator move the writer back to the
+  preferred member after confirmation (refused while a release transaction is open, a remote command is in flight or a
+  destructive workflow is active; never run automatically).
 - A single GPU cluster going offline, a credential leak or a data-plane anomaly does not affect other clusters and must not stall
   the control plane's handling of other clusters.
 - **The registry head is the runtime source of truth**: the startup Secret serves only as the initial seed and for disaster recovery. All currently active
@@ -891,7 +909,7 @@ compatibility matrix, centered on digest pins rather than version ranges:
 | Agent / Executor artifact consistency | `src/gpu_fault/fleet_compatibility.py` and `src/gpu_fault/regional_compatibility.py`; Agent/Executor both check the protocol, the physical artifact SHA and the component compatibility digest |
 | Behavior on pin mismatch | Fail closed. A control-plane pin ahead of the fleet (`PIN_AHEAD_OF_FLEET`) makes all node actions fail, so the release order is "install nodes first, then update the control-plane pin" |
 | Canary | fleet deployment waves + barriers + explicit `next-wave` advancement; revoke/drain/reactivate control per node |
-| Rollback | Schema is forward-only (no down migration), and **every process pins the exact version**: `gpu_fault_schema_version` must equal the process's own `POSTGRES_SCHEMA_VERSION`, otherwise startup raises `RuntimeError`; old processes cannot read a new schema. A release with a schema change cannot be rolled back automatically (the engine refuses outright under `autoRollback: true`) and must use `gpu-fault-admin deploy --accept-schema-change`: Aurora snapshot first, fail-forward within the transaction, recover from the snapshot if something goes wrong; switching straight back to old processes is not possible. `dual` refers only to the legacy/dedicated dual write of the hot-state tables and the workflow/remote-command dedicated tables (a data layout migration), not a general DDL rollback mechanism |
+| Rollback | Schema is forward-only (no down migration), and **every process pins the exact version**: `gpu_fault_schema_version` must equal the process's own `POSTGRES_SCHEMA_VERSION`, otherwise startup raises `RuntimeError`; old processes cannot read a new schema. A release with a schema change cannot be rolled back automatically (the engine refuses outright under `autoRollback: true`) and must use `gpu-fault-admin deploy --accept-schema-change`: Aurora snapshot first, fail-forward within the transaction, recover from the snapshot if something goes wrong; switching straight back to old processes is not possible (a staging database nobody would restore may use `--accept-schema-change-without-snapshot`). `dual` refers only to the legacy/dedicated dual write of the hot-state tables and the workflow/remote-command dedicated tables (a data layout migration), and the v23 `--set-hot-layout detached` is a one-way switch; neither is a general DDL rollback mechanism |
 | GPU model | Two places: the product family gate on the policy side (B100/B200/H200 etc.), and the instance type → GPU/EFA expected-value table on the inventory side (unknown instance types must be configured explicitly, otherwise node installation fails) |
 | Driver / firmware version | **No version compatibility matrix**. The XID catalog is pinned at 610 and the DCGM field set is fixed; the driver version does not participate in policy selection, and there is no gate of the form "an action is allowed only when driver ≥ X" |
 
@@ -902,28 +920,28 @@ compatibility matrix, centered on digest pins rather than version ranges:
 ### 10.1 Case Catalog
 
 The machine-readable case catalog is `testcases/fault-scenarios.yaml`, with `tools/run_fault_test_cases.py` as the entry point.
-Currently **340 explicit cases + 2 case families generated per XID catalog
+Currently **456 explicit cases + 2 case families generated per XID catalog
 code** (the `xid_catalog_rules` generator, covering every XID in the catalog,
-plus B200 context variants, 172 × 2 = 344 cases), 684 cases after expansion, across 49 categories
-(47 explicit + 2 generated). The numbers are authoritative as loaded from `testcases/fault-scenarios.yaml`
+plus B200 context variants, 172 × 2 = 344 cases), 800 cases after expansion, across 53 categories
+(51 explicit + 2 generated). The numbers are authoritative as loaded from `testcases/fault-scenarios.yaml`
 (`test_cases` + expanded `generated_test_families`);
-`--list --include-manual --include-live` lists only 648, because the 36
+`--list --include-manual --include-live` lists only 764, because the 36
 `automation: command` cases only appear when explicitly selected with `--case`.
 
-Risk classification (the table below counts only the 340 explicit cases and determines whether a case may run on real machines):
+Risk classification (the table below counts only the 456 explicit cases and determines whether a case may run on real machines):
 
 | risk | Count | Meaning |
 |---|---:|---|
-| `non-destructive` | 179 | Pure software path, can run unconditionally |
-| `read-only-signal-replay` | 38 | Only replays signals, does not touch the environment |
-| `live-non-destructive` | 38 | Runs on real machines without changing state |
-| `live-service-action` | 31 | Service-level actions on real machines |
-| `destructive` | 24 | Requires manual approval |
-| `live-workload-restart` | 9 | Restarts training on real machines |
+| `non-destructive` | 210 | Pure software path, can run unconditionally |
+| `live-non-destructive` | 49 | Runs on real machines without changing state |
+| `destructive` | 44 | Requires manual approval |
+| `read-only-signal-replay` | 39 | Only replays signals, does not touch the environment |
+| `live-service-action` | 37 | Service-level actions on real machines |
+| `live-workload-restart` | 26 | Restarts training on real machines |
+| `destructive-provider-reboot` | 17 | Provider reboot on real machines |
+| `live-node-mutation` | 15 | Modifies nodes on real machines |
+| `live-isolation` | 11 | Isolation on real machines |
 | `live-kernel-log-injection` | 6 | Writes kmsg on real machines |
-| `destructive-provider-reboot` | 5 | Provider reboot on real machines |
-| `live-isolation` | 4 | Isolation on real machines |
-| `live-node-mutation` | 4 | Modifies nodes on real machines |
 | `destructive-warm-spare` | 2 | Warm spare replacement on real machines |
 
 ### 10.2 Proposed Injection List vs Actual Coverage
@@ -931,13 +949,13 @@ Risk classification (the table below counts only the 340 explicit cases and dete
 | Proposed injection scenario | Coverage |
 |---|---|
 | Simulated XID / ECC | **Covered**, and per code (full XID catalog kmsg-format replay + B200 variants + XID 154 + companion XID + NVLink5 decode) |
-| Simulated temperature anomaly | Covered (`gpu-metrics` 25 cases, `host-health` 5 cases) |
-| Metric loss / killing DCGM / Device Plugin / driver processes | **Partially covered**: `regional-collector` 22 cases cover the silence and loss-of-contact decisions; injection that kills DCGM/device plugin processes is not in the public catalog |
+| Simulated temperature anomaly | Covered (`gpu-metrics` 25 cases, `host-health` 7 cases) |
+| Metric loss / killing DCGM / Device Plugin / driver processes | **Partially covered**: `regional-collector` 22 cases cover the silence and loss-of-contact decisions; recovery from a device plugin registration fault (`GF-GENERAL-LIVE-014`) and per-GPU incomplete collection caused by a paused exporter with fresh-snapshot validation (`GF-GENERAL-LIVE-025`, `GF-GENERAL-FIX-025`) are in the catalog; an injection that kills driver processes directly is not in the public catalog |
 | Dropped GPU and PCIe/NVLink anomalies | Dropped GPU covered; NVLink covered (`xid74-nvlink` 15 cases, `sxid-*`); **PCIe AER not covered** (and not implemented, §11) |
 | Drain timeout / Pod cannot be evicted | **Not applicable**: there is no Eviction path (§7.4). The equivalent scenarios are `STOP_WORKLOADS` failure and an unreadable workload |
 | Controller restart during repair | Covered (`regional-high-availability` 9 cases, `regional-preemption` 38 cases including lease takeover) |
 | Duplicate and out-of-order events | Covered (idempotency, `attempt-generation-fence` 8 cases, `regional-remote-command` 18 cases including duplicate receipts) |
-| Manual takeover after repair failure | Covered (`destructive-acceptance`, `regional-destructive-acceptance`, 7/26 cases respectively) |
+| Manual takeover after repair failure | Covered (`destructive-acceptance`, `regional-destructive-acceptance`, 7/31 cases respectively) |
 | Multiple nodes failing simultaneously | Covered (`cross-fault-arbitration` 6 cases, three-node aggregation and reset, two-node SXID quiesce lease) |
 
 ### 10.3 Current State of Acceptance Metrics
@@ -963,15 +981,15 @@ Sorted by "whether it affects closing the loop". The first 6 items change the sy
 | 3 | Dry-run | `/simulate` **writes to the state store** and pushes the workflow to a terminal state; no production-usable rehearsal | Mistaking it for a rehearsal causes state pollution | Either explicitly disable `/simulate` in production, or add a truly read-only plan-preview |
 | 4 | GPU-level device disabling (Device Plugin / scheduler) | Can only restart the whole device plugin DaemonSet Pod | The actual isolation granularity of a single-card fault is the **whole node**; capacity loss is amplified 8× | Evaluate integrating single-card unhealthy injection into the device plugin |
 | 5 | False-isolation rate, event loss rate, end-to-end detection latency | workflow/notification/readmission metrics have been added; these three still lack a unified denominator or a signal→finding timeline | Detection quality still cannot be fully quantified | Add denominator definitions and signal/finding milestones |
-| 6 | PCIe (AER / link) fault decision | The `pcie_replay_total` count, from batch 233 the load-gated link downtrain (235-238) and the correctable-error rate (1501), and the `pci_bdfs` evidence field | Still no decision path for PCIe link loss or AER uncorrectable errors | If real cases exist, add a family following the "temperature/throttling" threshold + debounce pattern |
+| 6 | PCIe (AER / link) fault decision | The `pcie_replay_total` count, the load-gated link downtrain (DCGM 235-238) and the correctable-error rate (DCGM 1501), and the `pci_bdfs` evidence field | Still no decision path for the kernel AER log or AER uncorrectable errors; a PCIe link loss is found only indirectly through an XID or the GPU inventory drop | If real cases exist, add a family following the "temperature/throttling" threshold + debounce pattern |
 | 7 | Write NodeCondition | NodeCondition is **read-only** | External systems cannot see this design's decisions; the scheduler cannot act on them | Writing NodeCondition would introduce a second writer, conflicting with the single-writer principle; recommend staying read-only and exposing a query API instead |
 | 8 | CRDs (FaultEvent / RemediationPolicy / RemediationRun) | **No CRDs**, REST + Aurora | Cannot view faults with `kubectl get` | Deliberate choice: the state store is shared across clusters, CRDs live only within a single cluster. If CRDs are wanted, they can only be a read-only projection |
 | 9 | Control-plane Leader Election | **No leader**, lane leases + fencing + active-active | None (this is the stronger design: no single-leader throughput bottleneck and no leader flapping) | Keep as is, but the documentation must state explicitly "there is no leader", otherwise troubleshooting will go looking for a leader that does not exist |
 | 10 | Drain policy (critical Pods / system Pods / DaemonSets) | Does not call the Eviction API; first isolates scheduling with cordon + taint, then separately stops managed training jobs | Unmanaged Pods on the node are unaffected | This is a deliberately narrowed blast radius. For a real drain, RBAC and PDB interaction would need to be re-evaluated |
 | 11 | Ticketing system integration / Webhook | `vendor-ticket-<incident_id>` is a **locally synthesized string**, written only into the SNS/SES notification body; no built-in webhook | Humans must turn notifications into tickets | For integration, add a subscription on the site SNS topic or a channel on the notification outbox, rather than a call on the business path |
-| 12 | — (a wording defect of v1 itself) | v1 §8.3 "RBAC does not grant Node/Pod delete permission" holds for Node but not for Pod (the executor has `pods delete` in the managed workload and device plugin namespaces) | Reviewers will misjudge the permission surface | Correct the wording of v1 §8.3 according to §7.4 of this document |
+| 12 | — (a wording defect of v1 itself) | **Corrected**: v1 §8.3 now agrees with §7.4 of this document; only Node has no delete permission, and the executor has `pods delete` in the managed workload and device plugin namespaces | None | Keep the two places in sync |
 | 13 | Driver / firmware / GPU model compatibility matrix | There is a product family gate and an instance type expected-value table, but **no driver/firmware version matrix**; the catalog is pinned at 610 | When changing driver major versions, policy applicability relies on human judgment | At least record a list of "verified driver versions", and report the driver version in agent heartbeats for comparison |
-| 14 | "Manual isolate/recover/terminate workflow" API | There are markers, agent drain/revoke/reactivate, workflow execute, `POST /v1/incidents/{id}/close` (ESCALATED), `workflow-reconcile --close-*`, `submit-remediation --disposition restore` (return of a manually repaired QUARANTINED node to the store); **still no first-class "isolate an arbitrary node" or "terminate a RUNNING workflow" endpoint** | Manual isolation either bypasses the state store or waits for fail-closed | Add these two explicit endpoints; safer than having people run `kubectl taint` |
+| 14 | "Manual isolate/recover/terminate workflow" API | There are markers, agent drain/revoke/reactivate, workflow execute, `POST /v1/incidents/{id}/close` (ESCALATED), `workflow-reconcile --close-*`, `submit-remediation --disposition restore` (return of manually repaired isolated nodes to the store) and `--disposition confirm-node-action` (confirming an unknown node action outcome on evidence); **still no first-class "isolate an arbitrary node" or "terminate a RUNNING workflow" endpoint** | Manual isolation either bypasses the state store or waits for fail-closed | Add these two explicit endpoints; safer than having people run `kubectl taint` |
 | 15 | Observation window as an explicit state | Expressed as cooldown + debounce counts, no explicit state | No functional impact, but operators cannot see "under observation" | Could be exposed as a derived field on the incident |
 
 **Four places with no difference where the implementation is stronger than the proposal**, which need not be discussed again in review:
