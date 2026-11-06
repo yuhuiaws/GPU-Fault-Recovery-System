@@ -4808,7 +4808,7 @@ can each deliver the same thing twice at every layer. Deduplication does not rel
 | Queue request | `processor_request_id` | `gpu_fault_processor_queue` + `processor_request` object | The `COMPLETED` response body is replayed verbatim; the side effect happens only once |
 | Workflow step | `completed_step_indexes` / `completed_operations` | `workflow` object | Completed steps are skipped after takeover |
 | Node action | `command_id` | Agent-side ledger (`GPU_FAULT_NODE_ACTION_RETENTION_SECONDS=2592000`, `GPU_FAULT_NODE_ACTION_MAX_RESULTS=10000`) | A re-post returns the archived result of the latest attempt; retryable failures are re-posted by the control plane (`GPU_FAULT_NODE_ACTION_RETRY_LIMIT`, default 3); once the limit is exceeded the terminal state is FAILED |
-| Provider submission (reboot/replace) | `<request_id>/<operation>/<step_index>` (`hyperpod_submission_idempotency_key`) | Submission record `HyperPodSubmissionRecord`, kept on the control plane through `RegionalHyperPodSubmissionStore` (HyperPod and EC2 share `provider_submissions.ProviderSubmissionLedger`) | Among concurrent replicas only the one that won the reservation submits; written INTENDED before the provider call, SUBMITTED/FAILED after; a call that raised (and may have taken effect) records UNKNOWN, which is never retried and goes to an operator decision |
+| Provider submission (node reboot; provider replacement is forbidden by a hard constraint) | `<request_id>/<operation>/<step_index>` (`hyperpod_submission_idempotency_key`) | Submission record `HyperPodSubmissionRecord`, kept on the control plane through `RegionalHyperPodSubmissionStore` (HyperPod and EC2 share `provider_submissions.ProviderSubmissionLedger`) | Among concurrent replicas only the one that won the reservation submits; written INTENDED before the provider call, SUBMITTED/FAILED after; a call that raised (and may have taken effect) records UNKNOWN, which is never retried and goes to an operator decision |
 
 **Sliding-window correlation** is evidenced by markers, see §5.4; it is a separate matter from primary-key deduplication.
 The primary key handles re-posts of the same event; reuse of an action after correlation must still prove complete coverage, and a TTL cannot substitute for arbitration.
@@ -5228,9 +5228,10 @@ that may already have restored its services on its own. **There is no calendar-s
 Logs are **plain text lines** in the format `%(asctime)s %(levelname)s %(name)s %(message)s`; the level is
 controlled by `GPU_FAULT_LOG_LEVEL` / `LOG_LEVEL` (default INFO; a misspelled level name falls back to INFO instead of
 crashing the process at startup). There is no JSON logger; fields are embedded in the message as `key=value`. All entry points
-share `gpu_fault.logging_setup.configure_logging()`: it does not take over when the root logger already has a handler
-(so pytest and embedding callers keep control) -- this is also the historical reason for "misconfigured yet completely silent": before it
-existed, uvicorn only configured the `uvicorn*` loggers, and the control plane's own `LOGGER.info` calls were all discarded.
+share `gpu_fault.logging_setup.configure_logging()`: when the root logger already has a handler it does not take over the
+format and level (so pytest and embedding callers keep control), but it still installs the redaction filter on those handlers.
+The single entry point is needed because uvicorn's own logging configuration gives handlers only to the `uvicorn*` loggers,
+and the control plane's own `LOGGER.info` calls would all be discarded.
 
 Redaction is centralized, and **attached to the handler rather than the logger**: a filter on the root logger only applies to records
 logged directly to the root, whereas `callHandlers` runs the ancestor handler's filter on records bubbling up from child loggers,
@@ -5289,65 +5290,66 @@ The only realistic means of cross-process correlation is
 
 `GET /metrics` (Prometheus text format; loopback is unauthenticated, non-loopback needs the execution token) rendered on
 the real app assembled by `create_app(build_context())` (in-memory Store fixture, worker role)
-exports **264 metric families** with `regional_mode` off and **277** with it on (the extra 13 are all emitted only in regional mode:
+exports **311 metric families** with `regional_mode` off and **324** with it on (the extra 13 are all emitted only in regional mode:
 9 `gpu_fault_remote_command_*`, 2 `gpu_fault_fleet_rollout_*`, 2 `gpu_fault_regional_registry_*`),
-all prefixed `gpu_fault_`; under the same fixture ingress is 225/227 and spool-worker is 224/226. Conditional families such as the Postgres connection pool,
+all prefixed `gpu_fault_`; under the same fixture ingress is 262/264, and spool-worker (a role that only assembles with an active-active
+Processor plus the telemetry spool) is 265/267. The numbers grow with the code; the actual `GET /metrics` output is authoritative. Conditional families such as the Postgres connection pool,
 spare health, spool consumer, collector snapshot and the departed-node cleanup (`gpu_fault_departed_node_cleanup_*`, 7, on
 the regional-mode worker only, §7.10) are not in the count; a production worker only has more, never fewer. Distribution in regional mode:
 
 | Prefix | Families | Coverage |
 |---|---:|---|
-| `gpu_fault_processor_*` | 111 | Queue depth, lane wait/hold, leases, consumption, delayed retries, claimed-not-started, graceful-shutdown release, cleanup, `pg_notify`, priority counts, consume-loop liveness |
+| `gpu_fault_processor_*` | 120 | Queue depth and limits, admission batching (fault/evidence batches, adaptive in-flight limit, shed/expired), claim rounds and backoff, lane wait/hold, lease renewal and reclaim, consumption, delayed retries, claimed-not-started and graceful-shutdown release, cleanup, fault pressure, counter drift scans, `pg_notify` listening and shards, consume-loop liveness |
 | `gpu_fault_telemetry_*` | 40 | spool, batch commits, freshness of each telemetry channel |
-| `gpu_fault_workflow_*` | 34 | workflow status census, step/duration/milestone, dispatch wakeups and loop-liveness stamps, scan window and truncation |
+| `gpu_fault_workflow_*` | 38 | workflow status census, step/duration, waits and overdue steps, dispatch tick/lease/wakeups and loop-liveness stamps, placement holds, branch-escalation budget refusals, scan window and truncation |
+| `gpu_fault_store_*` | 17 | store I/O concurrency/waiting/rejections (`store_io_*`, 4), hot-table layout (`store_hot_table_*`, 8), compaction rounds/actions and the bloat scan time |
+| `gpu_fault_remediation_budget_*` | 15 | Active claims (by scope type), waiting counts (total/by scope) and the longest wait, over-limit scopes, parked-hold releases, the remediation storm breaker (§9.5) |
 | `gpu_fault_notification_*` | 12 | Notification status/delivery result, outbox depth and oldest pending age, expired/dead-lettered/drill suppression, most recent terminal failure time, dispatcher loop liveness |
 | `gpu_fault_periodic_*` | 9 | Loop-liveness stamps, job last run/error, lease errors, cleanup rows/errors/budget exhaustion |
-| `gpu_fault_remote_command_*` | 9 (only `regional_mode`) | Total commands and per-cluster counts, oldest unclaimed duration, expired unclaimed, executor internal errors (count + latest timestamp), compound-command/accompanying-step counts, `gpu_fault_remote_command_open_sibling_holds_total` (dispatches held because the same workflow step already has an unclosed command; process-level counter, ARCH-D5) |
-| `gpu_fault_remediation_budget_*` | 7 | Active budget claims, cluster cap/active/waiting, number of waiting workflows (by scope) |
+| `gpu_fault_remote_command_*` | 9 (only `regional_mode`) | Total commands and per-cluster counts, oldest unclaimed duration, expired unclaimed, executor internal errors (count + latest timestamp), compound-command/accompanying-step counts, `gpu_fault_remote_command_open_sibling_holds_total` (dispatches held because the same workflow step already has an unclosed command; process-level counter) |
 | `gpu_fault_ingress_*` | 6 | Backpressure rejections, decode rejections, lane in-flight/waiting/rejected/worker counts |
 | `gpu_fault_closed_loop_*` | 5 | Milestone summary and the four gauges mean/count/complete/window-end for the six-hour window (see later in §10.2) |
 | `gpu_fault_attempt_observation_*` | 5 | Observation scan budget/rows read/truncation; per-cluster evaluated and owned nodes (see later in §10.2) |
-| `gpu_fault_request_decode_*` | 4 | Decode concurrency and rejections |
-| `gpu_fault_store_io_*` | 4 | store I/O concurrency, waiting, rejections |
+| `gpu_fault_request_decode_*` / `gpu_fault_capacity_*` / `gpu_fault_gc_*` | 4 each | Decode concurrency and rejections; declared topology and registered GPU node counts; GC collections/time/frozen objects |
 | `gpu_fault_ambiguous_attempt_ownership_*` / `gpu_fault_control_record_archive_*` / `gpu_fault_fleet_*` / `gpu_fault_incident_*` / `gpu_fault_metrics_*` / `gpu_fault_stale_*` | 3 each | Ownership ambiguity (counter, per-node family of ambiguous nodes only, per-cluster count of ambiguous nodes); archive success/errors/withheld; pin drift and rollout fence; incident automatic/manual closure and dangling pointers; aggregation process count/degraded/contributor errors; stale Agents, per-node observation family of stale nodes only and per-cluster count of stale nodes |
-| `gpu_fault_capacity_*` / `gpu_fault_completion_*` / `gpu_fault_hardware_escalation_*` / `gpu_fault_ingest_*` / `gpu_fault_regional_registry_*` | 2 each | Managed-node capacity; completion decisions/no-decision events; hardware escalation chain terminations/isolation refusals; unresolved fault signals/stale link repairs; registry refresh errors/Secret drift |
-| Singletons | 7 | `gpu_fault_event_loop_lag_seconds`, `gpu_fault_gpu_findings_without_incident_total`, `gpu_fault_health_signal_clock_regressions_total`, `gpu_fault_incidents_by_state`, `gpu_fault_orphan_workflows`, `gpu_fault_policy_unknown_product_total`, `gpu_fault_postgres_pool_checkout_wait_seconds` |
+| `gpu_fault_completion_*` / `gpu_fault_hardware_escalation_*` / `gpu_fault_ingest_*` / `gpu_fault_listen_*` / `gpu_fault_regional_registry_*` | 2 each | Completion decisions/no-decision events; hardware escalation chain terminations/isolation refusals; unresolved fault signals/stale link repairs; listen accept queue and `somaxconn`; registry refresh errors/Secret drift |
+| Singletons | 8 | `gpu_fault_event_loop_lag_seconds`, `gpu_fault_gpu_findings_without_incident_total`, `gpu_fault_health_signal_clock_regressions_total`, `gpu_fault_incidents_by_state`, `gpu_fault_orphan_workflows`, `gpu_fault_policy_unknown_product_total`, `gpu_fault_postgres_pool_checkout_wait_seconds`, `gpu_fault_process_resident_memory_bytes` |
 
-Families added after the architecture review (those within the scope of the table above are already counted; families marked as conditionally emitted -- such as the
-4 `gpu_fault_collector_*` families rendered only when a collector snapshot exists: snapshot age, time since oldest success, silent/erroring node counts -- are not in the in-memory fixture's count):
+Families that need a note of their own (those within the scope of the table above are already counted; families marked as conditionally emitted -- such as the
+4 `gpu_fault_collector_*` families rendered only when a collector snapshot exists: snapshot age, time since oldest success, silent/erroring node counts, plus the per-node
+`gpu_fault_collector_silent_top_node` series that carries no TYPE line -- are not in the in-memory fixture's count):
 
 | Prefix | Coverage |
 |---|---|
-| `gpu_fault_processor_*` additions | `gpu_fault_processor_fault_rejections_total` (fault-layer events replayed after the ingress 202 and rejected with 4xx), `gpu_fault_processor_completions_by_path_status_total{path,status_class}` (G1; also writes `CollectorStatus.errors` entries with the `rejected-event:` prefix, merged by the three Stores via `telemetry.merge_collector_status`: sticky timestamps, entries with that prefix are retained until `last_success_at` is later than `last_error_at`, the collector's own errors always follow the latest entry); `gpu_fault_processor_claim_last_round_timestamp_seconds` is emitted only when the processor snapshot carries that key (E3) |
-| `gpu_fault_notification_*` additions | `gpu_fault_notification_delivery_total{status}`, `gpu_fault_notification_oldest_pending_age_seconds` (Store-derived); process-level `gpu_fault_notification_expired_total`, `gpu_fault_notification_expired_last_seen_timestamp_seconds`, `gpu_fault_notification_dead_lettered_total`, `gpu_fault_notification_suppressed_drills_total`, `gpu_fault_notification_dispatch_last_cycle_timestamp_seconds` (E1/E3); result=FAILED has terminal-state semantics |
-| `gpu_fault_fleet_pin_drift_*` | `gpu_fault_fleet_pin_drift_nodes{cluster_id,kind}`, kind ∈ `NODE_STALE`/`PIN_AHEAD_OF_FLEET` (E5) |
+| `gpu_fault_processor_*` additions | `gpu_fault_processor_fault_rejections_total` (fault-layer events replayed after the ingress 202 and rejected with 4xx), `gpu_fault_processor_completions_by_path_status_total{path,status_class}` (also writes `CollectorStatus.errors` entries with the `rejected-event:` prefix, merged by the three Stores via `telemetry.merge_collector_status`: sticky timestamps, entries with that prefix are retained until `last_success_at` is later than `last_error_at`, the collector's own errors always follow the latest entry); `gpu_fault_processor_claim_last_round_timestamp_seconds` is emitted only when the processor snapshot carries that key |
+| `gpu_fault_notification_*` additions | `gpu_fault_notification_delivery_total{status}`, `gpu_fault_notification_oldest_pending_age_seconds` (Store-derived); process-level `gpu_fault_notification_expired_total`, `gpu_fault_notification_expired_last_seen_timestamp_seconds`, `gpu_fault_notification_dead_lettered_total`, `gpu_fault_notification_suppressed_drills_total`, `gpu_fault_notification_dispatch_last_cycle_timestamp_seconds`; result=FAILED has terminal-state semantics |
+| `gpu_fault_fleet_pin_drift_*` | `gpu_fault_fleet_pin_drift_nodes{cluster_id,kind}`, kind ∈ `NODE_STALE`/`PIN_AHEAD_OF_FLEET` |
 | Loop-liveness stamps | `gpu_fault_workflow_dispatch_last_cycle_timestamp_seconds`, `gpu_fault_periodic_last_cycle_timestamp_seconds`, `gpu_fault_periodic_job_last_run_timestamp_seconds{periodic_job}`, `gpu_fault_telemetry_spool_consumer_last_cycle_timestamp_seconds` (conditionally emitted); each process-level error counter is paired with `*_last_seen_timestamp_seconds` (`gpu_fault_workflow_dispatch_internal_error_*`, `gpu_fault_workflow_dispatch_failure_handling_abandoned_*`, `gpu_fault_periodic_lease_error_*`, `gpu_fault_periodic_job_error_*{periodic_job}`). Event times take MAX, event counts keep the process slot; the former expresses the most recent occurrence time, the latter takes rate/increase first and then sums, never merging the reset domains of different processes first. |
-| `gpu_fault_ingest_*` additions | `gpu_fault_ingest_unresolved_fault_signals_total{kind}`, current kinds are `unparsed_xid_line`/`unparsed_sxid_line`/`unclassified_sxid`; `hma_unschedulable_without_code` is kept only for compatibility with historical findings/notifications, there is no longer any HMA input. Not emitted when `fault_ingestion` is not bound to the context (G7). The `COLLECT_EVIDENCE` finding opened by it carries `runtime_profile_version` (source record → workload topology → node Agent registration, falling back in that order), otherwise the health family cannot even compile FREEZE_EVIDENCE (`no executable owner for evidenceCapture`) |
-| `gpu_fault_spare_reservations_*` | `gpu_fault_spare_reservations_active` (gauge), `gpu_fault_spare_reservations_reclaimed_total` (counter), taken from `HyperPodSpareHealthController.metrics_snapshot()`; `reclaimed_total` counts only the releases actually applied (a conditional patch; a reservation released after the read by the owner or by a scan that took over the task lease, or reserved again, only logs INFO `stale spare reservation already released: …` and is not counted); not emitted when the spare health controller is not enabled (A4) |
-| `gpu_fault_regional_registry_*` | `gpu_fault_regional_registry_secret_drift{service_role}`: 1 when the digest of the registry Secret copy the Pod mounts (refreshed by kubelet with the Secret; the startup copy on a release without the mount) disagrees with the durable head, so after a join/remove it returns to 0 within the kubelet sync period without a restart; not emitted for roles that do not run the registry runtime (H2) |
-| `gpu_fault_workflow_dispatch_wakeup*` | `gpu_fault_workflow_dispatch_wakeups_total{channel,process}` (channel ∈ `workflow_dispatch`/`remote_command`, the number of wakeups this process translated into early scans, take the per-process increment first and then sum), `gpu_fault_workflow_dispatch_wakeup_last_seen_timestamp_seconds` (most recent, MAX, E4), `gpu_fault_workflow_dispatch_wakeup_listener_connected{channel}` (1 when that channel's LISTEN thread is online, otherwise that channel falls back to pure polling; MIN, the Pod reads 0 if any process is disconnected). Both channels are always emitted, including 0 (performance A, §3.7 ④) |
+| `gpu_fault_ingest_*` additions | `gpu_fault_ingest_unresolved_fault_signals_total{kind}`, current kinds are `unparsed_xid_line`/`unparsed_sxid_line`/`unclassified_sxid`; `hma_unschedulable_without_code` is kept only for compatibility with historical findings/notifications, there is no longer any HMA input. Not emitted when `fault_ingestion` is not bound to the context. The `COLLECT_EVIDENCE` finding opened by it carries `runtime_profile_version` (source record → workload topology → node Agent registration, falling back in that order), otherwise the health family cannot even compile FREEZE_EVIDENCE (`no executable owner for evidenceCapture`) |
+| `gpu_fault_spare_reservations_*` | `gpu_fault_spare_reservations_active` (gauge), `gpu_fault_spare_reservations_reclaimed_total` (counter), taken from `HyperPodSpareHealthController.metrics_snapshot()`; `reclaimed_total` counts only the releases actually applied (a conditional patch; a reservation released after the read by the owner or by a scan that took over the task lease, or reserved again, only logs INFO `stale spare reservation already released: …` and is not counted); not emitted when the spare health controller is not enabled |
+| `gpu_fault_regional_registry_*` | `gpu_fault_regional_registry_secret_drift{service_role}`: 1 when the digest of the registry Secret copy the Pod mounts (refreshed by kubelet with the Secret; the startup copy on a release without the mount) disagrees with the durable head, so after a join/remove it returns to 0 within the kubelet sync period without a restart; not emitted for roles that do not run the registry runtime |
+| `gpu_fault_workflow_dispatch_wakeup*` | `gpu_fault_workflow_dispatch_wakeups_total{channel,process}` (channel ∈ `workflow_dispatch`/`remote_command`, the number of wakeups this process translated into early scans, take the per-process increment first and then sum), `gpu_fault_workflow_dispatch_wakeup_last_seen_timestamp_seconds` (most recent, MAX), `gpu_fault_workflow_dispatch_wakeup_listener_connected{channel}` (1 when that channel's LISTEN thread is online, otherwise that channel falls back to pure polling; MIN, the Pod reads 0 if any process is disconnected). Both channels are always emitted, including 0 (§3.7 ④) |
 | `gpu_fault_workflow_dispatch_tick_seconds` / `gpu_fault_workflow_dispatch_lease_*` | `gpu_fault_workflow_dispatch_tick_seconds{le,process}` (histogram: wall time of each tick this process ran holding the dispatch lease, or with the lease off, from taking the lease to the end of its batch; a tick that found the lease held elsewhere is not observed; the buckets include 7.5 s -- the half lease the derived batch is sized to -- and the shipped 15-s lease), `gpu_fault_workflow_dispatch_lease_acquisitions_total{process}` (times this process took the lease under a new epoch: from no holder, from a lapsed holder, or back after its own lapsed), `gpu_fault_workflow_dispatch_lease_losses_total{when,process}` (times this process found the lease it held taken by another process; when ∈ `mid_tick` (a checkpoint inside its tick, after which it stops) / `tick_start` (it was away longer than the lease)) -- all three PER_PROCESS, take rate/increase per process first and then sum; `gpu_fault_workflow_dispatch_lease_held` (1 while this process holds the lease by its own clock, 0 with the lease off; SUM: a Pod's value is its number of holders, the region's sum should be 1). All four are always emitted, including 0 (§3.7 ④; how to read them: [administrator operations §7](administrator-operations.md#7-troubleshooting-by-symptom)) |
 | Latest scan evidence | `gpu_fault_processor_counter_drift_scan_timestamp_seconds` and `gpu_fault_processor_counter_drift_scan_max_age_seconds`, paired per process with drift_abs/mismatched_clusters. The update time comes only from a real successful scan; the validity period is three configured cycles and at least 120 seconds. |
 | Terminal notification events | `gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds` records the time of actual terminal FAILED events from inline/outbox; repeatedly reading historical DEAD does not update it; it is not the count of retained FAILED rows. |
 | `gpu_fault_capacity_registered_*` | `gpu_fault_capacity_registered_cluster_node_count{cluster_id}` (a managed GPU cluster's registered GPU nodes: its fleet Agents in lifecycle `ACTIVE`/`DRAINING`, one series per cluster with at least one registered node, never per node) and `gpu_fault_capacity_registered_managed_node_count` (the sum over every managed cluster, 0 for an empty fleet). Rendered on the worker role only (a fleet_level contributor), merged ANY within the Pod (a process whose read failed renders neither family, so the merge answers with a sibling's recent publication, never with 0); they reuse the shared Agent-table scan of `metric_scan_cache`, tallied once per TTL, with no Store read of their own; synthetic capacity-drill clusters (`perf-cap-*`, `synthetic: true` in the registry) are left out. The alerts `GpuFaultClusterNodesExceedDeclaredTopology` / `GpuFaultManagedNodesExceedDeclaredTopology` (warning, 30 minutes) compare them with the declared `gpu_fault_capacity_largest_cluster_node_count` / `gpu_fault_capacity_managed_node_count` ([administrator capacity configuration §5.1](administrator-capacity-configuration.md#51-declared-topology-against-the-registered-gpu-fleet)) |
 
-The current census of the same in-memory three-role fixture is ingress 225, worker 264, spool-worker 224 families,
-each 3 families more than the 222/261/221 before this round of changes; the processor prefix is 111 in all three,
-the notification prefix is 8/12/8 respectively. Conditional metrics that are not enabled -- PostgreSQL, regional, refresh file, etc. --
+By role, the processor prefix is 120 families on worker and ingress (the spool-worker's active-active Processor adds the consume-loop
+liveness families), and the notification prefix is ingress 8 / worker 12 / spool-worker 8. Conditional metrics that are not enabled -- PostgreSQL, regional, refresh file, etc. --
 are not counted in these test-fixture numbers; the production inventory must still be checked separately against the actual assembly.
 
-The **data-plane components' own** families added by the 2026-09-08 data-plane review (scraped by each GPU cluster's `gpu-fault-adot-dataplane`,
+The **data-plane components' own** families (scraped by each GPU cluster's `gpu-fault-adot-dataplane`,
 series carry `gpu_cluster`; shared implementation `gpu_fault.dataplane_metrics`, stdlib HTTP server,
 port ≤ 0 disables it, a bind failure logs a single ERROR line without affecting the main loop):
 
 | Prefix | Port | Coverage |
 |---|---|---|
-| `gpu_fault_completion_*` | 9109 | Existing watcher family (`completion_metrics_server`), previously scraped by no one |
+| `gpu_fault_completion_*` | 9109 | The watcher family (`completion_metrics_server`) |
 | `gpu_fault_node_installer_*` | 9110 | reconciler, 12 series; counters count by **event** rather than re-accumulating per state each pass: `reconcile_passes_total` (only counts passes that ran to completion; a fail-closed pass does not move it), `nodes_seen_total`, `jobs_created_total` (counted at `budget.consume()`; a node whose annotation patch failed still counts the Job it received), `jobs_succeeded_total`, `jobs_failed_total` (counted only when Failed is first seen), `retries_scheduled_total`, `errors_total`; gauges `nodes_installed`, `nodes_retrying`, `nodes_pending`, `budget_in_flight`; timestamp `last_pass_completed_timestamp`. `/healthz` = heartbeat file fresh within 300 s |
 | `gpu_fault_cluster_executor_*` | 9111 | executor, 28 series (see §3.9 ⑩) |
 | `gpu_fault_node_resource_*` | — | Reserved for the node-resource collector; no endpoint yet |
 
-Corresponding new alerts: `GpuFaultProcessorFaultEventsRejected` (warning, 15-minute `increase()`>0,
+Corresponding alerts: `GpuFaultProcessorFaultEventsRejected` (warning, 15-minute `increase()`>0,
 take the per-process increment first and then sum) and `GpuFaultRegionalRegistrySecretDrift` (warning, drift persisting for 15 minutes).
 
 Comparison of the 7 suggested names with the implementation (checked one by one, **none exists**):
@@ -5355,14 +5357,14 @@ Comparison of the 7 suggested names with the implementation (checked one by one,
 | Suggested metric | Exists in the implementation | Closest substitute |
 |---|---|---|
 | `fault_events_total` | ✗ | No direct substitute. Ingress volume can only be inferred indirectly from `gpu_fault_processor_*` along the `path` dimension |
-| `quarantine_duration_seconds` | ✗ | None. Isolation duration can only be computed from incident/marker timestamps |
-| `remediation_runs_total` | ✗ | `gpu_fault_remote_command_total` (command granularity, not workflow granularity) |
-| `remediation_step_duration_seconds` | ✗ | None. Step durations exist only in logs |
-| `remediation_failures_total` | ✗ | The `gpu_fault_remote_command_executor_internal_errors_total` gauge and `gpu_fault_remote_command_executor_internal_error_last_seen_timestamp_seconds` (covers only the executor's own defects, not repair failures) |
+| `quarantine_duration_seconds` | ✗ | No direct substitute. `gpu_fault_closed_loop_milestone_*` with the `containment` / `readmission` milestones give the time from workflow creation to isolation and to readmission; one isolation's duration can only be computed from incident/marker timestamps |
+| `remediation_runs_total` | ✗ | `gpu_fault_workflow_total{status}` (persisted workflows by status); `gpu_fault_remote_command_total` is command granularity |
+| `remediation_step_duration_seconds` | ✗ | No per-step duration distribution. `gpu_fault_workflow_step_total` (step outcomes), `gpu_fault_workflow_step_waiting_seconds` (age of the oldest WAITING step) and `gpu_fault_workflow_duration_seconds` of terminal workflows; per-step durations exist only in logs |
+| `remediation_failures_total` | ✗ | `gpu_fault_workflow_total{status="FAILED"}`; the `gpu_fault_remote_command_executor_internal_errors_total` gauge and `gpu_fault_remote_command_executor_internal_error_last_seen_timestamp_seconds` cover only the executor's own defects, not repair failures |
 | `unknown_gpu_devices` | ✗ | `gpu_fault_policy_unknown_product_total` (unknown model count, similar semantics) |
 | `event_queue_lag_seconds` | ✗ | `gpu_fault_processor_queue_oldest_age_seconds` + `gpu_fault_remote_command_oldest_unclaimed_seconds` (**these two are the most useful lag metrics**) |
 
-The newly added closed-loop metrics include workflow status/step outcome/duration, containment/validation/
+The closed-loop metrics include workflow status/step outcome/duration, containment/validation/
 readmission/workload-restart milestones, remediation budget claim/wait, notification
 result/outbox depth and stale Agent. Still unimplemented are distributed tracing and a unified end-to-end latency from raw signal to
 finding.
@@ -5371,7 +5373,7 @@ The notification result metrics are read through a single aggregation call,
 `NotificationStore.notification_status_counts()`: PostgreSQL and
 SQLite use a single grouped `LEFT JOIN` and two batched reads respectively, and the Memory Store does a single traversal under the lock.
 outbox depth takes `notification_delivery_stats()["pending"]` already obtained in the same render, which contains only
-PENDING/RETRY/LEASED and no longer adds QUEUED to the retained FAILED results. The notification failure alert reads
+PENDING/RETRY/LEASED, not QUEUED or the retained FAILED results. The notification failure alert reads
 actual terminal failure events within 15 minutes; new failures cannot be inferred with `delta(FAILED retained row count)`.
 `/metrics` must not first `list_notifications()` and then call
 `get_notification_result()` one by one; that N+1 path lets tens of thousands of historical notifications push scrape latency to
@@ -5390,8 +5392,8 @@ hangs a shared scan cache on `AppRuntime`:
   attempt claims, `gpu_fault_stale_attempt_observations` only nodes that keep a stale observation; and for every
   cluster with an evaluated node it always emits `gpu_fault_attempt_observation_scan_nodes`,
   `gpu_fault_attempt_observation_scan_owned_nodes`, `gpu_fault_ambiguous_attempt_ownership_nodes` and
-  `gpu_fault_stale_attempt_observation_nodes` (label `cluster_id` only; the last two are 0 when healthy). Every
-  registered Agent used to be two lines in every publication (0 idle, 1 for a single owner): 25,600 lines at 12,800
+  `gpu_fault_stale_attempt_observation_nodes` (label `cluster_id` only; the last two are 0 when healthy). Two
+  lines per registered Agent in every publication (0 idle, 1 for a single owner) would be 25,600 lines at 12,800
   Agents. Both families keep their HELP/TYPE lines without samples: the Pod's ANY merge takes the first process that
   declares a family, so an empty family is this process's answer and a sibling's older publication cannot replace it.
 - Workflow detail reads go through `ControlPlaneStore.list_recent_workflows()`: non-terminal
@@ -5405,14 +5407,13 @@ hangs a shared scan cache on `AppRuntime`:
   `gpu_fault_workflow_scan_limit`, `gpu_fault_workflow_scan_window_seconds`,
   `gpu_fault_workflow_scan_size` and `gpu_fault_workflow_scan_truncated`.
   The three families step, duration and milestone are recomputed from the slice on every scrape (gauge/summary, stateless),
-  so the window is their sample population. The original implementation was `limit=100_000`, which was a memory cap rather than a
-  scrape budget.
+  so the window is their sample population.
 - `closed_loop_metrics` computes the six-hour milestone window on the same bounded slice by actual success time,
-  deduplicating on each workflow's first success; inherited steps add no new samples. Four new gauge families are added: window mean, count,
+  deduplicating on each workflow's first success; inherited steps add no new samples. Four more gauge families: window mean, count,
   complete and window-end timestamp; no delta is taken over the old summary, which evicts history. An empty window is mean=NaN, count=0, complete=1; truncation, lost history, time contradictions and
-  scan/retention boundaries shorter than six hours emit unknown. ClosedLoopSlow uses only complete non-empty windows from the past 120 seconds;
-  incomplete or missing windows are reported separately by ClosedLoopWindowIncomplete.
-- `gpu_fault_workflow_total` is changed to the database-side grouped aggregation `ControlPlaneStore.workflow_status_counts()`,
+  scan/retention boundaries shorter than six hours emit unknown. `GpuFaultClosedLoopSlow` uses only complete non-empty windows whose end lies within the past 120 seconds;
+  incomplete or missing windows are reported separately by `GpuFaultClosedLoopWindowIncomplete`.
+- `gpu_fault_workflow_total` comes from the database-side grouped aggregation `ControlPlaneStore.workflow_status_counts()`,
   so the census value is unaffected by the detail budget; only the three families step,
   duration and milestone are limited by the budget. Truncation persisting for 30 minutes is alerted by
   `GpuFaultWorkflowMetricScanTruncated`.
@@ -5423,31 +5424,30 @@ The completion count of `processor.rejected_events.record_replay_completion` sha
 entity IDs such as workflow, incident, attempt and fleet enter the route-family template and do not become
 permanently growing metric labels. Real request paths, queue contents and replay targets are unchanged.
 
-After the 2026-09-08 control-plane review the way `/metrics` is rendered also changed (A-6 / G-2 / G-12 / H2):
+How `/metrics` is rendered:
 
 - **contributor isolation**: each metric family is rendered by one registered contributor; a contributor that throws
   loses only its own families and is counted in `gpu_fault_metrics_contributor_errors_total{contributor}`, while the remaining families are emitted as
-  usual -- one broken read no longer turns the whole scrape into 0 lines and silences the `absent()`-style alerts along with it.
+  usual -- one broken read does not turn the whole scrape into 0 lines and silences the `absent()`-style alerts along with it.
 - **`fleet_level` role gating**: contributors that read cluster-level facts (closed loop, completion status, outbox, backlog, etc.)
   render only in roles with `background_services_enabled` (worker); ingress does not re-read
   the same table; alerts on such families must use `max by`, not `sum`.
-- **60s cache and two-segment slice**: the TTL of `metric_scan_cache` defaults to 60s (see above); workflow details are no longer
-  "all states newest-first" (no corresponding index, whole-kind sort), instead open states go through the executable/BLOCKED
+- **60s cache and two-segment slice**: the TTL of `metric_scan_cache` defaults to 60s (see above); workflow details are not read
+  "all states newest-first" (no corresponding index, a whole-kind sort); instead open states go through the executable/BLOCKED
   partial indexes and terminal states take the newest slice through `gpu_fault_workflow_updated_all`; whole-kind aggregations such as the orphan check, notification outbox,
   remote-command backlog and spool depth also enter the same cache, one read per TTL.
 - **Dedicated render thread**: `GET /metrics` renders on the per-process `gpu-fault-metrics` thread and does not compete with
-  the request path for the store I/O pool -- in the past, when the pool saturated, the scrape itself timed out, and the saturation alert lost samples exactly when it was needed most.
+  the request path for the store I/O pool -- otherwise, when the pool saturates, the scrape itself times out, and the saturation alert loses samples exactly when it is needed most.
   Concurrent scrapes within the same process queue up (this does not happen at ADOT's 15s interval).
-- New families: `gpu_fault_processor_consumer_running` (B-6, see §3.12),
-  `gpu_fault_ingress_decode_rejections_total{reason}` (E-3),
-  `gpu_fault_postgres_pool_*` (demand/max/requests_waiting/connection errors, G-7;
+- Related families: `gpu_fault_processor_consumer_running` (see §3.12),
+  `gpu_fault_ingress_decode_rejections_total{reason}`,
+  `gpu_fault_postgres_pool_*` (demand/max/requests_waiting/connection errors;
   the oversubscription ratio is a configuration constant, used only as a Control-plane capacity dashboard reading and a startup WARNING, no alert is set,
-  actual queueing is watched via `GpuFaultPostgresPoolCheckoutQueueing`), `gpu_fault_control_record_archive_*` (F-8).
+  actual queueing is watched via `GpuFaultPostgresPoolCheckoutQueueing`), `gpu_fault_control_record_archive_*`.
 - **Multi-process in-Pod aggregation** (`gpu_fault.app.process_metrics` + `gpu_fault.app.metric_aggregation`):
   ingress and control-worker run 4 uvicorn processes per Pod sharing one port; counters, gauges and timestamps in process memory are all
-  process-local, while ADOT scrapes the Pod -- DESTR-018 measured that 16 scrapes of the same Pod
-  landed on 7 process fingerprints, and the process that held the lease and actually counted `lifetime_exceeded_total` was never scraped once, so
-  alerts depending on that counter worked "by luck". Now every process writes its **complete** render result (family, labels, value) to
+  process-local, while ADOT scrapes the Pod and each scrape lands on one of its processes -- the process that holds the lease and
+  actually counts `lifetime_exceeded_total` may never be the one scraped, so alerts depending on that counter would work "by luck". So every process writes its **complete** render result (family, labels, value) to
   `/dev/shm/gpu-fault-process-metrics/<POD_UID>/<pid>.json` (written on every scrape it answers, plus a
   `gpu-fault-process-metrics` thread writes every 5 seconds, so the counting process need not be the answering process; writes use a
   temporary file + `os.replace`, a half-written file is never read), and the answering process merges its own **fresh** render with the sibling process files that pass the identity,
@@ -5508,8 +5508,8 @@ filtering in Python is forbidden:
 (`hyperpod_spares.HyperPodSpareCoordinator`) and the remote spare-health endpoint
 (`app/routes/regional.py`). Once the two implementations drift, "a spare refused locally is let through remotely" appears,
 and neither side reports the disagreement. In it,
-`incident.workflow_request_id is None` (a new event with no workflow attached yet) is now decided explicitly,
-no longer caught by `except (KeyError, TypeError)` -- that form would lump genuine parameter type defects and
+`incident.workflow_request_id is None` (a new event with no workflow attached yet) is decided explicitly,
+not caught by `except (KeyError, TypeError)` -- that form would lump genuine parameter type defects and
 the normal "no workflow yet" into the same branch.
 
 These metrics have no separate enable switch; they are always registered at app assembly; `GPU_FAULT_ENABLE_AMP` only controls whether
@@ -5565,8 +5565,8 @@ Region, and if there is no instance it asks each enabled Region listed by `ec2 d
 the first one with an instance is the home Region), `identitystore get-user-id` queries the home Region, and Grafana write operations stay in the workspace
 Region; the result is recorded in `admin_grant.identity_center_region`, `grafana_site_health` persists it as
 `spec.health.identityCenterRegion`, and the next deploy asks it directly without scanning again. When the operator pre-writes that key, only that Region is asked.
-On 2026-09-09 the production site's workspace was in us-west-2 and Identity Center in us-east-1; before scanning, deploy could only report
-`no IAM Identity Center instance is visible from us-west-2`, and nobody could log in to the dashboards. Corresponding test:
+When the workspace and the Identity Center home Region differ (say, the workspace in us-west-2 and Identity Center in us-east-1), without the scan
+deploy could only report `no IAM Identity Center instance is visible from <region>`, and nobody could log in to the dashboards. Corresponding test:
 `tests/admin/test_admin_grafana_admin_grant.py`.
 ### 10.3 Acceptance: Requirements → Case Matrix
 
@@ -5645,12 +5645,12 @@ coverage by mechanism + the scenario catalog enumerated entry by entry):
 
 | Command | Content |
 |---|---|
-| `make check` | `scripts/run_release_gates.py --mode check` in two phases: first `make check-static` (`scripts/run_static_gates.py`, ten gate groups **in parallel**: ruff / mypy / compile / architecture / contracts / safety / deployment / docs / yaml / shell), then `artifact-check` ∥ `test-parallel-release` in parallel (full `pytest -n $(PYTEST_XDIST_WORKERS)`, excluding `tests/test_artifact_consistency.py`); it no longer calls the docs-check / config-check / deploy-check make targets one by one in series |
+| `make check` | `scripts/run_release_gates.py --mode check`: a promtool preflight, then two phases: first `make check-static` (`scripts/run_static_gates.py`, ten gate groups **in parallel**: ruff / mypy / compile / architecture / contracts / safety / deployment / docs / yaml / shell), then `artifact-check` ∥ `test-parallel-release` in parallel (full `pytest -n $(PYTEST_XDIST_WORKERS)`, excluding `tests/test_artifact_consistency.py`); it does not call the docs-check / config-check / deploy-check make targets one by one in series |
 | `make docs-check` | `docs-static-check`, ten items: `doc-impact-check`, `impact-check`, `env-doc-check`, `case-index-check`, `manual-command-order-check`, `doc-reference-check`, `doc-anchor-check`, `fault-evidence-check`, `doc-facts-check`, `grafana-dashboards-check`, then the document contract test set |
-| `make coverage` | Requires an isolated PostgreSQL 16 test URL; collects non-PG coverage in parallel by `PYTEST_XDIST_WORKERS` (default `max(4, min(16, cpu_count//4))`, i.e. 4–16), then appends PG coverage serially, enforces `--cov-fail-under=78` uniformly, and finally runs the per-module floor with `ci_coverage_gate.py module-floors` |
+| `make coverage` | Requires an isolated PostgreSQL 16 test URL; collects non-PG coverage in parallel by `PYTEST_XDIST_WORKERS` (default `max(4, min(16, cpu_count//4))`, i.e. 4–16), then appends PG coverage serially, enforces `--fail-under=78` uniformly, and finally runs `ci_coverage_gate.py floors`: the per-module floors, the production combined floor, and the target of >= 95% statements and, separately, branches for both the production and the runner scope |
 | `make test-postgres` | Requires `GPU_FAULT_TEST_POSTGRES_URL`; without it, exits 2 immediately |
-| `make test-postgres-stress` | On top of `test-postgres`, fixed 8 workers × 40 rounds; the CAP-005 runner also creates an isolated database, produces JUnit, requires zero skips and is responsible for deleting it |
-| `make release-build` | Runs `check` and the PostgreSQL stress on a clean source tree; reuses or builds the OCI by the full image input digest, generates the Manifest/attestation and signs them |
+| `make test-postgres-stress` | On top of `test-postgres`, fixed 8 workers × 40 rounds (with `POSTGRES_TEST_PARALLEL=1` through the shards of `scripts/run_postgres_shards.py`); the CAP-005 runner also creates an isolated database, produces JUnit, requires zero skips and is responsible for deleting it |
+| `make release-build` | Runs the release mode of `run_release_gates.py` on a clean source tree (static, then the PostgreSQL stress, the full pytest run and artifact-check in parallel); reuses or builds the OCI by the full image input digest, generates the Manifest/attestation and signs them |
 | `make release-deploy` | By default verifies the signature and consumes `dist/current-attestation.json` and the bundle, then performs the deployment, verification and stability window |
 
 The coverage floor is not a single repository-level number. `coverage.module_floors` in `config/ci-unit-gate.json`
@@ -5663,14 +5663,14 @@ higher than `group_floor`, duplicate ids); a group that matches no file under te
 and `tests/test_ci_unit_gate.py` guarantees that every newly added deployment-only source file lands in
 some group. Only empty modules with no measurable points are excluded from the per-file ratio; a whole group with no measurable points still fails.
 The numerator uses the actual `covered_lines + covered_branches`; the partial-branch line count
-`num_partial_branches` cannot stand in for all uncovered branches; the 95% improvement targets for statements and branches are reported independently.
+`num_partial_branches` cannot stand in for all uncovered branches; the 95% targets for statements and for branches are computed and enforced separately (`tools/coverage_objectives.py::require_ci_coverage`).
 
 The test scale is not hard-coded in this document: `scripts/check-doc-facts.py` forbids the total file count of `tests/` from appearing as a literal
 (v1 §8 keeps only the recomputable structural assertion "`tests/regional/` is the largest"). **`make docs-check`
 only checks that the few document assertions declared in the `scripts/check-doc-facts.py` table agree with the code**; everything else still only checks that referenced
-paths/symbols exist, generated artifacts are in sync, and command order. A statement can be tied to one citation block of the document (a top-level list item or paragraph): the XID 45 evidence URL must sit in the citation that names the row "45 Robust Channel Preemptive Removal" -- the XID 63 citation uses the same URL, so a whole-document search would still pass after the XID 45 citation lost its link. The numbers in this document (264/277 metric families for the worker role,
-`regional_mode` off/on, 92 routes, 47 Store codec kinds, 20 notification types, 33 operations,
-81 declared indexes, 18 schema versions) were all obtained by assembling the real app, instantiating the Store codec or reading the
+paths/symbols exist, generated artifacts are in sync, and command order. A statement can be tied to one citation block of the document (a top-level list item or paragraph): the XID 45 evidence URL must sit in the citation that names the row "45 Robust Channel Preemptive Removal" -- the XID 63 citation uses the same URL, so a whole-document search would still pass after the XID 45 citation lost its link. The numbers in this document (311/324 metric families for the worker role,
+`regional_mode` off/on, 93 routes, 52 Store codec kinds, 23 notification types, 35 operations,
+77 declared indexes (`ddl.declared_index_names()`), 23 schema versions) were all obtained by assembling the real app, instantiating the Store codec or reading the
 machine sources and recounting; recount them after changing code. The route total, the five-bucket distribution and the
 per-module route tables are held to the really assembled app by
 `tests/test_documentation_contracts.py::test_docs_state_the_assembled_apps_route_count_and_buckets`; for the other numbers
@@ -5689,7 +5689,7 @@ This chapter is an **acceptance checklist**: every item mentioned in the recomme
 |---|---|---|
 | NVIDIA / AMD / Intel adapters, all three vendors | **NVIDIA only**. No ROCm, XGMI or Intel related code | Add on demand; the adapter boundary is already in place (§3.2) |
 | MIG as a first-class citizen | Appears only as the MIG prefix of `gpu_uuid`; no MIG-instance-level remediation | Gap; priority depends on whether the site uses MIG |
-| PCIe AER faults | `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER`, from batch 233 the link downtrain (235-238) and the correctable-error rate (1501), + `pci_bdfs`; **AER is not decoded** | Gap |
+| PCIe AER faults | `pcie_replay_total` / `DCGM_FI_DEV_PCIE_REPLAY_COUNTER` (202, graded on the current link's expected error rate), the link downtrain (235-238) and the correctable-error rate (1501), + `pci_bdfs` (`gpu_pcie_link_policy.py`); **AER is not decoded** | Gap |
 | Driver/firmware compatibility matrix | No matrix. The catalog is pinned at 610; the NVLink5 rule uses `driverBoundary: 575` | Gap; cross-generation upgrades need manual confirmation |
 | Dry run | The `/simulate` family **writes to the database**; it is not a dry run | Misleading name, watch out during integration testing; renaming touches the API |
 
@@ -5703,7 +5703,7 @@ This chapter is an **acceptance checklist**: every item mentioned in the recomme
 | CRDs carrying rules and state | No CRDs; everything is in Aurora | Intentional: the control plane does not hold the GPU cluster kubeconfig |
 | Leader election | None. Active-active + lease + fencing (§6.5) | Intentional, and more partition-tolerant than a leader |
 | Node retirement (Retired) | None. A hard constraint forbids calling the replace API | Hard constraint, not changed |
-| Cluster-level / fault-domain repair concurrency cap | Persistent remediation budget implemented (§9.5) | Closed; defaults to be tuned later by capacity evidence |
+| Cluster-level / fault-domain repair concurrency cap | The persistent remediation budget keeps workflows apart per node, job and fabric partition, and a per-cluster remediation storm breaker bounds a correlated fault; there is no fixed cluster or region concurrency number (§9.5) | Closed; no fixed cluster cap by design |
 | Rule hot-reload / validation / publish / rollback API | None. Rules are compile-time artifacts | Intentional: rules take part in `module_digest` and the consistency gate (§5.6) |
 | approve / cancel / pause endpoints | None. `SAFETY_PENDING` is **not** a manual approval state | Real gap; if the site requires manual release, new endpoints + a new state are needed |
 | Query health by GPU UUID | Only queryable by `(cluster_id, node_id)` | Minor gap |
@@ -5713,7 +5713,7 @@ This chapter is an **acceptance checklist**: every item mentioned in the recomme
 
 | Recommendation | Implementation |
 |---|---|
-| Separate tables for GPUDevice / FaultRule / RemediationPolicy / RemediationRun | Low-frequency objects land in `gpu_fault_objects (kind, key) → JSONB`; the Store codec registers 47 logical kinds; GPU hot state and the Processor queue/lane use dedicated tables in production dedicated mode (§4.4) |
+| Separate tables for GPUDevice / FaultRule / RemediationPolicy / RemediationRun | Low-frequency objects land in `gpu_fault_objects (kind, key) → JSONB`; the Store codec registers 52 logical kinds; GPU hot state and the Processor queue/lane use dedicated tables in production dedicated mode (§4.4) |
 | OperationAudit table | **Does not exist**. Audit facts are spread across three places: workflow objects, the Agent ledger and logs (§9.7) |
 | `dedupKey` / `policyVersion` fields on FaultEvent | Field names differ: dedup relies on `event_id` + the link table; versioning relies on `runtime_profile_version` / `SITE_METRIC_POLICY_VERSION` / the catalog version (§4.1 has a field-by-field mapping) |
 | The recommended YAML rule file (match/decision/workflow/approval/cooldown/maxAttempts) | The three concerns land in three places: the workflow is generated by `workflow_builder`, the approval equivalent is the fleet preflight, cooldown is the marker TTL (§5.3) |
@@ -5729,7 +5729,7 @@ This chapter is an **acceptance checklist**: every item mentioned in the recomme
 
 ### 11.5 Priority Recommendations
 
-Ranked by "impact × change cost", the top three are worth doing first:
+Ranked by "impact × change cost", the one worth doing first:
 
 1. **approve endpoint** (if the site requires manual release): the current substitute path (changing the pin / turning off a switch) is an operations
    action, neither auditable nor authorizable to a person.
