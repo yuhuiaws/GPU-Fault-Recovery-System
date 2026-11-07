@@ -10,6 +10,7 @@ that now says why it is not parked.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -55,9 +56,17 @@ def test_the_live_shape_is_parked_and_names_its_evidence() -> None:
 
     assert proof["parked"] is True, proof
     assert proof["provider"] == "eks-managed"
-    assert proof["groups"] == [
-        {"name": GROUP, "status": "ACTIVE", "desired": 0, "min": 0, "max": 2}
-    ], "only the group the selector covers is evidence; the CPU group is not"
+    assert [
+        {key: item[key] for key in ("name", "status", "desired", "min", "max")}
+        for item in proof["groups"]
+    ] == [{"name": GROUP, "status": "ACTIVE", "desired": 0, "min": 0, "max": 2}], (
+        "only the group the selector covers is evidence; the CPU group is not"
+    )
+    (group,) = proof["groups"]
+    assert group["instance_types"] == ["p5en.48xlarge"], "what its nodes are born as"
+    assert group["labels"]["gpu-fault.io/dcgm-hostengine"] == "host", (
+        "the group's declared labels are kept for the template's render node"
+    )
     assert proof["proven_by"] == [
         "eks:DescribeNodegroup status and scalingConfig",
         "Karpenter NodePools (none)",
@@ -229,9 +238,11 @@ def test_a_hyperpod_group_at_zero_beside_a_populated_one_does_not_park_the_clust
     )
 
     assert proof["parked"] is False, proof
-    assert proof["groups"] == [
-        {"name": "gpu-spot-group", "status": "InService", "target": 4, "current": 4}
-    ]
+    assert [
+        {key: item[key] for key in ("name", "status", "target", "current")}
+        for item in proof["groups"]
+    ] == [{"name": "gpu-spot-group", "status": "InService", "target": 4, "current": 4}]
+    assert proof["groups"][0]["instance_types"] == ["ml.p5en.48xlarge"]
     assert "instance group gpu-spot-group wants 4 instance(s)" in proof["reason"]
 
 
@@ -341,62 +352,93 @@ def _checks(proof: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def test_a_data_plane_release_is_refused_while_a_cluster_is_parked() -> None:
-    proof = _eks({GROUP: nodegroup()})
-    plan = ReleaseExecutionPlan(
-        nodes=(
-            ReleaseComponent.CPU_STAGE,
-            ReleaseComponent.EXECUTOR,
-            ReleaseComponent.AGENT,
+def _release(*cluster_ids: str) -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            clusters=[SimpleNamespace(cluster_id=item) for item in cluster_ids]
         )
     )
 
-    refusal = PARKED.release_refusal(_checks(proof), plan)
 
-    assert refusal is not None and refusal["status"] == "FAIL", refusal
-    assert refusal["name"] == "parked_gpu_clusters"
-    summary = refusal["summary"]
-    assert summary.startswith(
-        "GPU cluster(s) parked at zero nodes: gpu-eks-cluster;"
-    ), summary
-    assert "(executor, agent)" in summary, "names the GPU components it changes"
-    assert "gpu-fault-admin remove-cluster" in summary, "names both exits"
-    assert "let its nodes join" in summary
-    assert summary.endswith("Nothing was changed."), summary
-    assert refusal["details"]["parked"] == {"gpu-eks-cluster": proof}
+AGENT_WAVES = ReleaseExecutionPlan(
+    nodes=(
+        ReleaseComponent.CPU_STAGE,
+        ReleaseComponent.EXECUTOR,
+        ReleaseComponent.RECONCILER,
+        ReleaseComponent.AGENT,
+    )
+)
 
 
 @pytest.mark.parametrize(
-    "nodes",
+    "plan",
     [
-        (
-            ReleaseComponent.REGISTRY,
-            ReleaseComponent.CPU_STAGE,
-            ReleaseComponent.CPU_FINALIZE,
+        AGENT_WAVES,
+        ReleaseExecutionPlan(nodes=(ReleaseComponent.EXECUTOR,)),
+        ReleaseExecutionPlan(
+            nodes=(ReleaseComponent.REGISTRY, ReleaseComponent.CPU_FINALIZE)
         ),
-        (ReleaseComponent.OBSERVABILITY, ReleaseComponent.CPU_FINALIZE),
     ],
-    ids=["control-plane-only", "observability"],
+    ids=["agent-waves", "executor", "control-plane-only"],
 )
-def test_a_control_plane_release_proceeds_over_a_parked_cluster(
-    nodes: tuple[ReleaseComponent, ...],
+def test_no_release_kind_is_refused_while_another_cluster_has_nodes(
+    plan: ReleaseExecutionPlan,
 ) -> None:
+    """Zero GPU nodes affect only their own cluster: a parked cluster beside a
+    populated one never refuses a release."""
+
     proof = _eks({GROUP: nodegroup()})
 
     assert (
-        PARKED.release_refusal(_checks(proof), ReleaseExecutionPlan(nodes=nodes))
+        PARKED.release_refusal(
+            _release("gpu-a", "gpu-eks-cluster"), _checks(proof), plan
+        )
         is None
+    )
+
+
+def test_agent_waves_are_refused_only_when_no_cluster_has_a_node() -> None:
+    """The rollback of an Agent-wave release restores the control plane's Agent
+    pins from live Agents; with every cluster at zero there is none."""
+
+    proof = _eks({GROUP: nodegroup()})
+    release = _release("gpu-eks-cluster")
+
+    refusal = PARKED.release_refusal(release, _checks(proof), AGENT_WAVES)
+
+    assert refusal is not None and refusal["status"] == "FAIL", refusal
+    assert refusal["name"] == "zero_node_gpu_clusters"
+    assert refusal["summary"].startswith(
+        "every GPU cluster has zero nodes (gpu-eks-cluster): "
+    ), refusal["summary"]
+    assert refusal["summary"].endswith("Nothing was changed."), refusal["summary"]
+    executor_only = ReleaseExecutionPlan(nodes=(ReleaseComponent.EXECUTOR,))
+    assert PARKED.release_refusal(release, _checks(proof), executor_only) is None, (
+        "a release without Agent waves restores no Agent pin"
     )
 
 
 def test_an_unproven_cluster_is_not_reported_parked() -> None:
     proof = _eks({GROUP: nodegroup(desired=2)})
-    plan = ReleaseExecutionPlan(nodes=(ReleaseComponent.EXECUTOR,))
 
-    assert PARKED.release_refusal(_checks(proof), plan) is None, (
-        "a cluster that is not parked fails its own checks instead"
-    )
-    assert PARKED.parked_cluster_ids(_checks(proof)) == []
+    assert PARKED.zero_node_clusters(_checks(proof)) == {}
+    assert (
+        PARKED.release_refusal(_release("gpu-eks-cluster"), _checks(proof), AGENT_WAVES)
+        is None
+    ), "a cluster that is not parked fails its own checks instead"
+
+
+def test_reports_name_each_parked_cluster_with_its_state_and_groups() -> None:
+    proof = _eks({GROUP: nodegroup()})
+
+    (entry,) = PARKED.zero_node_clusters(_checks(proof)).values()
+
+    assert entry["state"] == "parked"
+    assert entry["provider"] == "eks-managed"
+    assert entry["reason"] == proof["reason"]
+    assert entry["groups"] == proof["groups"]
 
 
 def test_the_status_header_names_the_parked_cluster_and_its_groups() -> None:
@@ -409,4 +451,57 @@ def test_the_status_header_names_the_parked_cluster_and_its_groups() -> None:
         "managed node group the node selector covers is ACTIVE at desiredSize 0"
     ), line
     assert f"({GROUP}: desiredSize 0, min 0, max 2)" in line
-    assert "not a failure" in line and "refused until then" in line
+    assert "not a failure" in line, line
+    assert "join with the current release by themselves" in line, line
+
+
+# --- the render node and the snapshot entry ------------------------------------
+
+
+def test_the_render_node_carries_the_declared_group() -> None:
+    from types import SimpleNamespace
+
+    proof = _eks({GROUP: nodegroup()})
+    target = SimpleNamespace(
+        cluster_id="gpu-eks-cluster", provider="eks-managed", hyperpod_cluster_name=""
+    )
+
+    node = PARKED.render_node(proof, target)
+
+    labels = node["metadata"]["labels"]
+    assert labels["node.kubernetes.io/instance-type"] == "p5en.48xlarge"
+    assert labels["eks.amazonaws.com/nodegroup"] == GROUP
+    assert labels["gpu-fault.io/control-plane"] == SITE
+    assert labels["gpu-fault.io/dcgm-hostengine"] == "host"
+    assert node["status"]["addresses"] == [{"type": "InternalIP", "address": "0.0.0.0"}]
+    environment = PARKED.reconciler_environment(proof, target)
+    assert environment["GPU_FAULT_ZERO_NODE_CLUSTER"] == "true"
+    assert json.loads(environment["GPU_FAULT_ZERO_NODE_RENDER_NODE"]) == node
+
+
+def test_a_group_of_an_unknown_gpu_type_cannot_render_a_template() -> None:
+    from types import SimpleNamespace
+
+    group = {**nodegroup(), "instanceTypes": ["x9.huge"]}
+    proof = _eks({GROUP: group})
+    target = SimpleNamespace(
+        cluster_id="gpu-eks-cluster", provider="eks-managed", hyperpod_cluster_name=""
+    )
+
+    with pytest.raises(PARKED.ReleaseError, match="declare no GPU instance type"):
+        PARKED.render_node(proof, target)
+
+
+def test_the_snapshot_entry_has_no_identity_and_no_node() -> None:
+    proof = _eks({GROUP: nodegroup()})
+
+    entry = PARKED.zero_node_identity(proof)
+
+    assert entry["node_ids"] == []
+    assert PARKED.is_zero_node_identity(entry), entry
+    assert not PARKED.is_zero_node_identity({"node_ids": ["n"], "zero_nodes": {}}), (
+        "an entry with a node is a live identity"
+    )
+    assert PARKED.live_identities({"a": {"node_ids": ["n"]}, "b": entry}) == {
+        "a": {"node_ids": ["n"]}
+    }

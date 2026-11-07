@@ -6,9 +6,9 @@ checks (``regional_contexts``: no Kubernetes nodes; ``gpu_cluster``: no Ready
 "HyperPod" nodes; ``control_api``: no registered Node Agents) and every deploy
 was refused at preflight. A cluster proven parked is now a named state that
 does not fail, its own Deployments and executor still judged, and a release
-that does not touch the GPU data plane proceeds -- including its failure path:
-the automatic rollback's unscoped ``sync-state`` accepts the cluster too. A
-release that changes the GPU data plane is refused up front, naming the exits.
+of any kind proceeds -- including its failure path: the automatic rollback's
+unscoped ``sync-state`` accepts the cluster too. Only a release with Agent
+waves on a site where no GPU cluster has a node is refused up front.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from gpu_fault_release import regional_admin_checks as CHECKS
 from gpu_fault_release import regional_admin_checks_readiness as READINESS
 from gpu_fault_release import regional_admin_commands as ADMIN
 from gpu_fault_release import regional_deployment_inventory as INVENTORY
+from gpu_fault_release import regional_parked_cluster as PARKED
 from gpu_fault_release import regional_release_agent_set as AGENT_SET
 from gpu_fault_release import regional_release_fleet_rollout as FLEET
 from gpu_fault_release import regional_release_preflight as PREFLIGHT
@@ -50,6 +51,7 @@ from tests.regional._parked_cluster_support import (
     OWNERSHIP,
     SITE,
     ParkedSite,
+    agent,
     node,
 )
 
@@ -224,7 +226,9 @@ def test_a_parked_cluster_verifies_its_deployments_and_executor(
     assert any(
         "deployment/gpu-fault-cluster-executor" in call for call in release.execs
     ), "the executor's readiness and TLS path are still probed"
-    assert report["parked_gpu_clusters"] == [EKS], "the report names it at its top"
+    (entry,) = report["zero_node_clusters"].values()
+    assert list(report["zero_node_clusters"]) == [EKS], "named at the report's top"
+    assert entry["state"] == "parked" and entry["groups"][0]["name"] == GROUP
     assert report["healthy"] is True
 
 
@@ -339,9 +343,7 @@ def test_the_context_preflight_records_a_parked_cluster() -> None:
 
     proof = facts["providers"][EKS]["parked"]
     assert proof["parked"] is True, proof
-    assert proof["groups"] == [
-        {"name": GROUP, "status": "ACTIVE", "desired": 0, "min": 0, "max": 2}
-    ]
+    assert [(item["name"], item["desired"]) for item in proof["groups"]] == [(GROUP, 0)]
     assert site.iam == [EKS], "the executor IAM is judged as for every cluster"
     describes = [
         call
@@ -390,7 +392,8 @@ def test_status_names_the_parked_cluster_in_its_header_and_json(
     lines = ADMIN.status_header_lines(status, json_destination="status.json")
 
     assert status["healthy"] is True
-    assert status["parked_gpu_clusters"] == [EKS]
+    assert list(status["zero_node_clusters"]) == [EKS]
+    assert status["zero_node_clusters"][EKS]["state"] == "parked"
     assert "failing checks: none" in lines
     parked = [line for line in lines if line.startswith("parked GPU cluster")]
     assert parked and parked[0].startswith(
@@ -407,9 +410,15 @@ class PreflightSite(ParkedSite):
 
 
 def _deploy_preflight(
-    monkeypatch: pytest.MonkeyPatch, kind: str, changed: list[str]
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    changed: list[str],
+    *,
+    only_the_parked_cluster: bool = False,
 ) -> dict[str, Any]:
     site = PreflightSite()
+    if only_the_parked_cluster:
+        site.config.clusters = (site.eks,)
     proof = _cluster_section(site)["clusters"][EKS]["parked"]
     contexts = {
         "name": "regional_contexts",
@@ -445,28 +454,41 @@ def _deploy_preflight(
     return ADMIN.build_deploy_preflight_report(site)
 
 
-def test_a_data_plane_release_is_refused_at_preflight_while_a_cluster_is_parked(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "kind,changed",
+    [
+        ("CONTROL_PLANE_ONLY", ["cpu_ingress_manifests"]),
+        ("DATA_PLANE_COMPATIBLE", ["executor_wheel"]),
+        ("DATA_PLANE_COMPATIBLE", ["node_runtime_wheel", "node_bundle"]),
+    ],
+    ids=["control-plane-only", "executor", "agent-waves"],
+)
+def test_every_release_kind_passes_preflight_beside_a_parked_cluster(
+    monkeypatch: pytest.MonkeyPatch, kind: str, changed: list[str]
 ) -> None:
-    report = _deploy_preflight(monkeypatch, "DATA_PLANE_COMPATIBLE", ["executor_wheel"])
+    """Zero GPU nodes affect only their own cluster."""
 
-    assert report["healthy"] is False, report
-    refusal = next(
-        item for item in report["checks"] if item["name"] == "parked_gpu_clusters"
-    )
-    assert refusal["status"] == "FAIL"
-    assert refusal["summary"].endswith("Nothing was changed."), refusal["summary"]
+    report = _deploy_preflight(monkeypatch, kind, changed)
+
+    assert report["healthy"] is True, report
+    assert list(report["zero_node_clusters"]) == [EKS]
 
 
-def test_a_control_plane_release_passes_preflight_over_a_parked_cluster(
+def test_agent_waves_are_refused_at_preflight_when_no_cluster_has_a_node(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report = _deploy_preflight(
-        monkeypatch, "CONTROL_PLANE_ONLY", ["cpu_ingress_manifests"]
+        monkeypatch,
+        "DATA_PLANE_COMPATIBLE",
+        ["node_runtime_wheel", "node_bundle"],
+        only_the_parked_cluster=True,
     )
 
-    assert report["healthy"] is True, report
-    assert report["parked_gpu_clusters"] == [EKS]
+    assert report["healthy"] is False, report
+    refusal = next(
+        item for item in report["checks"] if item["name"] == "zero_node_gpu_clusters"
+    )
+    assert refusal["summary"].endswith("Nothing was changed."), refusal["summary"]
 
 
 def test_the_cpu_roll_inventory_holds_a_parked_cluster_with_no_agents(
@@ -482,7 +504,8 @@ def test_the_cpu_roll_inventory_holds_a_parked_cluster_with_no_agents(
     sets = FLEET.capture_active_agent_node_sets(ParkedSite())
 
     assert sets == {HYPERPOD: {"node_ids": ["node-a"]}, EKS: {"node_ids": []}}
-    assert "parked-gpu-cluster" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "zero-node-gpu-cluster" in err and "step=active_agent_node_sets" in err, err
     with pytest.raises(ReleaseError, match=f"missing clusters: {EKS}$"):
         FLEET.capture_active_agent_node_sets(ParkedSite(desired=2))
 
@@ -500,49 +523,49 @@ def identity_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_sync_state_accepts_a_parked_cluster_and_a_release_snapshot_refuses_it(
-    identity_probe: None,
+def test_the_agent_snapshot_records_a_parked_cluster_as_an_explicit_entry(
+    identity_probe: None, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    identities = AGENT_SET.capture_agent_identities_matching_nodes(
-        ParkedSite(), accept_parked=True
-    )
-    assert list(identities) == [HYPERPOD], "the parked cluster has no identity to keep"
+    identities = AGENT_SET.capture_agent_identities_matching_nodes(ParkedSite())
 
-    with pytest.raises(ReleaseError) as refused:
-        AGENT_SET.capture_agent_identities_matching_nodes(ParkedSite())
-    message = str(refused.value)
-    assert message.startswith(f"{EKS} is parked at zero GPU nodes ("), message
-    assert "gpu-fault-admin remove-cluster" in message
-    assert message.endswith("nothing of the GPU data plane was changed"), message
+    assert identities[HYPERPOD]["node_ids"] == ["node-a"]
+    entry = identities[EKS]
+    assert PARKED.is_zero_node_identity(entry), entry
+    assert entry["zero_nodes"]["state"] == "parked"
+    assert entry["zero_nodes"]["groups"][0]["name"] == GROUP
+    err = capsys.readouterr().err
+    assert "zero-node-gpu-cluster" in err and f"cluster={EKS}" in err, err
 
 
-def test_a_cluster_without_agents_that_is_not_parked_still_refuses_sync_state(
+def test_a_cluster_without_agents_that_is_not_parked_still_refuses_the_snapshot(
     identity_probe: None,
 ) -> None:
     with pytest.raises(
         ReleaseError, match=f"{EKS} has no active Agent identity to capture"
     ):
-        AGENT_SET.capture_agent_identities_matching_nodes(
-            ParkedSite(desired=2), accept_parked=True
-        )
+        AGENT_SET.capture_agent_identities_matching_nodes(ParkedSite(desired=2))
 
 
-class CaptureReached(Exception):
-    """Raised by the spy once the previous-state capture asks for the Agents."""
-
-
-def test_only_a_planless_capture_accepts_a_parked_cluster(
-    monkeypatch: pytest.MonkeyPatch,
+def test_live_agents_on_nodes_the_selector_dropped_still_gate(
+    identity_probe: None,
 ) -> None:
-    """``sync-state`` captures without a plan and keeps nothing of it
-    (``previous=None``); a release captures with its plan, as its snapshot."""
+    """A misconfiguration, not a park: the node group lost its label, the
+    selector selects nothing, the Agents are live. The snapshot refuses and
+    the status coverage reports the drift."""
 
-    seen: list[bool] = []
+    site = ParkedSite(records=[agent(HYPERPOD, "node-a"), agent(EKS, "ip-10-0-1-10")])
+    with pytest.raises(ReleaseError):
+        AGENT_SET.capture_agent_identities_matching_nodes(site)
+    report = _cluster_section(site)
+    section = report["clusters"][EKS]
+    section["agents"] = [{"node_id": "ip-10-0-1-10", "lifecycle_state": "ACTIVE"}]
+    with pytest.raises(ReleaseError, match=f"{EKS} Agent coverage drift"):
+        check_agent_coverage(EKS, section)
 
-    def spy(_release: Any, *, accept_parked: bool) -> dict[str, Any]:
-        seen.append(accept_parked)
-        raise CaptureReached
 
+def test_a_release_snapshot_carries_the_parked_entry(
+    identity_probe: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     site = ParkedSite()
     site.state = {
         "release_id": "live",
@@ -563,12 +586,13 @@ def test_only_a_planless_capture_accepts_a_parked_cluster(
     monkeypatch.setattr(
         STATE, "capture_previous_monitoring", lambda *_a, **_k: ({}, OLD_IMAGE)
     )
-    monkeypatch.setattr(AGENT_SET, "capture_agent_identities_matching_nodes", spy)
-    for plan in (None, ReleaseExecutionPlan(nodes=(ReleaseComponent.EXECUTOR,))):
-        with pytest.raises(CaptureReached):
-            STATE.capture_previous(site, plan)
 
-    assert seen == [True, False]
+    previous = STATE.capture_previous(
+        site, ReleaseExecutionPlan(nodes=(ReleaseComponent.AGENT,))
+    )
+
+    assert PARKED.is_zero_node_identity(previous["agent_identities"][EKS]), previous
+    assert previous["agent_identities"][HYPERPOD]["node_ids"] == ["node-a"]
 
 
 # --- the failure path of a CONTROL_PLANE_ONLY release ----------------------------
@@ -628,12 +652,33 @@ def test_the_deploy_record_names_the_parked_clusters(tmp_path: Any) -> None:
     report_path = tmp_path / "verify.json"
     report_path.write_text("{}", encoding="utf-8")
 
+    entry = {"state": "parked", "reason": "r", "groups": [], "provider": "eks-managed"}
     metadata = release_deploy_evidence.verification_metadata(
-        report_path, {"summary": {"FAIL": 0}, "parked_gpu_clusters": [EKS]}
+        report_path, {"summary": {"FAIL": 0}, "zero_node_clusters": {EKS: entry}}
     )
     stability = release_deploy_evidence.verification_metadata(
         report_path, {"summary": {"FAIL": 0}}
     )
 
-    assert metadata["parked_gpu_clusters"] == [EKS]
-    assert "parked_gpu_clusters" not in stability, "only a report that says so"
+    assert metadata["zero_node_clusters"] == {EKS: entry}
+    assert "zero_node_clusters" not in stability, "only a report that says so"
+
+
+def test_the_source_deploy_success_record_reads_the_zero_node_clusters(
+    tmp_path: Any,
+) -> None:
+    """``source-deploy-success.json`` carries what the release record's verify
+    named, outside its ``live`` evidence (which the next run compares)."""
+
+    from scripts import staging_deploy
+
+    entry = {"state": "parked", "reason": "r", "groups": [], "provider": "eks-managed"}
+    record = tmp_path / "release-deploy" / "release-b" / "state.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        json.dumps({"verification": {"zero_node_clusters": {EKS: entry}}}),
+        encoding="utf-8",
+    )
+
+    assert staging_deploy.release_record_zero_node_clusters(tmp_path) == {EKS: entry}
+    assert staging_deploy.release_record_zero_node_clusters(tmp_path / "none") is None

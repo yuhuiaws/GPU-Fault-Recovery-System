@@ -45,6 +45,7 @@ if __package__:
         LiveEvidenceError,
         RuntimeProfileChangePending,
         collect_live_deploy_evidence,
+        latest_release_record,
         live_evidence_from_release_record,
         read_live_status,
         successful_source_live_matches,
@@ -84,6 +85,7 @@ else:
         LiveEvidenceError,
         RuntimeProfileChangePending,
         collect_live_deploy_evidence,
+        latest_release_record,
         live_evidence_from_release_record,
         read_live_status,
         successful_source_live_matches,
@@ -485,6 +487,7 @@ def record_successful_source_deploy(
     signing: SigningMaterial,
     mode: str,
     live_evidence: Mapping[str, object],
+    zero_node_clusters: Mapping[str, object] | None = None,
 ) -> Path:
     state_path, signature_path = source_success_paths(state_dir)
     application = identities.get("application")
@@ -515,6 +518,13 @@ def record_successful_source_deploy(
         },
         "site_file": str(state_dir / "site.yaml"),
         "live": dict(live_evidence),
+        # The release's GPU clusters without nodes; outside ``live``, which the
+        # next run compares key for key and must not reclassify on.
+        **(
+            {"zero_node_clusters": dict(zero_node_clusters)}
+            if zero_node_clusters is not None
+            else {}
+        ),
     }
     temporary_state = state_path.with_suffix(".tmp")
     temporary_signature = signature_path.with_suffix(".tmp")
@@ -996,8 +1006,32 @@ def apply_source_deploy(
         signing=signing,
         mode=mode,
         live_evidence=evidence,
+        zero_node_clusters=(
+            release_record_zero_node_clusters(state_dir)
+            if mode == "APPLICATION_RELEASE"
+            else None
+        ),
     )
     return mode, evidence
+
+
+def release_record_zero_node_clusters(state_dir: Path) -> dict[str, object] | None:
+    """The GPU clusters the release just verified without nodes (state,
+    reason, groups), from the release driver's record; ``None`` without one."""
+
+    try:
+        record = json.loads(
+            latest_release_record(state_dir).read_text(encoding="utf-8")
+        )
+    except (LiveEvidenceError, OSError, ValueError):
+        return None
+    verification = record.get("verification") if isinstance(record, dict) else None
+    value = (
+        verification.get("zero_node_clusters")
+        if isinstance(verification, dict)
+        else None
+    )
+    return dict(value) if isinstance(value, dict) else None
 
 
 def release_record_evidence(state_dir: Path) -> dict[str, object] | None:

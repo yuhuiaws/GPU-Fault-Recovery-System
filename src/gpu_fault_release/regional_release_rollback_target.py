@@ -10,6 +10,7 @@ from gpu_fault.node_installer_rendering import (
     validate_node_dependencies,
 )
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_dcgm import captured_dcgm_hostengine
 from gpu_fault_release.regional_release_diff import ReleaseComponent
@@ -18,6 +19,7 @@ from gpu_fault_release.regional_release_images import (
     previous_node_dependency_environment,
     previous_node_template_environment,
 )
+from gpu_fault_release.regional_release_gpu_rollout import deploy_reconciler_of_cluster
 from gpu_fault_release.regional_release_legacy import validate_rollback_agent_identity
 from gpu_fault_release.regional_release_node_scope import served_node_scope
 from gpu_fault_release.regional_release_rollback_context import (
@@ -193,15 +195,24 @@ def rollback_target(
         agent_identity = (previous.get("agent_identities") or {}).get(
             target.cluster_id
         ) or {}
-        legacy_agent_identity = validate_rollback_agent_identity(
-            target.cluster_id,
-            agent_identity,
-            metadata=previous.get("metadata") or {},
-            artifact=artifact,
-            compatibility=node_compatibility,
-            config_digest=config_digest,
-            runtime_profile_version=runtime_profile_version,
-        )
+        if parked_cluster.is_zero_node_identity(agent_identity):
+            # The release started without a node here: there is no Agent
+            # identity to restore. Still without a node, only the steady-state
+            # Reconciler rolls back (the node runtime's zero-node path); a node
+            # that joined since is a newcomer the previous runtime is rolled
+            # onto like any wave node, against the previous pins.
+            legacy_agent_identity = False
+            agent_identity = {}
+        else:
+            legacy_agent_identity = validate_rollback_agent_identity(
+                target.cluster_id,
+                agent_identity,
+                metadata=previous.get("metadata") or {},
+                artifact=artifact,
+                compatibility=node_compatibility,
+                config_digest=config_digest,
+                runtime_profile_version=runtime_profile_version,
+            )
         self._roll_node_runtime(
             target,
             phase="rollback",
@@ -220,7 +231,7 @@ def rollback_target(
             steady_template_config_map=old.get("template"),
             node_installer_image=node_installer_image,
             allow_legacy_identity=legacy_agent_identity,
-            agent_identity=agent_identity,
+            agent_identity=agent_identity or None,
         )
     elif ReleaseComponent.RECONCILER in components:
         missing = [name for name in ("reconciler_wheel", "bundle") if not old.get(name)]
@@ -229,8 +240,10 @@ def rollback_target(
                 f"{target.cluster_id} previous Reconciler resources are missing: "
                 + ", ".join(missing)
             )
-        self._deploy_reconciler(
+        deploy_reconciler_of_cluster(
+            self,
             target,
+            phase="rollback",
             wheel_cm=old["reconciler_wheel"],
             bundle_cm=old["bundle"],
             artifact_sha=artifact,

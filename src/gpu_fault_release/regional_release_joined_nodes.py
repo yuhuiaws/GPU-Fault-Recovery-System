@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from gpu_fault.cluster_scope import node_selector, selector_matches
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release.regional_release_config import ClusterTarget
 from gpu_fault_release.regional_release_gpu_rollout import (
     agents_converged,
@@ -68,13 +69,20 @@ def _now() -> str:
 
 
 def captured_node_ids(state: object, cluster_id: str) -> frozenset[str] | None:
-    """The node set the release captured for ``cluster_id``; None without one."""
+    """The node set the release captured for ``cluster_id``; None without one.
+
+    A cluster the release found without nodes (``regional_parked_cluster``) was
+    captured with none: every node that joins it during the release is a
+    newcomer, installed by the steady-state Reconciler with the release's own
+    node runtime."""
 
     previous = state.get("previous") if isinstance(state, Mapping) else None
     identities = (
         previous.get("agent_identities") if isinstance(previous, Mapping) else None
     )
     identity = identities.get(cluster_id) if isinstance(identities, Mapping) else None
+    if parked_cluster.is_zero_node_identity(identity):
+        return frozenset()
     nodes = identity.get("node_ids") if isinstance(identity, Mapping) else None
     if not isinstance(nodes, list) or not nodes:
         return None

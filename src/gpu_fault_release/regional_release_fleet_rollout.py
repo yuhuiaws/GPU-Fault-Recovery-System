@@ -672,10 +672,11 @@ def capture_active_agent_node_sets(release: RegionalRelease) -> dict[str, AgentN
         if proof is None:
             missing.append(cluster_id)
             continue
-        narrate_step(
-            "parked-gpu-cluster",
-            cluster=cluster_id,
-            check="active_agent_node_sets",
+        parked_cluster.narrate(
+            cluster_id,
+            state=parked_cluster.PARKED,
+            step="active_agent_node_sets",
+            recorded="no live Agent to wait for",
             reason=json.dumps(str(proof.get("reason"))),
         )
         result[cluster_id] = {"node_ids": []}
@@ -1203,7 +1204,11 @@ def deploy_reconciler(
     node_installer_image: str | None = None,
     node_dependency_target: NodeDependencyTarget = NodeDependencyTarget.CANDIDATE,
     node_scope: Mapping[str, str] | None = None,
+    zero_nodes: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
+    # ``zero_nodes``: the proof of a cluster without nodes (parked); the script
+    # then requires, keys and preflights no node and renders its installer
+    # template from the node its groups declare (``regional_parked_cluster``).
     # The Reconciler's own knob is a count of nodes it may install on at once,
     # so it can never be the "auto" sentinel: a caller that does not hand a
     # wave policy (the Reconciler-only component path) gets the conservative
@@ -1236,6 +1241,8 @@ def deploy_reconciler(
         node_scope=node_scope,
     )
     pin_installer_version(environment, release, target, node_dependency_target)
+    if zero_nodes is not None:
+        environment.update(parked_cluster.reconciler_environment(zero_nodes, target))
     release._settle_installer_jobs(target)
     environment["GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT"] = "false"
     # Product reports are diagnostic, not authorization to skip fresh key

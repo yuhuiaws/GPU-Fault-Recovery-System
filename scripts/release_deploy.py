@@ -1166,6 +1166,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "stability": state.get("stability"),
                 "release_summary": state.get("release_summary"),
                 "completion_warnings": state.get("completion_warnings", []),
+                # GPU clusters the release found without nodes (state, reason,
+                # groups), as its verify named them.
+                "zero_node_clusters": (
+                    (state.get("verification") or {}).get("zero_node_clusters") or {}
+                ),
             },
             indent=2,
             sort_keys=True,

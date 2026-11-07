@@ -30,7 +30,9 @@ NodePools of the automatic-update advisory -- so it needs no new permission;
 it is asked only of a cluster whose node list is empty, at most once per
 report snapshot, and never carried from one step of a release to the next.
 
-What a parked cluster changes; everything else is judged as for any cluster:
+Zero GPU nodes affect only their own cluster: never a deploy or an upgrade of
+the site, never another GPU cluster or the CPU control plane. What a parked
+cluster changes; everything else is judged as for any cluster:
 
 * ``regional_contexts`` records ``providers.<id>.parked`` and skips only the
   Agent-endpoint CIDR coverage of nodes, of which there are none;
@@ -39,14 +41,22 @@ What a parked cluster changes; everything else is judged as for any cluster:
 * ``control_api``: zero Ready nodes against zero counted Agents is complete
   coverage; fleet readiness and collector readiness are not asked
   (``parked_not_awaited``);
-* every report lists the parked clusters (``parked_gpu_clusters``), and so do
-  the ``status`` header (``status_lines``) and the deploy record;
-* the Agent node inventory of a release (the CONTROL_PLANE_ONLY ingress roll)
-  and ``sync-state`` -- the last step of every automatic rollback -- accept the
-  cluster without Agents;
-* a release that changes the GPU data plane snapshots and rolls every
-  cluster's Agents, and a parked cluster has none: its deploy preflight
-  refuses before anything is changed (``release_refusal``), naming the exits.
+* every report names it (``zero_node_clusters``: state, reason, groups), and so
+  do the ``status`` header (``status_lines``) and the deploy record;
+* every release kind proceeds. Its cluster-level components roll and are
+  verified as usual; its node work is skipped and recorded
+  (``record_node_work_skipped``, the ``zero-node-gpu-cluster`` log lines): the
+  Agent snapshot holds an explicit entry with no identity and no node
+  (``zero_node_identity``), and there is no node preflight batch, fleet
+  rollout, wave or Agent wait. Its steady-state Reconciler rolls with the
+  release's node runtime, the installer template rendered from a node of the
+  declared group (``render_node``), so a node that joins later installs the
+  current release. The CPU roll's heartbeat barrier, the rollback (the
+  Reconciler alone; Agent pins from the clusters with live Agents), the resume
+  and ``sync-state`` all carry the entry;
+* only a release with Agent waves while every GPU cluster has zero nodes is
+  refused at its deploy preflight (``release_refusal``): its rollback could not
+  derive the Agent pins from any live Agent.
 
 Scaling back up needs no command: the group's ownership label reaches the new
 nodes, the executor's node-key sync attests them, the steady-state Reconciler
@@ -59,6 +69,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, cast
@@ -66,32 +77,61 @@ from typing import Any, cast
 from gpu_fault.admin.automatic_node_updates import KARPENTER_NODEPOOLS
 from gpu_fault.admin.bootstrap_ownership import hyperpod_groups_for_selector
 from gpu_fault.cluster_scope import (
+    EKS_NODEGROUP_LABEL,
+    HYPERPOD_CLUSTER_LABEL,
+    HYPERPOD_INSTANCE_GROUP_LABEL,
+    INSTANCE_TYPE_LABEL,
     is_eks_managed,
     node_selector,
     selector_matches,
     selector_ownership_value,
     selector_requirements,
 )
+from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from gpu_fault.eks_node_repair import nodegroup_hosts_gpu_nodes, selected_nodegroup
 from gpu_fault_release import regional_release_state as release_state
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
-    GPU_SNAPSHOT_COMPONENTS,
+    ReleaseComponent,
     ReleaseExecutionPlan,
 )
+from gpu_fault_release.regional_release_narration import narrate_step
 
 #: The key of a cluster's proof in check details (``regional_contexts``
 #: ``providers.<id>``, ``control_api`` ``clusters.<id>``, ``gpu_cluster:<id>``).
 PARKED_KEY = "parked"
-#: Report key: the ids of every parked cluster the report's checks proved.
-PARKED_CLUSTERS_KEY = "parked_gpu_clusters"
+#: Report, status and release-state key: cluster id -> what is known of a
+#: cluster without nodes (``state``, ``provider``, ``reason``, ``groups``; the
+#: release state adds what the release skipped there).
+ZERO_NODE_KEY = "zero_node_clusters"
+#: The state of a cluster whose provider declares zero capacity.
+PARKED = "parked"
+#: An Agent identity entry's key for a cluster without nodes (no identity).
+ZERO_NODES_IDENTITY_KEY = "zero_nodes"
 #: Collector readiness evidence: the parked clusters it did not wait for.
 NOT_AWAITED_KEY = "parked_not_awaited"
-#: The deploy preflight check a GPU data-plane release fails while one is parked.
-CHECK = "parked_gpu_clusters"
+#: The deploy preflight check a release fails when no GPU cluster has a node.
+CHECK = "zero_node_gpu_clusters"
+#: The ``narrate_step`` kind of every line about a cluster without nodes.
+NARRATION = "zero-node-gpu-cluster"
+#: The node-level work a release skips on a cluster without nodes.
+SKIPPED_NODE_WORK = (
+    "agent-snapshot",
+    "node-preflight-batch",
+    "fleet-rollout",
+    "agent-waves",
+    "agent-wait",
+)
+#: The script switch and the node the installer template is rendered from.
+ZERO_NODE_CLUSTER_ENV = "GPU_FAULT_ZERO_NODE_CLUSTER"
+RENDER_NODE_ENV = "GPU_FAULT_ZERO_NODE_RENDER_NODE"
+RENDER_NODE_NAME = "gpu-fault-zero-node-template"
+RENDER_NODE_UID = "00000000-0000-0000-0000-000000000000"
+RENDER_NODE_ADDRESS = "0.0.0.0"
 EKS_MANAGED = "eks-managed"
 HYPERPOD = "hyperpod"
 _REASON_LIMIT = 300
+_STATE_LOCK = threading.Lock()
 
 #: ``sagemaker describe-cluster`` reduced to the cluster's binding and, per
 #: instance group, what the automatic-update advisory and the parked proof
@@ -174,6 +214,24 @@ def eks_parked(
             "desired": _count(_mapping(group.get("scalingConfig")).get("desiredSize")),
             "min": _count(_mapping(group.get("scalingConfig")).get("minSize")),
             "max": _count(_mapping(group.get("scalingConfig")).get("maxSize")),
+            # What a node of the group is born with: the installer template of
+            # a cluster without nodes is rendered from them (``render_node``).
+            "instance_types": [
+                str(item)
+                for item in (
+                    *(group.get("instanceTypes") or ()),
+                    *(
+                        (group.get("instanceType"),)
+                        if group.get("instanceType")
+                        else ()
+                    ),
+                )
+                if item
+            ],
+            "labels": {
+                str(key): str(value)
+                for key, value in _mapping(group.get("labels")).items()
+            },
         }
         for name, group in sorted(described.items())
         if isinstance(group, Mapping) and nodegroup_hosts_gpu_nodes(group, selector)
@@ -345,6 +403,15 @@ def hyperpod_parked(
             "status": str(group.get("Status") or ""),
             "target": _count(group.get("TargetCount")),
             "current": _count(group.get("CurrentCount")),
+            "instance_types": (
+                [str(group["InstanceType"])] if group.get("InstanceType") else []
+            ),
+            "labels": {
+                str(key): str(value)
+                for key, value in _mapping(
+                    _mapping(group.get("KubernetesConfig")).get("CurrentLabels")
+                ).items()
+            },
         }
         for group in groups
         if isinstance(group, Mapping)
@@ -503,6 +570,63 @@ def _snapshot(release: Any) -> AbstractContextManager[Any]:
     return nullcontext()
 
 
+def _selected_nodes(release: Any, target: Any) -> list[Mapping[str, Any]] | None:
+    """The nodes ``target``'s selector selects; ``None`` when unreadable."""
+
+    try:
+        selector = node_selector(target)
+        listing = release._get_json(
+            release._gpu(target, "get", "nodes", "-l", selector)
+        )
+        return [
+            item
+            for item in listing.get("items") or ()
+            if isinstance(item, Mapping)
+            and selector_matches(_mapping(item.get("metadata")).get("labels"), selector)
+        ]
+    except Exception:  # noqa: BLE001 - an unreadable node list proves nothing
+        return None
+
+
+def recorded_zero_nodes(release: Any, target: Any) -> dict[str, Any] | None:
+    """The proof the release snapshot recorded for ``target`` when the release
+    started without a node there (``zero_node_identity``), else ``None``."""
+
+    state = getattr(release, "state", None)
+    previous = state.get("previous") if isinstance(state, Mapping) else None
+    identities = _mapping(_mapping(previous).get("agent_identities"))
+    identity = identities.get(str(target.cluster_id))
+    if not is_zero_node_identity(identity):
+        return None
+    entry = _mapping(_mapping(identity).get(ZERO_NODES_IDENTITY_KEY))
+    return {
+        "parked": entry.get("state") == PARKED,
+        "provider": entry.get("provider"),
+        "reason": entry.get("reason"),
+        "groups": [dict(_mapping(item)) for item in entry.get("groups") or ()],
+    }
+
+
+def zero_nodes_now(release: Any, target: Any) -> dict[str, Any] | None:
+    """The proof a release step skips ``target``'s node work on, else ``None``.
+
+    The provider's proof read now (``parked_without_nodes``) or, when that read
+    fails, the one the release snapshot recorded while the cluster still
+    selects no node: a step of a release that started on a parked cluster --
+    its rollback above all -- is not held up by a provider read that failed.
+    """
+
+    proof = parked_without_nodes(release, target)
+    if proof is not None:
+        return proof
+    recorded = recorded_zero_nodes(release, target)
+    if recorded is None or recorded.get("parked") is not True:
+        return None
+    with _snapshot(release):
+        selected = _selected_nodes(release, target)
+    return recorded if selected == [] else None
+
+
 def parked_without_nodes(release: Any, target: Any) -> dict[str, Any] | None:
     """The proof of ``target`` when its selector selects no node and it is
     parked, else ``None`` -- including when the node list cannot be read.
@@ -513,22 +637,8 @@ def parked_without_nodes(release: Any, target: Any) -> dict[str, Any] | None:
     """
 
     with _snapshot(release):
-        try:
-            selector = node_selector(target)
-            listing = release._get_json(
-                release._gpu(target, "get", "nodes", "-l", selector)
-            )
-            selected = [
-                item
-                for item in listing.get("items") or ()
-                if isinstance(item, Mapping)
-                and selector_matches(
-                    _mapping(item.get("metadata")).get("labels"), selector
-                )
-            ]
-        except Exception:  # noqa: BLE001 - an unreadable node list proves nothing
-            return None
-        if selected:
+        selected = _selected_nodes(release, target)
+        if selected is None or selected:
             return None
         proof = read_parked(release, target)
     return proof if proof.get("parked") is True else None
@@ -618,11 +728,25 @@ def not_awaited(
     )
 
 
-def parked_documents(checks: Iterable[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Cluster id -> proof of every parked cluster a report's checks proved."""
+def summary(proof: Mapping[str, Any]) -> dict[str, Any]:
+    """What a report and the release state say of a cluster without nodes."""
+
+    return {
+        "state": PARKED if proof.get("parked") is True else "unproven",
+        "provider": proof.get("provider"),
+        "reason": proof.get("reason"),
+        "groups": [dict(_mapping(item)) for item in proof.get("groups") or ()],
+    }
+
+
+def zero_node_clusters(checks: Iterable[Any]) -> dict[str, dict[str, Any]]:
+    """Cluster id -> ``summary`` of every parked cluster a report's checks
+    proved (the reports' ``zero_node_clusters``)."""
 
     found: dict[str, dict[str, Any]] = {}
     for check in checks:
+        if not isinstance(check, Mapping):
+            continue
         name = str(check.get("name") or "")
         details = _mapping(check.get("details"))
         if name == "control_api":
@@ -636,19 +760,13 @@ def parked_documents(checks: Iterable[Mapping[str, Any]]) -> dict[str, dict[str,
         for cluster_id, section in sections.items():
             proof = _mapping(section).get(PARKED_KEY)
             if isinstance(proof, Mapping) and proof.get("parked") is True:
-                found.setdefault(str(cluster_id), dict(proof))
+                found.setdefault(str(cluster_id), summary(proof))
     return dict(sorted(found.items()))
 
 
-def parked_cluster_ids(checks: Iterable[Any]) -> list[str]:
-    """The ids ``parked_documents`` finds (the reports' ``parked_gpu_clusters``)."""
-
-    return list(parked_documents(item for item in checks if isinstance(item, Mapping)))
-
-
-def _groups_text(proof: Mapping[str, Any]) -> str:
-    groups = [_mapping(item) for item in proof.get("groups") or ()]
-    if proof.get("provider") == HYPERPOD:
+def _groups_text(entry: Mapping[str, Any]) -> str:
+    groups = [_mapping(item) for item in entry.get("groups") or ()]
+    if entry.get("provider") == HYPERPOD:
         return ", ".join(
             f"{item.get('name')}: TargetCount {item.get('target')}, CurrentCount "
             f"{item.get('current')}"
@@ -665,59 +783,191 @@ def status_lines(health: object) -> list[str]:
     """One ``status`` header line per parked cluster of a health report."""
 
     checks = _mapping(health).get("checks")
-    documents = parked_documents(
-        item
-        for item in (checks if isinstance(checks, list) else [])
-        if isinstance(item, Mapping)
-    )
+    entries = zero_node_clusters(checks if isinstance(checks, list) else [])
     return [
-        f"parked GPU cluster {cluster_id} ({proof.get('provider')}): no node selected; "
-        f"{proof.get('reason')} ({_groups_text(proof)}); not a failure -- scale a "
-        "covered group up and its nodes join by themselves; a release that changes "
-        "the GPU data plane is refused until then"
-        for cluster_id, proof in documents.items()
+        f"parked GPU cluster {cluster_id} ({entry.get('provider')}): no node "
+        f"selected; {entry.get('reason')} ({_groups_text(entry)}); not a failure "
+        "-- a deploy rolls its Deployments and Reconciler and skips its node "
+        "work; scale a covered group up and its nodes join with the current "
+        "release by themselves"
+        for cluster_id, entry in entries.items()
     ]
 
 
 # --- what a release makes of it -------------------------------------------
 
 
-def release_refusal(
-    checks: Iterable[Any], plan: ReleaseExecutionPlan
-) -> dict[str, Any] | None:
-    """The failing deploy preflight check of a release that changes the GPU
-    data plane while a cluster its ``regional_contexts`` check proved is
-    parked; ``None`` for any other release or site."""
+def zero_node_identity(proof: Mapping[str, Any]) -> dict[str, Any]:
+    """The Agent identity entry a release snapshot records for a cluster
+    without nodes: no node, no identity, and why."""
 
-    parked = parked_documents(item for item in checks if isinstance(item, Mapping))
-    components = [item.value for item in plan.nodes if item in GPU_SNAPSHOT_COMPONENTS]
-    if not parked or not components:
+    return {"node_ids": [], ZERO_NODES_IDENTITY_KEY: summary(proof)}
+
+
+def is_zero_node_identity(identity: object) -> bool:
+    return (
+        isinstance(identity, Mapping)
+        and isinstance(identity.get(ZERO_NODES_IDENTITY_KEY), Mapping)
+        and not identity.get("node_ids")
+    )
+
+
+def live_identities(identities: Mapping[str, Any]) -> dict[str, Any]:
+    """``identities`` without the entries of clusters that had no node."""
+
+    return {
+        str(cluster_id): identity
+        for cluster_id, identity in identities.items()
+        if not is_zero_node_identity(identity)
+    }
+
+
+def render_node(proof: Mapping[str, Any], target: Any) -> dict[str, Any]:
+    """The node document a cluster without nodes renders its installer
+    template from: a node of the first covered group whose declared instance
+    type the GPU inventory knows, carrying that group's declared labels.
+
+    The Reconciler fills the name, address, UID, provider id and instance type
+    of every real node into the Jobs it builds from the template, so the node
+    that is rendered from is never one a Job runs for. A cluster whose groups
+    declare no known GPU instance type refuses: its template cannot be rendered.
+    """
+
+    for group in (_mapping(item) for item in proof.get("groups") or ()):
+        for instance_type in group.get("instance_types") or ():
+            if expected_accelerator_counts(str(instance_type)) is None:
+                continue
+            labels = {
+                **{str(k): str(v) for k, v in _mapping(group.get("labels")).items()},
+                INSTANCE_TYPE_LABEL: str(instance_type),
+            }
+            if is_eks_managed(target):
+                labels[EKS_NODEGROUP_LABEL] = str(group.get("name") or "")
+            else:
+                labels[HYPERPOD_CLUSTER_LABEL] = str(target.hyperpod_cluster_name or "")
+                labels[HYPERPOD_INSTANCE_GROUP_LABEL] = str(group.get("name") or "")
+            return {
+                "metadata": {
+                    "name": RENDER_NODE_NAME,
+                    "uid": RENDER_NODE_UID,
+                    "labels": dict(sorted(labels.items())),
+                },
+                "spec": {"providerID": ""},
+                "status": {
+                    "addresses": [
+                        {"type": "InternalIP", "address": RENDER_NODE_ADDRESS}
+                    ]
+                },
+            }
+    declared = sorted(
+        str(item)
+        for group in (_mapping(entry) for entry in proof.get("groups") or ())
+        for item in group.get("instance_types") or ()
+    )
+    raise ReleaseError(
+        f"{target.cluster_id} has no node and its node groups declare no GPU "
+        "instance type the installer knows ("
+        + (", ".join(declared) or "none declared")
+        + "): its installer template cannot be rendered; scale a group up, or "
+        "declare a supported instance type"
+    )
+
+
+def reconciler_environment(proof: Mapping[str, Any], target: Any) -> dict[str, str]:
+    """The environment ``deploy-node-installer-reconciler.sh`` runs a cluster
+    without nodes with: no node to require, key or preflight, the installer
+    template rendered from ``render_node``."""
+
+    return {
+        ZERO_NODE_CLUSTER_ENV: "true",
+        RENDER_NODE_ENV: json.dumps(
+            render_node(proof, target), sort_keys=True, separators=(",", ":")
+        ),
+    }
+
+
+def narrate(cluster_id: str, **fields: Any) -> None:
+    """One operator-visible line about a cluster without nodes."""
+
+    narrate_step(NARRATION, cluster=cluster_id, **fields)
+
+
+def record_node_work_skipped(
+    release: Any,
+    target: Any,
+    proof: Mapping[str, Any],
+    *,
+    phase: str,
+    identity: tuple[str, str],
+    skipped: Sequence[str] = SKIPPED_NODE_WORK,
+) -> None:
+    """Narrate and record (``release.state["zero_node_clusters"]``, carried by
+    the next checkpoint) the node work a release skipped on ``target``."""
+
+    entry = {
+        **summary(proof),
+        "release_id": str(getattr(release, "release_id", "") or ""),
+        "phase": phase,
+        "skipped": list(skipped),
+        "reconciler": {"bundle_sha256": identity[0], "template_sha256": identity[1]},
+    }
+    narrate(
+        target.cluster_id,
+        state=entry["state"],
+        phase=phase,
+        skipped=",".join(skipped),
+        reconciler="steady-state",
+        reconciler_bundle=identity[0][:12],
+        reconciler_template=identity[1][:12],
+        reason=json.dumps(str(entry["reason"])),
+    )
+    state = getattr(release, "state", None)
+    if isinstance(state, dict):
+        with _STATE_LOCK:
+            state.setdefault(ZERO_NODE_KEY, {})[str(target.cluster_id)] = entry
+
+
+def zero_node_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    """The live release's record of the node work it skipped (``status``)."""
+
+    entries = state.get(ZERO_NODE_KEY)
+    mine = {
+        str(cluster_id): dict(entry)
+        for cluster_id, entry in (entries.items() if isinstance(entries, dict) else ())
+        if isinstance(entry, Mapping)
+        and entry.get("release_id") == state.get("release_id")
+    }
+    return {ZERO_NODE_KEY: mine} if mine else {}
+
+
+def release_refusal(
+    release: Any, checks: Iterable[Any], plan: ReleaseExecutionPlan
+) -> dict[str, Any] | None:
+    """The failing deploy preflight check of a release with Agent waves when no
+    GPU cluster of the site has a node; ``None`` for every other release.
+
+    A rollback restores the control plane's Agent pins from the live Agents the
+    release snapshot recorded; with every cluster parked there are none.
+    """
+
+    if not plan.has(ReleaseComponent.AGENT):
+        return None
+    parked = zero_node_clusters(checks)
+    if not parked:
+        return None
+    configured = {str(target.cluster_id) for target in release.config.clusters}
+    if not configured or not configured.issubset(parked):
         return None
     return {
         "name": CHECK,
         "status": "FAIL",
         "summary": (
-            "GPU cluster(s) parked at zero nodes: "
-            + ", ".join(parked)
-            + f"; this release changes the GPU data plane ({', '.join(components)}) "
-            "and snapshots and rolls every cluster's Agents, which a cluster without "
-            "nodes does not have. Scale a node group the cluster's node selector "
-            "covers back up and let its nodes join (status then shows the cluster "
-            "covered), or remove the cluster with gpu-fault-admin remove-cluster, "
-            "then deploy again. Nothing was changed."
+            "every GPU cluster has zero nodes ("
+            + ", ".join(sorted(configured))
+            + "): a release with Agent waves snapshots the live Agents its "
+            "rollback restores the control plane's Agent pins from, and there is "
+            "none. Scale a node group of one cluster back up and let its nodes "
+            "join, then deploy again. Nothing was changed."
         ),
-        "details": {"parked": parked, "components": components},
+        "details": {ZERO_NODE_KEY: parked},
     }
-
-
-def capture_refusal(cluster_id: str, proof: Mapping[str, Any]) -> str:
-    """The engine's own refusal to snapshot a parked cluster's Agents (behind
-    the deploy preflight's ``release_refusal``)."""
-
-    return (
-        f"{cluster_id} is parked at zero GPU nodes ({proof.get('reason')}); a release "
-        "that changes the GPU data plane snapshots and rolls every cluster's Agents "
-        "and has none to snapshot there: scale a node group its node selector covers "
-        "back up and let its nodes join, or remove the cluster with gpu-fault-admin "
-        "remove-cluster, then deploy again; nothing of the GPU data plane was changed"
-    )

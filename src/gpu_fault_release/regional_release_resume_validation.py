@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
@@ -235,6 +236,8 @@ def _validate_candidate_components(
     target: Any,
     components: frozenset[ReleaseComponent],
     node_names: tuple[str, ...],
+    *,
+    zero_nodes: bool = False,
 ) -> None:
     # The cluster's installer template identity: what the candidate's
     # reconciler, its nodes and its Agents carry (the source digest unless the
@@ -297,7 +300,8 @@ def _validate_candidate_components(
             raise ReleaseError(f"{target.cluster_id} resume DCGM image drifted")
     if ReleaseComponent.ENDPOINT in components:
         release._verify_gpu_control_plane_endpoint(target)
-    if ReleaseComponent.AGENT not in components:
+    if ReleaseComponent.AGENT not in components or zero_nodes:
+        # A cluster without nodes rolled only its Reconciler (checked above).
         return
     if not agents_converged(
         gpu_node_items(release, target, fresh=True),
@@ -522,12 +526,18 @@ def validate_resume_checkpoint(
             raise ReleaseError(
                 f"{target.cluster_id} resume previous Agent identity is missing"
             )
+        # Started without a node: no node set to hold the cluster to. The resume
+        # asks again, step by step, whether it still has none (and skips its
+        # node work) or rolls the nodes that joined since like newcomers.
+        zero_nodes = parked_cluster.is_zero_node_identity(identity)
         node_names = tuple(
             sorted(str(value) for value in identity.get("node_ids") or [])
         )
-        if not node_names:
+        if not node_names and not zero_nodes:
             raise ReleaseError(f"{target.cluster_id} resume previous node set is empty")
-        live_names = tuple(release._target_node_names(target))
+        live_names = (
+            node_names if zero_nodes else tuple(release._target_node_names(target))
+        )
         if set(live_names) < set(node_names):
             # Recorded nodes the cluster lost mid-release: only a proven
             # departure narrows the set; anything else is drift.
@@ -548,6 +558,7 @@ def validate_resume_checkpoint(
                 target,
                 planned_gpu,
                 node_names,
+                zero_nodes=zero_nodes,
             )
             continue
         completed_components = _progress_components(
@@ -582,6 +593,7 @@ def validate_resume_checkpoint(
                 target,
                 completed_components,
                 node_names,
+                zero_nodes=zero_nodes,
             )
         previous_components = planned_gpu - completed_components - active_components
         if previous_components:
@@ -593,7 +605,7 @@ def validate_resume_checkpoint(
                 components=previous_components,
                 run_verifier=False,
             )
-        if ReleaseComponent.AGENT in active_components:
+        if ReleaseComponent.AGENT in active_components and not zero_nodes:
             category = (
                 "paused"
                 if target.cluster_id in paused

@@ -12,6 +12,7 @@ from typing import Any, Callable
 
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_aurora_credentials import read_aurora_refresh_cronjob
 from gpu_fault_release.regional_release_aurora_refresh import (
@@ -1152,6 +1153,11 @@ def validate_agent_rollback_target(
     identity = (previous.get("agent_identities") or {}).get(target.cluster_id)
     if not isinstance(identity, dict):
         raise ReleaseError(f"{target.cluster_id} rollback Agent identity is missing")
+    if parked_cluster.is_zero_node_identity(identity):
+        # Started without a node: no Agent identity to verify (its Reconciler is
+        # judged with the other rollback resources). A node that joined since
+        # was rolled back like a newcomer; the snapshot names no identity for it.
+        return
     node_names = tuple(str(value) for value in identity.get("node_ids") or [])
     if not node_names:
         raise ReleaseError(f"{target.cluster_id} rollback Agent node set is empty")

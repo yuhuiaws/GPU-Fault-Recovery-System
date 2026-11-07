@@ -16,6 +16,7 @@ from gpu_fault.regional_compatibility import (
 )
 from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault.cluster_scope import selector_matches
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
@@ -1020,17 +1021,46 @@ def upgrade_gpu_target(
         if progress is not None:
             progress(components, "COMPLETED", None)
     elif active_plan.has(ReleaseComponent.RECONCILER):
-        run_component(
-            (ReleaseComponent.RECONCILER,),
-            lambda: release._deploy_reconciler(
+
+        def roll_reconciler() -> None:
+            deploy_reconciler_of_cluster(
+                release,
                 target,
+                phase="upgrade",
                 wheel_cm=release.executor_wheel_cm,
                 bundle_cm=release.bundle_cm,
                 artifact_sha=release.node_wheel_sha,
                 config_digest=target_agent_config_digest(release.config, target),
                 node_dependency_target=NodeDependencyTarget.CANDIDATE,
-            ),
-        )
+            )
+
+        run_component((ReleaseComponent.RECONCILER,), roll_reconciler)
+
+
+def deploy_reconciler_of_cluster(
+    release: Any, target: ClusterTarget, *, phase: str, **arguments: Any
+) -> None:
+    """``release._deploy_reconciler`` for a Reconciler-only roll (forward or
+    rollback): a cluster parked at zero nodes gets its Reconciler without any
+    node to require (``regional_parked_cluster``), and the skip is recorded."""
+
+    zero_nodes = (
+        None
+        if release.runner.dry_run
+        else parked_cluster.zero_nodes_now(release, target)
+    )
+    if zero_nodes is None:
+        release._deploy_reconciler(target, **arguments)
+        return
+    identity = release._deploy_reconciler(target, **arguments, zero_nodes=zero_nodes)
+    parked_cluster.record_node_work_skipped(
+        release,
+        target,
+        zero_nodes,
+        phase=phase,
+        identity=(str(identity[0]), str(identity[1])),
+        skipped=("node-preflight-batch",),
+    )
 
 
 def join_target(release: Any, cluster_id: str) -> ClusterTarget:

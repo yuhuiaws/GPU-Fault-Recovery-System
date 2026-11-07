@@ -15,6 +15,7 @@ from gpu_fault.hyperpod_spares import (
     SPARE_RESERVATION_ANNOTATION,
     SparePoolState,
 )
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_dcgm import record_node_dcgm_states
@@ -73,6 +74,10 @@ class NodeMutationPreflight:
     #: Nodes of ``node_names`` already on their way out (NotReady or being
     #: deleted) when the forward roll read them; judged for departure first.
     leaving_nodes: tuple[str, ...] = ()
+    #: The proof of a cluster that selected no node and is parked
+    #: (``regional_parked_cluster``): ``node_names`` is empty, the node work is
+    #: skipped and only the steady-state Reconciler rolls.
+    zero_nodes: Mapping[str, Any] | None = None
 
     @property
     def node_dependency_target(self) -> NodeDependencyTarget:
@@ -223,6 +228,11 @@ def run_node_installer_preflight(
     pin_installer_version(
         environment, release, target, candidate.node_dependency_target
     )
+    if candidate.zero_nodes is not None:
+        # No node to preflight: the script proves the template and its inputs.
+        environment.update(
+            parked_cluster.reconciler_environment(candidate.zero_nodes, target)
+        )
     environment.update(
         {
             "GPU_FAULT_RECONCILER_PREFLIGHT_ONLY": "true",

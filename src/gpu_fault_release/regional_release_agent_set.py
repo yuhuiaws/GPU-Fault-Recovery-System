@@ -14,10 +14,10 @@ rolled a join back). The joining cluster's set still gates, and every deploy
 (whose rollback snapshot the identities are) judges every cluster as before.
 
 A cluster parked at zero GPU nodes (``regional_parked_cluster``) has no Agent
-and no node: its empty set matches. ``sync-state`` -- the last step of every
-automatic rollback -- accepts it and leaves it out of the identities it does
-not keep; a release's snapshot, which a rollback restores from, refuses it by
-name and says how to bring the cluster back or remove it.
+and no node: its empty set matches. The capture records it as an explicit
+entry without an identity (``zero_node_identity``), which every reader of the
+snapshot -- the CPU roll's heartbeat barrier, the rollback, the resume, a
+newcomer's join -- takes for "nothing to roll, nothing to restore".
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release import regional_release_state as state
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
-from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
 from gpu_fault_release.regional_verify_scope import gates, narrate_not_gating
@@ -188,9 +187,7 @@ def _other_clusters(
             )
 
 
-def capture_agent_identities_matching_nodes(
-    release: Any, *, accept_parked: bool = False
-) -> dict[str, dict[str, Any]]:
+def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str, Any]]:
     """Every cluster's ACTIVE Agents must be exactly its GPU nodes.
 
     Fail-closed: a release must not start over a node without a live Agent or
@@ -201,8 +198,8 @@ def capture_agent_identities_matching_nodes(
     Agent records behind the difference.
 
     A gating cluster without any Agent whose selector selects no node and that
-    is proven parked (``regional_parked_cluster.parked_without_nodes``) is left
-    out with ``accept_parked`` (``sync-state``), and refused by name without.
+    is proven parked (``regional_parked_cluster.parked_without_nodes``) is
+    recorded as an explicit entry with no identity and no node.
     """
 
     capture_identities = getattr(release, "_capture_agent_identities", None)
@@ -217,13 +214,12 @@ def capture_agent_identities_matching_nodes(
         proof = parked_cluster.parked_without_nodes(release, target)
         if proof is None:
             return False
-        if not accept_parked:
-            raise ReleaseError(parked_cluster.capture_refusal(target.cluster_id, proof))
         if target.cluster_id not in parked:
-            narrate_step(
-                "parked-gpu-cluster",
-                cluster=target.cluster_id,
-                check=CHECK,
+            parked_cluster.narrate(
+                target.cluster_id,
+                state=parked_cluster.PARKED,
+                step=CHECK,
+                recorded="no Agent identity, no node",
                 reason=json.dumps(str(proof.get("reason"))),
             )
         parked[target.cluster_id] = proof
@@ -257,7 +253,13 @@ def capture_agent_identities_matching_nodes(
                 break
         if not problem:
             _other_clusters(release, identities, others)
-            return identities
+            return {
+                **identities,
+                **{
+                    cluster_id: parked_cluster.zero_node_identity(proof)
+                    for cluster_id, proof in parked.items()
+                },
+            }
         if attempt == 0:
             print(
                 f"active Agent set re-read in {AGENT_SET_RECHECK_SECONDS:.0f}s: {problem}",

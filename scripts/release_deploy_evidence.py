@@ -106,10 +106,11 @@ def verification_metadata(path: Path, report: dict[str, Any]) -> dict[str, Any]:
         "verified_at": utc_now(),
         "summary": report.get("summary"),
     }
-    # The GPU clusters the verify found parked at zero nodes: passing, so the
-    # deploy record names them rather than leaving them to the report file.
-    if "parked_gpu_clusters" in report:
-        metadata["parked_gpu_clusters"] = list(report.get("parked_gpu_clusters") or [])
+    # The GPU clusters the verify found without nodes: passing, so the deploy
+    # record names them (state, reason, groups) rather than leaving them to the
+    # report file.
+    if "zero_node_clusters" in report:
+        metadata["zero_node_clusters"] = dict(report.get("zero_node_clusters") or {})
     return metadata
 
 

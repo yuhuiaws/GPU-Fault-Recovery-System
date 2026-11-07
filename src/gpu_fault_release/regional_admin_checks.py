@@ -112,7 +112,7 @@ def _report(mode: str, release: Any, checks: list[dict[str, Any]]) -> dict[str, 
         "healthy": counts["FAIL"] == 0,
         "summary": counts,
         "checks": checks,
-        parked.PARKED_CLUSTERS_KEY: parked.parked_cluster_ids(checks),
+        parked.ZERO_NODE_KEY: parked.zero_node_clusters(checks),
     }
 
 

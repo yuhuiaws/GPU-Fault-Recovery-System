@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
@@ -137,8 +138,10 @@ def previous_cluster_runtime_profiles(
 def rollback_controller_config_for(
     release: Any, previous: dict[str, Any], site_runtime_profile_version: str
 ) -> dict[str, str]:
+    # Only clusters that had live Agents carry the pins; a cluster the release
+    # started without a node on recorded none (``regional_parked_cluster``).
     return rollback_controller_config(
-        previous.get("agent_identities") or {},
+        parked_cluster.live_identities(previous.get("agent_identities") or {}),
         site_runtime_profile_version=site_runtime_profile_version,
         cluster_runtime_profiles=previous_cluster_runtime_profiles(release, previous),
     )

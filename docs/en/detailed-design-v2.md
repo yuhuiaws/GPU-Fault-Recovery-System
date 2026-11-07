@@ -4455,13 +4455,17 @@ with the CLI and not configurable.
 selects, the release engine asks the provider whether that was declared (`src/gpu_fault_release/regional_parked_cluster.py`):
 every EKS managed node group the selector covers `ACTIVE` at `scalingConfig.desiredSize` 0 and no Karpenter NodePool able to
 launch a selected node, or every covered HyperPod instance group `InService` at `TargetCount`/`CurrentCount` 0. Proven, the
-cluster is *parked*: `status`/`verify` judge its Deployments and executor as always, read zero Agents for zero nodes as full
-coverage, ask no fleet or collector readiness and name it (`parked_gpu_clusters`, `parked GPU cluster` header line, the
-deploy record); a `NOOP` or `CONTROL_PLANE_ONLY` release proceeds, the CPU roll's Agent node inventory and the rollback's
-`sync-state` accept its empty Agent set, and a release with GPU components is refused at its deploy preflight
-(`parked_gpu_clusters`) because its snapshot needs every cluster's Agents. Not proven -- a group that still wants nodes, one
-being replaced, a selector that covers no group, a failed read -- the cluster fails as before, the refusal naming why. The
-proof reads only what `regional_contexts` already reads; the departed-node cleanup itself does not consult it.
+cluster is *parked*, and zero GPU nodes affect only that cluster: `status`/`verify` judge its Deployments and executor as
+always, read zero Agents for zero nodes as full coverage, ask no fleet or collector readiness and name it
+(`zero_node_clusters`, the `parked GPU cluster` header line, the deploy record); every release kind proceeds -- the Agent
+snapshot records an explicit entry with no identity and no node (`zero_node_identity`), the node preflight batch, fleet
+rollout, waves and waits are skipped and recorded, the steady-state Reconciler is rolled with the release's node runtime
+(its installer template rendered from a node of the declared group, `render_node`, so a later joiner installs the current
+release), the CPU roll's heartbeat barrier, the rollback (Reconciler only, Agent pins from the clusters with live Agents),
+the resume and `sync-state` all carry the entry. Only a release with Agent waves while every GPU cluster has zero nodes is
+refused at its deploy preflight (`zero_node_gpu_clusters`). Not proven -- a group that still wants nodes, one being
+replaced, a selector that covers no group, a failed read -- the cluster fails as before, the refusal naming why. The proof
+reads only what `regional_contexts` already reads; the departed-node cleanup itself does not consult it.
 
 Code basis: `src/gpu_fault/departed_node_cleanup.py::DepartedNodeCleanup.run_once`,
 `src/gpu_fault/departed_node_cleanup_actions.py::DepartureWrites`, `src/gpu_fault/departed_nodes.py`,

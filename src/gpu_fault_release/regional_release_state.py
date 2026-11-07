@@ -926,12 +926,8 @@ def _capture_previous(
     )
     agent_identities: dict[str, dict[str, Any]] = {}
     if capture_gpu and release.config.clusters:
-        # Without a plan this is sync-state's proof of the live site, which it
-        # does not keep (``previous=None``): a parked cluster's empty Agent set
-        # matches its empty node set there. A release's snapshot refuses one.
-        agent_identities = agent_set.capture_agent_identities_matching_nodes(
-            release, accept_parked=plan is None
-        )
+        # A parked cluster is an explicit entry with no identity and no node.
+        agent_identities = agent_set.capture_agent_identities_matching_nodes(release)
     role_deployments = cpu_role_deployments(release) if capture_cpu else {}
     role_config_maps = (
         cpu_role_config_maps(release, role_deployments) if capture_cpu else {}

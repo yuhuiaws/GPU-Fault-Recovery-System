@@ -911,11 +911,12 @@ def _deploy_preflight_report(release: Any) -> dict[str, Any]:
     report = build_preflight_report(
         release, repair_plan=plan, bootstrap=bootstrap, include_workflow=not repair
     )
-    # A release that snapshots and rolls every cluster's Agents cannot run over
-    # a cluster parked at zero nodes: refused here, before any repair or write.
+    # A release with Agent waves needs one cluster with live Agents for its
+    # rollback's pins: refused here, before any repair or write, when no GPU
+    # cluster has a node (one or more parked clusters alone never refuse).
     checks = report.get("checks")
     if isinstance(checks, list):
-        refusal = parked_cluster.release_refusal(checks, plan)
+        refusal = parked_cluster.release_refusal(release, checks, plan)
         if refusal is not None:
             report = _report("preflight", release, [*checks, refusal])
     if not repair or not report["healthy"]:
@@ -1048,6 +1049,8 @@ def build_release_summary(
             **product_isolation_summary(state),
             **departed_nodes_summary(state),
             **joined_nodes_summary(state),
+            # What this release skipped on GPU clusters without nodes.
+            **parked_cluster.zero_node_summary(state),
         }
         result["next_deploy"] = next_deploy(release, state)
     except Exception as exc:
@@ -1142,8 +1145,8 @@ def _status_result(
     result["healthy"] = health["healthy"]
     result["health"] = health
     result["health_scope"] = scope
-    result[parked_cluster.PARKED_CLUSTERS_KEY] = list(
-        health.get(parked_cluster.PARKED_CLUSTERS_KEY) or []
+    result[parked_cluster.ZERO_NODE_KEY] = dict(
+        health.get(parked_cluster.ZERO_NODE_KEY) or {}
     )
     return result
 

@@ -50,6 +50,12 @@ NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-}"
 NODE_DEPENDENCY_IMAGE="${GPU_FAULT_NODE_DEPENDENCY_IMAGE:-}"
 NODE_WHEELHOUSE_SHA256="${GPU_FAULT_NODE_WHEELHOUSE_SHA256:-}"
 PREFLIGHT_ONLY="${GPU_FAULT_RECONCILER_PREFLIGHT_ONLY:-false}"
+# A GPU cluster the release engine proved parked at zero nodes: with no node
+# selected the script requires, keys and preflights none and renders the
+# installer template from GPU_FAULT_ZERO_NODE_RENDER_NODE, the node document
+# the cluster's node groups declare (regional_parked_cluster.render_node).
+ZERO_NODE_CLUSTER="${GPU_FAULT_ZERO_NODE_CLUSTER:-false}"
+ZERO_NODE_RENDER_NODE="${GPU_FAULT_ZERO_NODE_RENDER_NODE:-}"
 REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
 # Older callers may supply product hints. They do not replace live key proof
 # or a trusted full template pin; reports contain identities, never key material.
@@ -138,6 +144,10 @@ fi
 }
 [[ "${PREFLIGHT_ONLY}" == "true" || "${PREFLIGHT_ONLY}" == "false" ]] || {
     printf 'ERROR: GPU_FAULT_RECONCILER_PREFLIGHT_ONLY must be true or false\n' >&2
+    exit 2
+}
+[[ "${ZERO_NODE_CLUSTER}" == "true" || "${ZERO_NODE_CLUSTER}" == "false" ]] || {
+    printf 'ERROR: GPU_FAULT_ZERO_NODE_CLUSTER must be true or false\n' >&2
     exit 2
 }
 [[ "${REQUIRE_ROLLBACK_SLOT}" == "true" ||
@@ -261,16 +271,36 @@ NODE_INVENTORY_JSON="$(kubectl_context get nodes \
     -l "${NODE_SELECTOR}" -o json)"
 mapfile -t NODES < <(jq -r '.items | sort_by(.metadata.name)[] | .metadata.name' \
     <<<"${NODE_INVENTORY_JSON}")
-(( ${#NODES[@]} > 0 )) || {
-    printf 'ERROR: no GPU node found for %s (selector %s)\n' \
-        "${HYPERPOD_CLUSTER}" "${NODE_SELECTOR}" >&2
-    exit 1
-}
+ZERO_NODES="false"
+if (( ${#NODES[@]} == 0 )); then
+    [[ "${ZERO_NODE_CLUSTER}" == "true" ]] || {
+        printf 'ERROR: no GPU node found for %s (selector %s)\n' \
+            "${HYPERPOD_CLUSTER}" "${NODE_SELECTOR}" >&2
+        exit 1
+    }
+    # Only the node the template is rendered from enters the rendering inputs;
+    # no key, preflight or installation is ever asked of it.
+    NODE_INVENTORY_JSON="$(jq -ce '
+        select(type == "object"
+            and (.metadata.name | type == "string" and length > 0)
+            and (.metadata.labels["node.kubernetes.io/instance-type"]
+                | type == "string" and length > 0))
+        | {items: [.]}
+    ' <<<"${ZERO_NODE_RENDER_NODE}")" || {
+        printf 'ERROR: zero-node cluster %s has no valid render node\n' \
+            "${CLUSTER_ID}" >&2
+        exit 2
+    }
+    ZERO_NODES="true"
+    printf 'zero-node GPU cluster %s: no node selected (selector %s); no node is required, keyed or preflighted; the installer template is rendered from the declared node group\n' \
+        "${CLUSTER_ID}" "${NODE_SELECTOR}" >&2
+fi
 # This digest describes names only and cannot authorize key or template reuse.
-NODE_SET_SHA256="$(printf '%s\n' "${NODES[@]}" | sort | sha256sum | awk '{print $1}')"
+NODE_SET_SHA256="$(printf '%s\n' ${NODES[@]+"${NODES[@]}"} | sort | sha256sum | awk '{print $1}')"
 
 NODE_ACTION_KEYS_PROVISIONED="false"
-if [[ -n "${FLEET_MASTER_FILE}" && "${PREFLIGHT_ONLY}" != "true" ]]; then
+if [[ -n "${FLEET_MASTER_FILE}" && "${PREFLIGHT_ONLY}" != "true" &&
+    "${ZERO_NODES}" != "true" ]]; then
     GPU_FAULT_KUBECTL_CONTEXT="${KUBECTL_CONTEXT}" \
     GPU_FAULT_NAMESPACE="${NAMESPACE}" \
     GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
@@ -319,7 +349,7 @@ if invalid:
         "node action key Secret has invalid node-scoped keys: "
         + ", ".join(sorted(invalid))
     )
-' "${NODES[@]}"
+' ${NODES[@]+"${NODES[@]}"}
 
 kubectl_context -n "${NAMESPACE}" get configmap \
     "${INSTALLER_CONFIG_MAP}" -o json |
@@ -407,7 +437,11 @@ if active:
 '
 fi
 
-NODE="${NODES[0]}"
+if [[ "${ZERO_NODES}" == "true" ]]; then
+    NODE="$(jq -r '.items[0].metadata.name' <<<"${NODE_INVENTORY_JSON}")"
+else
+    NODE="${NODES[0]}"
+fi
 install -m 0600 /dev/null "${NODE_INPUTS_FILE}"
 # The Secret values have been validated above; only topology and reference
 # identities enter the rendering snapshot, never credentials.
@@ -542,6 +576,22 @@ container["env"] = [
 ] + [{"name": name, "value": value} for name, value in updates.items()]
 path.write_text(yaml.safe_dump_all(documents, sort_keys=False))
 PY
+
+if [[ "${PREFLIGHT_ONLY}" == "true" && "${ZERO_NODES}" == "true" ]]; then
+    # No node to preflight: the template and the Reconciler were admitted above.
+    kubectl_context apply --dry-run=server \
+        -f "${RECONCILER_MANIFEST}" >/dev/null
+    python3 - "${TEMPLATE_CONFIG_MAP}" <<'PY'
+import json
+import sys
+
+print(json.dumps({
+    "node_count": 0, "status": "PASSED", "template_config_map": sys.argv[1],
+    "zero_node_cluster": True,
+}, separators=(",", ":")))
+PY
+    exit 0
+fi
 
 if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
     kubectl_context apply --dry-run=server \

@@ -18,10 +18,12 @@ node group `ACTIVE` at `scalingConfig.desiredSize` 0, no Karpenter NodePool
 able to launch a selected node) is built from the live node group and NodePool
 shapes. The HyperPod proof (every covered instance group `InService` at
 `TargetCount` and `CurrentCount` 0) is derived from the `DescribeCluster`
-fields; a HyperPod cluster scaled to zero has not been exercised live. While a
-cluster is parked, releases with GPU components are refused rather than rolled
-around it, and `uninstall`, `remove-cluster` and `rotate-token` still need a
-node on that cluster.
+fields; a HyperPod cluster scaled to zero has not been exercised live. The
+installer template of a cluster without nodes is rendered from a node of the
+declared group; that it builds the same Job for a joining node as a template
+rendered from a real node is proven offline against the rendering scripts, not
+on a node that joined live. `uninstall`, `remove-cluster` and `rotate-token`
+still need a node on that cluster.
 
 ## Xid linkage and Drain P2P recovery
 

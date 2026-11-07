@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
 from gpu_fault_release.regional_release_dcgm import forward_dcgm_hostengine
 from gpu_fault_release.regional_release_departure_absorption import (
@@ -293,6 +294,61 @@ def _finalize_node_runtime(
     return final_identity
 
 
+def _zero_node_runtime(
+    release: Any,
+    target: ClusterTarget,
+    candidate: NodeMutationPreflight,
+    *,
+    steady_runtime_image: str | None,
+    steady_template_config_map: str | None,
+    mutation_started: Callable[[], None] | None,
+    candidate_preflight_completed: bool,
+) -> tuple[str, str]:
+    """The node runtime of a cluster parked at zero nodes: no node to preflight,
+    wave or wait for, so only the steady-state Reconciler rolls -- with the very
+    identity, template and images ``_finalize_node_runtime`` would hand it --
+    and a node that joins later installs this release's runtime. The skipped
+    work is narrated and recorded (``regional_parked_cluster``)."""
+
+    assert candidate.zero_nodes is not None
+    if not candidate_preflight_completed:
+        ensure_node_candidate_preflight(release, target, candidate)
+    if mutation_started is not None:
+        mutation_started()
+    identity = release._deploy_reconciler(
+        target,
+        wheel_cm=candidate.wheel_cm,
+        bundle_cm=candidate.bundle_cm,
+        artifact_sha=candidate.artifact_sha,
+        config_digest=candidate.config_digest,
+        runtime_profile_version=candidate.runtime_profile_version,
+        executor_wheel_filename=candidate.executor_wheel_filename,
+        node_compatibility_digest=candidate.node_compatibility_digest,
+        bundle_sha256=candidate.bundle_sha256,
+        template_sha256=candidate.template_sha256,
+        template_config_map=(
+            steady_template_config_map or candidate.template_config_map
+        ),
+        template_content_sha256=(
+            candidate.template_content_sha256
+            if not steady_template_config_map
+            or steady_template_config_map == candidate.template_config_map
+            else None
+        ),
+        allowed_node_names=None,
+        max_unavailable=candidate.max_unavailable,
+        runtime_image=steady_runtime_image or candidate.runtime_image,
+        node_installer_image=candidate.node_installer_image,
+        node_dependency_target=candidate.node_dependency_target,
+        zero_nodes=candidate.zero_nodes,
+    )
+    final = (str(identity[0]), str(identity[1]))
+    parked_cluster.record_node_work_skipped(
+        release, target, candidate.zero_nodes, phase=candidate.phase, identity=final
+    )
+    return final
+
+
 def _dry_run_node_runtime(
     release: Any,
     target: ClusterTarget,
@@ -360,9 +416,20 @@ def _node_runtime_candidate(
     )
     # The node set and its failure-domain map are two views of one node list,
     # so they share a single read instead of listing every node twice.
+    # A cluster parked at zero nodes has no node to roll: its node work is
+    # skipped and recorded, and only the steady-state Reconciler rolls
+    # (``_zero_node_runtime``). Asked before the node read, which refuses an
+    # empty node set; any cluster not proven parked keeps that refusal.
+    zero_nodes = (
+        None
+        if release.runner.dry_run
+        else parked_cluster.zero_nodes_now(release, target)
+    )
     with node_inventory_scope(release):
         node_names = (
-            () if release.runner.dry_run else release._target_node_names(target)
+            ()
+            if release.runner.dry_run or zero_nodes is not None
+            else release._target_node_names(target)
         )
         excluded: list[dict[str, Any]] = []
         if node_names and phase in EXCLUDING_PHASES:
@@ -387,18 +454,19 @@ def _node_runtime_candidate(
         )
         failure_domains = (
             {}
-            if release.runner.dry_run
+            if release.runner.dry_run or zero_nodes is not None
             else target_node_failure_domains(release, target, node_names)
         )
     policy = (
         NodeRolloutPolicy(
-            # A dry run lists no nodes, so there is no cap to resolve "auto"
-            # against: it reports the one-node floor rather than the sentinel.
+            # A dry run (or a cluster without nodes) lists no nodes, so there is
+            # no cap to resolve "auto" against: the one-node floor, not the
+            # sentinel.
             max_unavailable=max(1, release.config.upgrade_max_unavailable),
             first_wave_max_unavailable=1,
             max_unavailable_per_failure_domain=1,
         )
-        if release.runner.dry_run
+        if release.runner.dry_run or zero_nodes is not None
         else rollback_node_rollout_policy(release, failure_domains)
         if phase == "rollback"
         else node_rollout_policy(release, failure_domains, phase=phase)
@@ -423,6 +491,7 @@ def _node_runtime_candidate(
             template_content_sha256=template_content_sha256,
             excluded_nodes=tuple(excluded),
             leaving_nodes=leaving,
+            zero_nodes=zero_nodes,
         ),
         policy,
         failure_domains,
@@ -515,6 +584,16 @@ def roll_node_runtime(
         )
 
     candidate, policy, failure_domains = plan()
+    if candidate.zero_nodes is not None:
+        return _zero_node_runtime(
+            release,
+            target,
+            candidate,
+            steady_runtime_image=steady_runtime_image,
+            steady_template_config_map=steady_template_config_map,
+            mutation_started=mutation_started,
+            candidate_preflight_completed=candidate_preflight_completed,
+        )
     # A node that provably leaves during the roll is set aside on the proof; one
     # already on its way out when the roll read the cluster is judged first.
     departures = WaveDepartures.for_phase(release, target, phase)

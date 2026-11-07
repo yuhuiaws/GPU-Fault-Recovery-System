@@ -257,13 +257,10 @@ class ParkedSite(ResourceRelease):
     def _capture_previous(self, plan: Any = None) -> dict[str, Any]:
         from gpu_fault_release import regional_release_agent_set as agent_set
 
-        # The wiring of ``regional_release_state._capture_previous`` (pinned by
-        # its own test): a plan-less capture is sync-state's.
+        # The Agent half of ``regional_release_state._capture_previous``.
         return {
             "live_runtime_image": self.runtime_image,
-            "agent_identities": agent_set.capture_agent_identities_matching_nodes(
-                self, accept_parked=plan is None
-            ),
+            "agent_identities": agent_set.capture_agent_identities_matching_nodes(self),
         }
 
     def _save_state(self, phase: str, **values: Any) -> None:
