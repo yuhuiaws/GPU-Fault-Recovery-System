@@ -30,7 +30,7 @@ from gpu_fault.orchestration.failure_outcome import (
     NO_SECOND_TICKET_OPERATIONS as _NO_SECOND_TICKET_OPERATIONS,
     UNKNOWN_OUTCOME_FLAGS as _UNKNOWN_OUTCOME_FLAGS,
     executor_rejected_failure as executor_rejected_failure,
-    gpu_clients_refused,
+    fabric_manager_unit_failed,
     held_chain_hand_off,
     node_failure_reasons,
     reported_failed_nodes,
@@ -103,6 +103,8 @@ CONTAINMENT_REFUSED_STAGE = "containment_refused"
 # nothing was applied (``node_action_refused_before_acting``): the hand-off
 # plans evidence and the support ticket only -- no quarantine, no reboot --
 # because the chain's own cordon is already on a node nothing was done to.
+# So does a failed Fabric Manager restart with no report that its unit failed
+# (``_fabric_manager_restart_rung``): it never ran on a node nothing stopped.
 NODE_ACTION_REFUSED_STAGE = "node_action_refused"
 # A validation that never observed its node: every node it waited for was
 # pending behind the product's own quiesce taint (``quiesce_taint_present`` in
@@ -462,23 +464,29 @@ def _fabric_manager_restart_rung(
 ) -> tuple[str, RecoveryAction, WorkflowOperation]:
     """A failed RESTART_FABRIC_MANAGER climbs like a failed reset, through the
     whole record (the solo XID 45 plan holds no cordon; the reboot successor
-    cordons first). One its GPU-client check refused never ran, on GPUs in use
-    nothing stopped: no reboot, the evidence and the ticket only."""
+    cordons first) -- only when the agent reports the unit failed
+    (``failure_outcome.fabric_manager_unit_failed``). Any other failure never
+    ran the restart, or says nothing about the unit, on a node nothing
+    stopped: no reboot, the evidence and the ticket only, the reason naming
+    why (``failure_outcome.fabric_manager_restart_reason``)."""
 
-    if all(
-        gpu_clients_refused(execution.details)
+    restarts = [
+        execution
         for execution in failed_executions
         if execution.operation is WorkflowOperation.RESTART_FABRIC_MANAGER
+    ]
+    if restarts and all(
+        fabric_manager_unit_failed(execution.details) for execution in restarts
     ):
         return (
-            NODE_ACTION_REFUSED_STAGE,
-            RecoveryAction.ESCALATE_OPERATOR,
-            WorkflowOperation.ESCALATE_SUPPORT,
+            "fabric_manager_restart",
+            RecoveryAction.REBOOT_NODE,
+            WorkflowOperation.RESTART_NODE,
         )
     return (
-        "fabric_manager_restart",
-        RecoveryAction.REBOOT_NODE,
-        WorkflowOperation.RESTART_NODE,
+        NODE_ACTION_REFUSED_STAGE,
+        RecoveryAction.ESCALATE_OPERATOR,
+        WorkflowOperation.ESCALATE_SUPPORT,
     )
 
 

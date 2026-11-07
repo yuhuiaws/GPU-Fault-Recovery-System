@@ -236,10 +236,17 @@ def test_a_failed_solo_fabric_manager_restart_climbs_to_the_reboot(
     """The solo XID 45 plan is FREEZE_EVIDENCE -> RESTART_FABRIC_MANAGER: no
     cordon, no validation. Its Fabric Manager restart failing used to end the
     record FAILED and the incident ESCALATED with no successor and no mail.
-    It now climbs to the reboot the way a failed reset does; the reboot
-    successor cordons and quarantines the node before it reboots it."""
+    When the agent reports the unit failed (the node-action fold's
+    ``fabric_manager_restart_outcome`` UNIT_FAILED) it now climbs to the
+    reboot the way a failed reset does; the reboot successor cordons and
+    quarantines the node before it reboots it. Every other failure of the
+    restart: ``tests/execution/test_fabric_manager_restart_outcomes.py``."""
     from gpu_fault.execution import WorkflowStepOutcome
     from gpu_fault.models import WorkflowExecutionRequest
+    from gpu_fault.orchestration.failure_outcome import (
+        FABRIC_MANAGER_RESTART_OUTCOME_DETAIL,
+        FM_RESTART_UNIT_FAILED,
+    )
     from tests._builders import active_workflow_executor
 
     incident, workflow = _solo_xid45(context)
@@ -253,8 +260,11 @@ def test_a_failed_solo_fabric_manager_restart_climbs_to_the_reboot(
         def execute(self, step_context) -> WorkflowStepOutcome:
             if step_context.step.operation is Op.RESTART_FABRIC_MANAGER:
                 return WorkflowStepOutcome.failed(
-                    "node agent node-a: CalledProcessError: systemctl restart "
-                    "nvidia-fabricmanager returned 1"
+                    "node agent node-a: RuntimeError: systemctl exited with "
+                    "status 1: Job for nvidia-fabricmanager.service failed",
+                    details={
+                        FABRIC_MANAGER_RESTART_OUTCOME_DETAIL: FM_RESTART_UNIT_FAILED
+                    },
                 )
             return WorkflowStepOutcome.succeeded(
                 operation_id=step_context.idempotency_key
@@ -306,9 +316,14 @@ def _failed_fabric_manager_restart(operations, details=None):
 
 def test_a_failed_fabric_manager_restart_in_a_held_chain_climbs_to_the_reboot() -> None:
     """Like a failed reset in a chain that cordoned first: the reboot rung,
-    no longer the support hand-off of a step no rung answered."""
+    no longer the support hand-off of a step no rung answered -- when the
+    agent reports the unit failed."""
     from gpu_fault.models import RecoveryAction
     from gpu_fault.orchestration.escalation import HardwareEscalationService
+    from gpu_fault.orchestration.failure_outcome import (
+        FABRIC_MANAGER_RESTART_OUTCOME_DETAIL,
+        FM_RESTART_UNIT_FAILED,
+    )
 
     h = _failed_fabric_manager_restart(
         [
@@ -317,7 +332,8 @@ def test_a_failed_fabric_manager_restart_in_a_held_chain_climbs_to_the_reboot() 
             Op.RESTART_FABRIC_MANAGER,
             Op.VALIDATE_GPU,
             Op.RESTORE_SCHEDULING,
-        ]
+        ],
+        {FABRIC_MANAGER_RESTART_OUTCOME_DETAIL: FM_RESTART_UNIT_FAILED},
     )
 
     classification = HardwareEscalationService.classify(h.workflow)
@@ -360,8 +376,25 @@ def test_a_failed_fabric_manager_restart_in_a_held_chain_climbs_to_the_reboot() 
             "manual_confirmation_required",
             "the restart may still be running: an operator confirms it",
         ),
+        (
+            {"fabric_manager_restart_outcome": "REFUSED_BY_NODE_CONFIGURATION"},
+            "node_action_refused",
+            "the node's configuration forbids it: no evidence for a heavier action",
+        ),
+        (
+            {},
+            "node_action_refused",
+            "no agent verdict on the unit: nothing says a reboot is needed",
+        ),
     ],
-    ids=["executor-rejected", "agent-refused", "gpu-clients", "unknown-outcome"],
+    ids=[
+        "executor-rejected",
+        "agent-refused",
+        "gpu-clients",
+        "unknown-outcome",
+        "node-configuration",
+        "no-agent-verdict",
+    ],
 )
 def test_a_failed_fabric_manager_restart_keeps_the_endings_that_never_reboot(
     details, stage, why

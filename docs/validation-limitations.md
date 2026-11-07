@@ -1715,10 +1715,18 @@ request: software-tested only
 `tests/orchestration/test_fabric_manager_plan.py`), since no catalog plan runs
 a validation after a Fabric Manager restart and every EFA or device-plugin
 plan carries the request. A failed Fabric Manager restart climbs to the
-reboot too (stage `fabric_manager_restart`), and one its GPU-client check
-refused goes to support without a reboot: software-tested only
-(`tests/orchestration/test_fabric_manager_restart_plan.py`), no live variant
-fails a Fabric Manager restart. So is the support hand-off of a validate-then-readmit
+reboot too (stage `fabric_manager_restart`) when the agent reports its unit
+failed, and every other failure of it -- refused by the node's configuration
+or by its GPU-client check, a read before the unit failed, no agent verdict
+at all -- goes to support without a reboot: software-tested only
+(`tests/orchestration/test_fabric_manager_restart_plan.py`,
+`tests/execution/test_fabric_manager_restart_outcomes.py`), no live variant
+fails a Fabric Manager restart. The agent's configuration refusal and a
+failed `systemctl` call carry no structured detail of their own: the fold
+tells them apart by the wording the agent's executor gives them, pinned
+against the real handler; a Fabric Manager unit that is not installed reads
+as a unit that failed (the agent does not read the unit's load state before
+the restart), so it still climbs to the reboot. So is the support hand-off of a validate-then-readmit
 record whose validation fails with no recovery step before it while its cordon
 still holds the node (stage `held_chain_step`;
 `tests/orchestration/test_cov95_runtime_escalation.py`,

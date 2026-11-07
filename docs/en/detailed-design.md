@@ -2460,10 +2460,19 @@ isolated and the incident to both nodes.
 Whole-record hardware recovery escalation is invoked idempotently by the Dispatcher on `FAILED` workflows:
 
 1. `RESET_GPU/RESET_ALL_GPUS_NVSWITCHES` fails: create a `RESTART_NODE` workflow. So does a failed
-   `RESTART_FABRIC_MANAGER` (stage `fabric_manager_restart`): the solo XID 45 plan holds no cordon, so it climbs
-   through the whole record, whose successor cordons and quarantines the node before the reboot, not in place. A
-   Fabric Manager restart the agent's GPU-client check refused never ran and its GPUs are in use: no reboot, the
-   evidence and the ticket only (`node_action_refused`).
+   `RESTART_FABRIC_MANAGER` whose unit failed (stage `fabric_manager_restart`): the node-action fold records the Node
+   Agent's verdict as `fabric_manager_restart_outcome` (`adapters/node_action/fabric_manager_outcome.py`), and only
+   `UNIT_FAILED` -- a `systemctl` call on the unit exited non-zero once the agent's own checks had passed -- is
+   evidence for the reboot. The solo XID 45 plan holds no cordon, so it climbs through the whole record, whose
+   successor cordons and quarantines the node before the reboot, not in place. Every other failure of the restart
+   never ran it or says nothing about the unit: the node's configuration does not allow it
+   (`REFUSED_BY_NODE_CONFIGURATION`), the agent's GPU-client check found clients (`REFUSED_GPU_CLIENTS`), a read
+   before the unit failed or the re-submits ran out (`NO_UNIT_VERDICT`), or the command got no agent verdict at all
+   (no outcome: the fleet gate, either allowlist, the transport, a step cap or deadline). On a node nothing stopped
+   none of them is evidence for a reboot -- an action the operator's policy forbade is no evidence that a heavier one
+   is needed -- so they get the evidence and the ticket only (`node_action_refused`), the reason naming why
+   (`failure_outcome.fabric_manager_restart_reason`). A reset that never ran still climbs: its chain cordoned the
+   node, stopped its work and quiesced its GPU services first.
 2. `RESTART_NODE` fails: create a `REPLACE_NODE` workflow with
    `replacement_strategy=HEALTHY_WARM_SPARE_ONLY`.
 3. Replacement only allows a warm spare that has passed the independent health state machine's validation and has been atomically reserved; the managed/provider

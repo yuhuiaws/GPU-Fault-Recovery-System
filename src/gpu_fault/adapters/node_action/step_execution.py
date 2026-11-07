@@ -11,6 +11,9 @@ from gpu_fault.adapters.common import (
     dcgm_result_is_configuration_only,
     node_action_accepted_nodes,
 )
+from gpu_fault.adapters.node_action.fabric_manager_outcome import (
+    fabric_manager_restart_evidence,
+)
 from gpu_fault.adapters.node_action.quiesce_taint import (
     apply_quiesce_taint,
     remove_quiesce_taint,
@@ -566,6 +569,8 @@ class NodeActionExecutionService:
             # re-submit bound; the attempt count and last error it recorded
             # are the operator's only view of what the agent tried.
             failure_details.update(result.details)
+        # A Fabric Manager restart reboots only on a unit that failed.
+        failure_details.update(fabric_manager_restart_evidence(result))
         if unknown_outcome_failure(result.details):
             # The agent itself says it does not know what happened: an
             # installer killed at its deadline may still be running, a

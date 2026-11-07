@@ -90,6 +90,81 @@ def gpu_clients_refused(details: Mapping[str, Any] | None) -> bool:
     return details is not None and bool(details.get(GPU_CLIENT_KIND_DETAIL))
 
 
+#: The step detail the node-action fold writes on a FAILED RESTART_FABRIC_MANAGER
+#: the Node Agent answered (``adapters/node_action/fabric_manager_outcome``):
+#: what the agent's verdict says about the Fabric Manager unit, one of
+#: :data:`FABRIC_MANAGER_RESTART_OUTCOMES`. A failure without it has no such
+#: verdict: it was refused or lost before the agent's handler answered (the
+#: fleet gate, an allowlist, the transport, a step cap or deadline), or it
+#: carries flags of its own that are judged before the ladder (an attested
+#: safety refusal, an unknown outcome).
+FABRIC_MANAGER_RESTART_OUTCOME_DETAIL = "fabric_manager_restart_outcome"
+#: A ``systemctl`` call on the unit exited non-zero once the agent's own checks
+#: had passed -- the restart, the active check after it, or a read of the unit:
+#: systemd could not restart the unit or answer for it.
+FM_RESTART_UNIT_FAILED = "UNIT_FAILED"
+#: The node's own configuration does not allow the restart: it never ran.
+FM_RESTART_REFUSED_BY_NODE_CONFIGURATION = "REFUSED_BY_NODE_CONFIGURATION"
+#: The agent's GPU-client check found clients on the GPUs: it never ran.
+FM_RESTART_REFUSED_GPU_CLIENTS = "REFUSED_GPU_CLIENTS"
+#: Any other answer: a read before the unit failed (the compute-apps query),
+#: the re-submits ran out on a retryable error, an error that names no unit
+#: call. Nothing in it says the unit failed.
+FM_RESTART_NO_UNIT_VERDICT = "NO_UNIT_VERDICT"
+FABRIC_MANAGER_RESTART_OUTCOMES = frozenset(
+    {
+        FM_RESTART_UNIT_FAILED,
+        FM_RESTART_REFUSED_BY_NODE_CONFIGURATION,
+        FM_RESTART_REFUSED_GPU_CLIENTS,
+        FM_RESTART_NO_UNIT_VERDICT,
+    }
+)
+#: How much of a failed step's error a no-verdict reason quotes.
+REASON_ERROR_LIMIT = 200
+
+
+def fabric_manager_unit_failed(details: Mapping[str, Any] | None) -> bool:
+    """Whether a FAILED RESTART_FABRIC_MANAGER is the agent's report that the
+    unit failed: the only failure of the restart that is evidence for the
+    reboot rung. Every other one never ran the restart -- the operator's
+    configuration or the GPU-client check refused it, a read before the unit
+    failed, the command never reached the agent's handler -- or says nothing
+    about the unit; on the solo plan's node, which nothing stopped, none of
+    them is a reason to reboot."""
+
+    return (
+        details is not None
+        and details.get(FABRIC_MANAGER_RESTART_OUTCOME_DETAIL) == FM_RESTART_UNIT_FAILED
+        and not gpu_clients_refused(details)
+    )
+
+
+def fabric_manager_restart_reason(execution: WorkflowStepExecution) -> str | None:
+    """What a hand-off says for a FAILED RESTART_FABRIC_MANAGER that is not
+    rebooted (:func:`fabric_manager_unit_failed`): why it never ran, or that
+    nothing says the unit failed; ``None`` for any other step and for a unit
+    that failed (whose reboot reads ``RESTART_FABRIC_MANAGER failed``)."""
+
+    details = execution.details
+    if execution.operation is not WorkflowOperation.RESTART_FABRIC_MANAGER or (
+        fabric_manager_unit_failed(details)
+    ):
+        return None
+    outcome = details.get(FABRIC_MANAGER_RESTART_OUTCOME_DETAIL)
+    if gpu_clients_refused(details):
+        return (
+            f"RESTART_FABRIC_MANAGER refused: GPU {details[GPU_CLIENT_KIND_DETAIL]} "
+            "clients active on a node nothing stopped; the restart never ran"
+        )
+    if outcome == FM_RESTART_REFUSED_BY_NODE_CONFIGURATION:
+        return (
+            "RESTART_FABRIC_MANAGER refused by the node configuration (Fabric "
+            "Manager restart not enabled); the restart never ran"
+        )
+    cause = (execution.error or "no error recorded")[:REASON_ERROR_LIMIT]
+    return f"RESTART_FABRIC_MANAGER failed with no verdict on the unit: {cause}"
+
+
 def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
     """Whether a FAILED step's details say its outcome is not actually known.
 
@@ -200,9 +275,10 @@ def node_failure_reasons(execution: WorkflowStepExecution, node_id: str) -> list
     the node, what kept it from looking (``node_pending``: the adapter's
     reason and the operator's exit when it wrote one, else the missing
     evidence itself, ``validation_evidence.missing_evidence_reason``); else
-    why the record holds the node (:data:`HELD_NODE_REASONS_DETAIL`); else the
-    failed step's own ``<OPERATION> failed`` -- never a validation the node may
-    have passed.
+    why the record holds the node (:data:`HELD_NODE_REASONS_DETAIL`); else why
+    a Fabric Manager restart is not rebooted
+    (:func:`fabric_manager_restart_reason`); else the failed step's own
+    ``<OPERATION> failed`` -- never a validation the node may have passed.
     """
 
     details = execution.details
@@ -219,7 +295,11 @@ def node_failure_reasons(execution: WorkflowStepExecution, node_id: str) -> list
     if not reasons:
         held = details.get(HELD_NODE_REASONS_DETAIL)
         held = held if isinstance(held, Mapping) else {}
-        reasons = [held.get(node_id) or f"{execution.operation.value} failed"]
+        reasons = [
+            held.get(node_id)
+            or fabric_manager_restart_reason(execution)
+            or f"{execution.operation.value} failed"
+        ]
     return [str(reason) for reason in reasons]
 
 
