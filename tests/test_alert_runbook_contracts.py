@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -531,7 +533,7 @@ def test_the_drop_counters_reach_amp_and_carry_the_grouping_labels() -> None:
         if rule.get("action") == "replace"
     }
 
-    assert MODULE.keep_filter_defects(scrapes, amp_rules()) == []
+    assert MODULE.keep_filter_defects(MODULE.collector_scrapes(ROOT), amp_rules()) == []
     # `up` is synthesised from the target's label set, so these have to be target
     # relabels for GpuFaultAdotSelfMetricsMissing to group like every other rule.
     assert set(MODULE.GROUPING_LABELS) <= added, added
@@ -1031,8 +1033,60 @@ def test_the_review_counters_each_have_an_alert() -> None:
 
     for alert, metric in expectations.items():
         assert metric in _expression(alert), alert
-    assert MODULE.keep_filter_defects(scrapes, amp_rules()) == []
+    assert (
+        MODULE.keep_filter_defects(scrapes, [_rule(name) for name in expectations])
+        == []
+    )
+    assert MODULE.keep_filter_defects(MODULE.collector_scrapes(ROOT), amp_rules()) == []
     assert _keep_admits(
         _scrape_job("gpu-fault-control-plane"),
         "gpu_fault_ingress_decode_rejections_total",
     ), "the decode rejection counter must pass the AMP keep filter"
+
+
+def test_the_static_check_reads_the_data_plane_keep_list_too() -> None:
+    """``GpuFaultGpuClusterUnavailable`` reads an executor family only the
+    per-GPU-cluster collector keeps. Judged against the control-plane
+    collector alone it read as dead configuration; the verifier unions the
+    keep filters of both collectors, and still reports a family neither keeps.
+    """
+
+    rule = _rule("GpuFaultGpuClusterUnavailable")
+    control_plane = adot_collector_config()["receivers"]["prometheus"]["config"][
+        "scrape_configs"
+    ]
+    both = MODULE.collector_scrapes(ROOT)
+
+    assert MODULE.keep_filter_defects(control_plane, [rule]) == [
+        "AMP rule metric is dropped by ADOT: GpuFaultGpuClusterUnavailable uses "
+        "gpu_fault_cluster_executor_zero_node_unavailable"
+    ], "the control-plane collector alone does not keep the executor family"
+    assert MODULE.keep_filter_defects(both, [rule]) == [], (
+        "the data-plane collector keeps it"
+    )
+    assert len(both) > len(control_plane), "both collectors' jobs are read"
+    prefixed = {**rule, "expr": "gpu_fault_cluster_executor_any_family == 1"}
+    assert MODULE.keep_filter_defects(both, [prefixed]) == [], (
+        "the executor prefix keep admits every family of its prefix"
+    )
+    unkept = {**rule, "expr": "gpu_fault_nowhere_kept_family == 1"}
+    assert MODULE.keep_filter_defects(both, [unkept]) == [
+        "AMP rule metric is dropped by ADOT: GpuFaultGpuClusterUnavailable uses "
+        "gpu_fault_nowhere_kept_family"
+    ], "a family neither collector keeps is still reported"
+
+
+def test_the_repository_alerting_has_no_static_defects() -> None:
+    """The verifier's own command over this checkout: every rule reaches AMP
+    through a collector that keeps it, and every rule has its runbook card."""
+
+    result = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/verify-regional-alerting.py")],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "UNREACHABLE_ALERT_DEFECTS= 0" in result.stdout, result.stdout

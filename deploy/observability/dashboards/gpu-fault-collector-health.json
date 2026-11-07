@@ -315,6 +315,158 @@
       ],
       "title": "Collector metrics snapshot age",
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 7,
+      "panels": [],
+      "title": "GPU clusters without nodes",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Each GPU cluster's executor, through the data-plane collector. Unavailable 1: the node selector selects no node and the provider does not declare that capacity zero (gpu-fault-admin status names why). Parked 1: scaled to zero on purpose, never paged. Both 0: the cluster has nodes. A cluster whose release skipped the collector never appears.\n\nAlert GpuFaultGpuClusterUnavailable (critical, for 30m): docs/en/administrator-operations.md#gpufaultgpuclusterunavailable",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 19
+      },
+      "id": 8,
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "value_and_name"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region, gpu_cluster) (gpu_fault_cluster_executor_zero_node_unavailable{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": true,
+          "legendFormat": "{{gpu_cluster}} unavailable",
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (control_plane_cluster, region, gpu_cluster) (gpu_fault_cluster_executor_zero_node_parked{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": true,
+          "legendFormat": "{{gpu_cluster}} parked",
+          "range": false,
+          "refId": "B"
+        }
+      ],
+      "title": "GPU cluster without nodes: unavailable / parked",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "The nodes each cluster's node selector selects, as its executor last read them (every 60 s).",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 19
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "min by (control_plane_cluster, region, gpu_cluster) (gpu_fault_cluster_executor_selected_nodes{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{gpu_cluster}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Selected GPU nodes by cluster",
+      "type": "timeseries"
     }
   ],
   "refresh": "1m",

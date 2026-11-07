@@ -35,7 +35,9 @@ from grafana_dashboard_catalog import DASHBOARDS, Dashboard, Panel
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "deploy" / "observability" / "dashboards"
 AMP_RULES = ROOT / "deploy" / "observability" / "amp-rules.yaml"
-# Sources supplying metric names rendered by the control-plane scrape job.
+# Sources supplying metric names rendered by the control-plane scrape job, and
+# the data-plane exporters a dashboard plots (the Completion Watcher; the
+# cluster executor, whose family is a prefix constant over suffix literals).
 # The aggregation registry defines the merger's own two gauge constants.
 EXPORTER_SOURCES = (
     "src/gpu_fault/app/metrics.py",
@@ -51,6 +53,7 @@ EXPORTER_SOURCES = (
     "src/gpu_fault/app/metric_aggregation.py",
     "src/gpu_fault/app/process_metrics.py",
     "src/gpu_fault/completion_metrics_server.py",
+    "src/gpu_fault/cluster_executor/metrics.py",
 )
 DATASOURCE = {"type": "prometheus", "uid": "gpu-fault-amp"}
 SCHEMA_VERSION = 39  # Grafana 10.4
@@ -73,6 +76,11 @@ MULTI_SERIES_SUFFIXES = ("_sum", "_count", "_max", "_bucket")
 # ``f"gpu_fault_workflow_dispatch_{name}"`` over a tuple of suffix literals:
 # the prefix is joined with every quoted identifier in the same file.
 FORMATTED_PREFIX = re.compile(r"\b(gpu_fault_[a-z0-9_]+_)\{")
+# ``CLUSTER_EXECUTOR_METRICS_PREFIX = "gpu_fault_cluster_executor_"``: a
+# ``dataplane_metrics.MetricFamily`` prefix, joined with the same suffixes.
+PREFIX_CONSTANT = re.compile(
+    r'^[A-Z][A-Z0-9_]*\s*=\s*"(gpu_fault_[a-z0-9_]+_)"\s*$', re.MULTILINE
+)
 IDENTIFIER_LITERAL = re.compile(r"\"([a-z][a-z0-9_]*)\"")
 RULE_METRIC = re.compile(r"\b(?:gpu_fault|otelcol)_[a-z0-9_]+|\bup(?=\{)")
 JOB_SELECTOR = re.compile(r'job="[^"]+"')
@@ -136,7 +144,8 @@ def exporter_metric_families() -> frozenset[str]:
     Summary and histogram families are declared once and rendered with the
     ``_sum``/``_count``/``_max``/``_bucket`` suffixes, so those are added for
     every family whose ``# TYPE`` says so. A name assembled from an f-string
-    prefix and a table of suffix literals is expanded from that same file.
+    prefix, or a prefix constant, and a table of suffix literals is expanded
+    from that same file.
     """
     names: set[str] = set()
     for relative in EXPORTER_SOURCES:
@@ -144,7 +153,9 @@ def exporter_metric_families() -> frozenset[str]:
         names.update(METRIC_NAME.findall(text))
         for family in MULTI_SERIES_TYPE.findall(text):
             names.update(family + suffix for suffix in MULTI_SERIES_SUFFIXES)
-        prefixes = set(FORMATTED_PREFIX.findall(text))
+        prefixes = set(FORMATTED_PREFIX.findall(text)) | set(
+            PREFIX_CONSTANT.findall(text)
+        )
         if prefixes:
             suffixes = set(IDENTIFIER_LITERAL.findall(text))
             names.update(prefix + suffix for prefix in prefixes for suffix in suffixes)

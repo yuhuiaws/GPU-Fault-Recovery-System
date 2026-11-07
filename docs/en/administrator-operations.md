@@ -4025,10 +4025,12 @@ timestamp stops; one WARNING per failed check). Both grants arrive with the rele
 `executor_role` bootstrap task of `deploy`, whose read-only probe re-puts an inline policy that differs, the RBAC one
 with the executor manifest.
 
-**Alerts:** nothing pages for a fleet without nodes whose product Deployments
-still run on its other nodes -- the collector-silence, stale-Agent and topology alerts count ACTIVE Agents only;
-`GpuFaultDataplaneCollectorMissing` fires for the cluster only when no node is left to run its watcher, which is a real fault.
-An unavailable cluster is therefore seen in `status`, the deploy log and the deploy record, not through an alert.
+**Alerts:** an unavailable cluster pages: `GpuFaultGpuClusterUnavailable` (critical, after 30 minutes) reads the
+executor's `gpu_fault_cluster_executor_zero_node_unavailable` with `max` across its replicas, so one replica that cannot
+prove the park is enough, and carries the cluster as `cluster_id` (the mail subject leads with it); its card (§8) starts at
+`gpu-fault-admin status`. A parked cluster never pages. The collector-silence, stale-Agent and topology alerts still count
+ACTIVE Agents only; `GpuFaultDataplaneCollectorMissing` fires for the cluster when no node is left to run its watcher and
+executor -- then there is no zero-node gauge either, and that alert is the page.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 
@@ -4512,7 +4514,7 @@ from the panel table in `scripts/grafana_dashboard_catalog.py`, and `make grafan
 guarantees the checked-in JSON is byte-for-byte identical to the generated result. The generator reads `amp-rules.yaml`: whenever an alert expression ends in
 `> N` / `>= N` / `< N`, the panel drawing that metric gets a threshold line of the same value (critical red, warning
 orange); each panel's description lists the alert names it covers, their `for` durations and the anchors of the cards in this section, so it is one step from a panel to
-a triage card. Each of the 89 alerts lands on at least one panel (`tests/test_grafana_dashboards.py`
+a triage card. Each of the 90 alerts lands on at least one panel (`tests/test_grafana_dashboards.py`
 iterates over all rules asserting this, and asserts the thresholds too); a threshold changed in the rules without regenerating turns the gate red.
 
 Import path: the Grafana provisioning step of `gpu-fault-admin deploy` imports them automatically at deployment into
@@ -4556,7 +4558,7 @@ Role choice: on-call dashboard viewing uses `VIEWER`; give `EDITOR` / `ADMIN` on
 `gpu-fault-admin deploy` re-import -- a lasting change must be made in
 `scripts/grafana_dashboard_catalog.py` and regenerated. To revoke, replace `"action":"ADD"` with `"REVOKE"`.
 After authorisation log in via the Identity Center portal or by opening the address above directly; `Alerting -> Alert rules` with the AMP data source
-shows the live state of the 89 rules (7 groups), corresponding one-to-one to the cards below.
+shows the live state of the 90 rules (7 groups), corresponding one-to-one to the cards below.
 
 Reading the dashboards is consistent with the cards: only staying above the threshold line (or below it for `< N`-type panels) for longer than the `for` duration
 is an alert; the overview's "Alerts firing" panel reads AMP's `ALERTS{alertstate="firing"}` directly,
@@ -4565,7 +4567,7 @@ and the names are the card names below.
 | Dashboard (uid) | Alert group | Panel row -> card |
 | --- | --- | --- |
 | GPU Fault · Overview (`gpu-fault-overview`) | Cross-group closed-loop essentials | Alerts -> all firing cards; Closed loop -> `GpuFaultIncidentsAwaitingOperator`, `GpuFaultOrphanWorkflows` (the workflows-by-status and notification outbox depth panels are trend readings); Processor queue -> `GpuFaultProcessorQueueDepthHigh`, `GpuFaultProcessorQueueDepthCritical`, `GpuFaultProcessorOldestRequestDelayed`, `GpuFaultProcessorClusterBacklogHigh`, `GpuFaultProcessorClusterBacklogCritical`; Remediation budget -> `GpuFaultRemediationStormBreakerOpen` (the window-nodes-versus-threshold panel is a reading); Store I/O -> `GpuFaultStoreIoSaturated`; Declared topology -> `GpuFaultClusterNodesExceedDeclaredTopology`, `GpuFaultManagedNodesExceedDeclaredTopology` (the "Declared GPU node counts" stat panel is a reading) |
-| GPU Fault · Collector health (`gpu-fault-collector-health`) | `gpu-fault-collector-health` | Collector delivery -> `GpuFaultCollectorSilent`, `GpuFaultCollectorCollectionErrors`; Freshness -> `GpuFaultCollectorMetricsSnapshotStale` |
+| GPU Fault · Collector health (`gpu-fault-collector-health`) | `gpu-fault-collector-health` | Collector delivery -> `GpuFaultCollectorSilent`, `GpuFaultCollectorCollectionErrors`; Freshness -> `GpuFaultCollectorMetricsSnapshotStale`; GPU clusters without nodes -> `GpuFaultGpuClusterUnavailable` (the selected-nodes panel is a reading) |
 | GPU Fault · Telemetry pipeline (`gpu-fault-telemetry-pipeline`) | `gpu-fault-telemetry-pipeline` | Remote write -> `GpuFaultTelemetryRemoteWriteFailing`, `GpuFaultTelemetryRemoteWriteQueueSaturated`, `GpuFaultAdotMemoryHigh`; Scrape liveness -> `GpuFaultAdotSelfMetricsMissing`, `GpuFaultDataplaneCollectorMissing`; Completion Watcher -> `GpuFaultCompletionActiveStateUnavailable`, `GpuFaultCompletionOutboxAppendFailures` |
 | GPU Fault · Control-plane capacity (`gpu-fault-control-plane-capacity`) | `gpu-fault-control-plane-capacity` | Scrape liveness -> `GpuFaultControlPlaneMetricsMissing`, `GpuFaultControlPlaneReplicaScrapeFailing`, `GpuFaultMetricsContributorFailing`, `GpuFaultProcessorConsumerStalled`; PostgreSQL pool and credentials -> `GpuFaultPostgresPoolCheckoutQueueing`, `GpuFaultPostgresPoolConnectionErrors`, `GpuFaultAuroraCredentialRefreshStale`, `GpuFaultAuroraCredentialRefreshFailing`, `GpuFaultAuroraCredentialRefreshStatusUnknown` (the oversubscription ratio and the per-consumer demand breakdown are readings without a card); Control-loop review counters -> `GpuFaultRemoteCommandStaleFenceSwept`, `GpuFaultNotificationDeliveryErrors`, `GpuFaultControlRecordArchiveErrors`; Processor queue -> `GpuFaultProcessorQueueDepthHigh`, `GpuFaultProcessorQueueDepthCritical`, `GpuFaultProcessorOldestRequestDelayed`, `GpuFaultProcessorClusterBacklogHigh`, `GpuFaultProcessorClusterBacklogCritical`; Fleet vs declared topology -> `GpuFaultClusterNodesExceedDeclaredTopology`, `GpuFaultManagedNodesExceedDeclaredTopology`; Metric scan truncation -> `GpuFaultWorkflowMetricScanTruncated`, `GpuFaultAttemptObservationMetricScanTruncated`; Admission and Store I/O -> `GpuFaultProcessorAdmissionRejected`, `GpuFaultStoreIoSaturated`, `GpuFaultStoreIoRejected`, `GpuFaultStoreIoBackendUnavailable`; Latency, leases and counters -> `GpuFaultProcessorP95Slow`, `GpuFaultProcessorExpiredLeasesReclaimed`, `GpuFaultProcessorCounterDrift`, `GpuFaultProcessorCounterDriftScanUnavailable`; Telemetry spool -> `GpuFaultTelemetrySpoolListenerDown`, `GpuFaultTelemetrySpoolDataLoss`, `GpuFaultTelemetrySpoolAdmissionRejected`, `GpuFaultTelemetrySpoolReplayError`, `GpuFaultTelemetrySpoolDrainDelayed`; Loop liveness -> `GpuFaultWorkflowDispatcherStalled`, `GpuFaultPeriodicRunnerStalled`, `GpuFaultProcessorUnhealthy`, `GpuFaultProcessorNoActiveConsumer`, `GpuFaultTelemetrySpoolConsumerStalled`, `GpuFaultTelemetrySpoolConsumerStopped`; Processor and periodic errors -> `GpuFaultProcessorLeaseRenewalFailing`, `GpuFaultProcessorFaultEventsRejected`, `GpuFaultPeriodicServiceErrors`, `GpuFaultMetricsAggregationIncomplete` |
 | GPU Fault · Remote command (`gpu-fault-remote-command`) | `gpu-fault-remote-command` | Claim latency -> `GpuFaultRemoteCommandUnclaimed`, `GpuFaultRemoteCommandExecutorInternalError`; Command census -> `GpuFaultRemoteCommandUnclaimedExpired` (the per-state/per-cluster command count panels are trend readings) |
@@ -4667,6 +4669,30 @@ evidence and routine requests are refused. The two "depth" panels plot the same 
   and the Aurora credential refresh CronJob.
 - **Boundary**: do not judge the silence of `GpuFaultCollectorSilent` as "recovered" before the snapshot recovers.
   See REG-14.1 for details.
+
+### GpuFaultGpuClusterUnavailable
+
+- **Meaning**: for 30 minutes the node selector of GPU cluster `cluster_id` has selected no Kubernetes node while its
+  provider does not declare that capacity zero: the cluster is *unavailable* (§5.0.6) -- a covered managed node group or
+  HyperPod instance group still wants nodes (they were lost to a spot reclaim or a failed replacement, or a scale-up is
+  still joining), a group is not `ACTIVE`/`InService`, the selector covers no group, a Karpenter NodePool could still launch
+  a selected node, or the executor could not read the provider. No GPU fault on that cluster is detected or remediated
+  until nodes return; the other clusters, the control plane and every deploy are unaffected. The source is the cluster
+  executor's `gpu_fault_cluster_executor_zero_node_unavailable` (§5.0.6 "The executor's verdict", the deploy host's own
+  rule), read with `max` across the executor replicas through the data-plane collector.
+- **First check**: run `gpu-fault-admin status --state-dir STATE_DIR` and read the zero-node reason: the header names the
+  cluster, `unavailable`, why it is not parked and the covered groups with their desired/target counts
+  (`zero_node_clusters` in `--full`); the executor says the same once per change of state
+  (`kubectl -n gpu-fault-system logs deploy/gpu-fault-cluster-executor | grep 'GPU cluster without nodes'`). Then the
+  provider named there: an EKS node group's `scalingConfig`, health and Auto Scaling activity, a HyperPod instance group's
+  `TargetCount`/`CurrentCount`/`Status`. A reason starting `the provider's node capacity could not be read` points at the
+  executor's own grants -- `eks:ListNodegroups` on the cluster ARN, `eks:DescribeNodegroup`, `sagemaker:DescribeCluster`,
+  get/list `nodepools.karpenter.sh` -- which arrive with the release (`gpu-fault-admin deploy` re-applies them).
+- **Boundary**: a cluster scaled to zero on purpose (every covered group at desired/target 0, no NodePool that could supply
+  a node) reads *parked* and does not page; scaling it up again and waiting for the nodes is the whole recovery (§5.0.6).
+  Do not clear the page by editing the node selector, relabelling groups or removing the cluster: `remove-cluster` is a
+  membership change, not a repair. A cluster with no node left to run its executor produces no gauge at all; its
+  `GpuFaultDataplaneCollectorMissing` is then the page.
 
 ### GpuFaultTelemetryRemoteWriteFailing
 

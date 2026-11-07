@@ -313,6 +313,53 @@ COLLECTOR_HEALTH = Dashboard(
                 ),
             ),
         ),
+        Row(
+            "GPU clusters without nodes",
+            (
+                Panel(
+                    "GPU cluster without nodes: unavailable / parked",
+                    (
+                        Target(
+                            f"max {BY_GPU_CLUSTER} ("
+                            + series("gpu_fault_cluster_executor_zero_node_unavailable")
+                            + ")",
+                            "{{gpu_cluster}} unavailable",
+                        ),
+                        Target(
+                            f"max {BY_GPU_CLUSTER} ("
+                            + series("gpu_fault_cluster_executor_zero_node_parked")
+                            + ")",
+                            "{{gpu_cluster}} parked",
+                        ),
+                    ),
+                    kind="stat",
+                    description=(
+                        "Each GPU cluster's executor, through the data-plane "
+                        "collector. Unavailable 1: the node selector selects no "
+                        "node and the provider does not declare that capacity "
+                        "zero (gpu-fault-admin status names why). Parked 1: "
+                        "scaled to zero on purpose, never paged. Both 0: the "
+                        "cluster has nodes. A cluster whose release skipped the "
+                        "collector never appears."
+                    ),
+                ),
+                Panel(
+                    "Selected GPU nodes by cluster",
+                    (
+                        Target(
+                            f"min {BY_GPU_CLUSTER} ("
+                            + series("gpu_fault_cluster_executor_selected_nodes")
+                            + ")",
+                            "{{gpu_cluster}}",
+                        ),
+                    ),
+                    description=(
+                        "The nodes each cluster's node selector selects, as its "
+                        "executor last read them (every 60 s)."
+                    ),
+                ),
+            ),
+        ),
     ),
 )
 

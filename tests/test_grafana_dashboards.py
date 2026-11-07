@@ -26,7 +26,6 @@ MODULE = lazy_script_module(ROOT / "scripts/build-grafana-dashboards.py")
 ALERTING = lazy_script_module(ROOT / "scripts/verify-regional-alerting.py")
 DASHBOARDS = ROOT / "deploy/observability/dashboards"
 AMP_RULES = ROOT / "deploy/observability/amp-rules.yaml"
-ADOT = ROOT / "deploy/observability/adot-control-plane.yaml"
 DATAPLANE_ADOT = ROOT / "deploy/dataplane/adot-dataplane.yaml"
 DATASOURCE = {"type": "prometheus", "uid": "gpu-fault-amp"}
 CLUSTER_VARIABLE_QUERY = (
@@ -203,7 +202,23 @@ def test_every_plotted_gpu_fault_metric_is_emitted_by_an_exporter() -> None:
 
 
 def test_every_plotted_metric_survives_the_adot_keep_filter() -> None:
-    documents = yaml.safe_load_all(ADOT.read_text(encoding="utf-8"))
+    """Through a collector that keeps it: the control plane's, or the
+    per-GPU-cluster one (the rows below are checked against that one alone)."""
+
+    scrapes = ALERTING.collector_scrapes(ROOT)
+    probes = [
+        {"alert": f"{uid}/{panel['title']}", "expr": " ".join(panel_exprs(panel))}
+        for uid, panel in all_panels()
+    ]
+
+    assert ALERTING.keep_filter_defects(scrapes, probes) == []
+
+
+def test_the_zero_node_row_survives_the_data_plane_keep_filter() -> None:
+    """The executor's zero-node gauges reach AMP only through the data-plane
+    collector: its own keep filter must admit every panel of the row."""
+
+    documents = yaml.safe_load_all(DATAPLANE_ADOT.read_text(encoding="utf-8"))
     collector = next(
         document
         for document in documents
@@ -214,8 +229,13 @@ def test_every_plotted_metric_survives_the_adot_keep_filter() -> None:
     probes = [
         {"alert": f"{uid}/{panel['title']}", "expr": " ".join(panel_exprs(panel))}
         for uid, panel in all_panels()
+        if any(
+            name.startswith("gpu_fault_cluster_executor_")
+            for name in GPU_FAULT_METRIC.findall(" ".join(panel_exprs(panel)))
+        )
     ]
 
+    assert len(probes) == 2, "the zero-node row is gone from the dashboards"
     assert ALERTING.keep_filter_defects(scrapes, probes) == []
 
 

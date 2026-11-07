@@ -1085,24 +1085,18 @@ def test_amp_rules_cover_prometheus_rules_and_kept_metrics() -> None:
     }
     assert local_alerts <= amp_alerts
 
-    documents = [
-        item
-        for item in yaml.safe_load_all(
-            (ROOT / "deploy/observability/adot-control-plane.yaml").read_text(
-                encoding="utf-8"
-            )
-        )
-        if item
-    ]
-    collector = next(item for item in documents if item["kind"] == "ConfigMap")
-    config = yaml.safe_load(collector["data"]["collector.yaml"])
-    scrape = config["receivers"]["prometheus"]["config"]["scrape_configs"][0]
-    keep = next(
+    # Through a collector that keeps it: the control plane's, or -- for the
+    # executor's families -- the per-GPU-cluster one (both write to AMP).
+    from tests._script_loader import lazy_script_module
+
+    verifier = lazy_script_module(ROOT / "scripts/verify-regional-alerting.py")
+    keeps = [
         item["regex"]
+        for scrape in verifier.collector_scrapes(ROOT)
         for item in scrape["metric_relabel_configs"]
         if item["action"] == "keep"
-    )
-    pattern = re.compile(f"^(?:{keep})$")
+    ]
+    pattern = re.compile("^(?:" + "|".join(f"(?:{keep})" for keep in keeps) + ")$")
     metric_names = {
         name
         for group in amp["groups"]

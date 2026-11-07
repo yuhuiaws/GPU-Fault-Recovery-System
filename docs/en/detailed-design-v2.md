@@ -4481,7 +4481,9 @@ every 60 s): it counts the selected nodes and, only when the API lists none, rea
 (HyperPod `DescribeCluster`; EKS `ListNodegroups`/`DescribeNodegroup`; Karpenter NodePools get/list) and exports
 `gpu_fault_cluster_executor_selected_nodes`, `..._zero_node_parked`, `..._zero_node_unavailable` and
 `..._last_zero_node_check_timestamp`; fed the same provider state, both readers reach the same proof
-(`tests/regional/test_zero_node_capacity_parity.py`).
+(`tests/regional/test_zero_node_capacity_parity.py`). `GpuFaultGpuClusterUnavailable` (critical, `for: 30m`) pages on the
+unavailable gauge with `max` across the executor replicas -- one replica that cannot prove the park is enough -- and
+`label_replace` names the cluster as `cluster_id`; a parked cluster never pages.
 The proof reads only what `regional_contexts` already reads; the departed-node cleanup itself does not consult it. It never opens a read snapshot (`regional_release_state.read_snapshot`):
 the snapshot's cache lives on the release object every thread shares, and a release step -- the candidate preflight, the
 cluster rollout -- runs its clusters in parallel threads whose node safety reads must stay fresh (`gpu_node_items`

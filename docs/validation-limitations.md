@@ -53,7 +53,10 @@ fake Kubernetes, EKS, SageMaker and Karpenter clients -- the check itself, its
 place in the claim loop and its parity with the deploy host's proof over the
 same provider state; on a live site only the parked reading of a cluster
 scaled to zero can be observed, never the unavailable one, which needs lost
-capacity.
+capacity. `GpuFaultGpuClusterUnavailable` is therefore proven with promtool
+over synthetic executor series (both replicas, one replica, a window too
+short, parked, capacity returning, two clusters); live, only its silence over
+a parked cluster is observable.
 
 ## Xid linkage and Drain P2P recovery
 

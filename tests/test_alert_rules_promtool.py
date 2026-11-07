@@ -877,6 +877,187 @@ def test_topology_alerts_fire_only_on_a_sustained_excess(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+# A GPU cluster without nodes that its provider does not declare parked
+# (b267). Each cluster's two executor replicas export the verdict, unlabelled;
+# the data-plane collector adds the site labels and gpu_cluster. Each case puts
+# the gauge on one side of the 30-minute window or of the fail-closed `max`:
+# sustained on both replicas, one replica only, shorter than the window, parked,
+# nodes returning, two clusters of which one is unavailable.
+GPU_CLUSTER_UNAVAILABLE = "GpuFaultGpuClusterUnavailable"
+EXECUTORS = ("gpu-fault-cluster-executor-0", "gpu-fault-cluster-executor-1")
+
+
+def _executor_series(cluster: str, pod: str, metric: str, values: str) -> dict:
+    """One executor replica's gauge, labelled the way the data-plane ADOT does."""
+
+    tags = {
+        **QUEUE_SITE,
+        "gpu_cluster": cluster,
+        "job": "gpu-fault-dataplane",
+        "pod": pod,
+        "instance": f"{pod}:9111",
+        "service_role": "gpu-fault-cluster-executor",
+    }
+    rendered = ",".join(f'{key}="{value}"' for key, value in tags.items())
+    return {"series": f"{metric}{{{rendered}}}", "values": values}
+
+
+def _zero_node(
+    cluster: str, unavailable: tuple[str, str], parked: str = "0x60"
+) -> list[dict]:
+    """Both replicas' unavailable and parked gauges of ``cluster``."""
+
+    return [
+        series
+        for pod, values in zip(EXECUTORS, unavailable, strict=True)
+        for series in (
+            _executor_series(
+                cluster, pod, "gpu_fault_cluster_executor_zero_node_unavailable", values
+            ),
+            _executor_series(
+                cluster, pod, "gpu_fault_cluster_executor_zero_node_parked", parked
+            ),
+        )
+    ]
+
+
+def _unavailable_alert(rule: dict, cluster: str) -> dict:
+    annotations = {
+        key: str(text).replace("{{ $labels.gpu_cluster }}", cluster)
+        for key, text in rule["annotations"].items()
+    }
+    return {
+        "exp_labels": {
+            **QUEUE_SITE,
+            "gpu_cluster": cluster,
+            "cluster_id": cluster,
+            "severity": rule["labels"]["severity"],
+        },
+        "exp_annotations": annotations,
+    }
+
+
+ZERO_NODE_CASES = [
+    pytest.param(
+        _zero_node("gpu-eks", ("1x60", "1x60")),
+        [("29m", []), ("31m", ["gpu-eks"])],
+        id="unavailable-on-both-replicas-pages-for-that-cluster-after-30m",
+    ),
+    pytest.param(
+        _zero_node("gpu-eks", ("1x60", "0x60")),
+        [("31m", ["gpu-eks"])],
+        id="one-replica-saying-unavailable-is-enough-max-fails-closed",
+    ),
+    pytest.param(
+        _zero_node("gpu-eks", ("1x24 0x35", "1x24 0x35")),
+        [("20m", []), ("45m", [])],
+        id="nodes-joining-within-the-window-stay-quiet",
+    ),
+    pytest.param(
+        _zero_node("gpu-eks", ("0x60", "0x60"), parked="1x60"),
+        [("45m", [])],
+        id="a-cluster-parked-on-purpose-never-pages",
+    ),
+    pytest.param(
+        _zero_node("gpu-eks", ("1x40 0x19", "1x40 0x19")),
+        [("35m", ["gpu-eks"]), ("45m", [])],
+        id="capacity-that-returns-resolves-the-page",
+    ),
+    pytest.param(
+        [
+            *_zero_node("gpu-eks", ("1x60", "1x60")),
+            *_zero_node("gpu-hp", ("0x60", "0x60")),
+        ],
+        [("31m", ["gpu-eks"])],
+        id="only-the-unavailable-cluster-pages",
+    ),
+]
+
+
+def _zero_node_rule() -> dict:
+    [(_, document)] = MODULE.rule_documents(
+        [ROOT / "deploy/observability/amp-rules.yaml"]
+    )
+    return next(
+        rule
+        for group in document["groups"]
+        for rule in group["rules"]
+        if rule.get("alert") == GPU_CLUSTER_UNAVAILABLE
+    )
+
+
+def test_the_unavailable_cluster_rule_pages_fail_closed_per_cluster() -> None:
+    rule = _zero_node_rule()
+    expression = " ".join(str(rule["expr"]).split())
+
+    assert rule["labels"] == {"severity": "critical"}, "a cluster without nodes pages"
+    assert rule["for"] == "30m", "it must ride out the departure guard and a rejoin"
+    assert expression.startswith(
+        "label_replace(max by (control_plane_cluster, region, gpu_cluster) "
+        "(gpu_fault_cluster_executor_zero_node_unavailable) == 1,"
+    ), expression
+    assert '"cluster_id", "$1", "gpu_cluster", "(.+)")' in expression, (
+        "the alert carries the cluster_id Alertmanager groups on and the subject leads with"
+    )
+    assert "gpu-fault-admin status" in rule["annotations"]["description"], (
+        "the page names the command that reads the zero-node reason"
+    )
+
+
+@pytest.mark.parametrize(("inputs", "checks"), ZERO_NODE_CASES)
+def test_the_unavailable_cluster_alert_fires_only_on_a_sustained_verdict(
+    tmp_path: Path, inputs: list[dict[str, str]], checks: list
+) -> None:
+    promtool = shutil.which(os.environ.get("PROMTOOL", "promtool"))
+    assert promtool is not None, "set PROMTOOL to the pinned local promtool"
+    rule = _zero_node_rule()
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text(
+        yaml.safe_dump(
+            {"groups": [{"name": "zero-node", "rules": [rule]}]}, sort_keys=False
+        ),
+        encoding="utf-8",
+    )
+    test_file = tmp_path / "cases.yaml"
+    test_file.write_text(
+        yaml.safe_dump(
+            {
+                "rule_files": [str(rule_file)],
+                "evaluation_interval": "1m",
+                "tests": [
+                    {
+                        "interval": "1m",
+                        "input_series": inputs,
+                        "alert_rule_test": [
+                            {
+                                "alertname": GPU_CLUSTER_UNAVAILABLE,
+                                "eval_time": when,
+                                "exp_alerts": [
+                                    _unavailable_alert(rule, cluster)
+                                    for cluster in firing
+                                ],
+                            }
+                            for when, firing in checks
+                        ],
+                    }
+                ],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [promtool, "test", "rules", str(test_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     "defect",
     [

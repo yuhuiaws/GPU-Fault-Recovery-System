@@ -3434,6 +3434,9 @@ When any of these is missing, the release does **not** deploy that cluster's col
 `dataplane_observability[<cluster>]` in the plan is an empty list, and nothing is touched. Be informed of the consequences:
 
 - `GpuFaultCompletionActiveStateUnavailable` / `GpuFaultCompletionOutboxAppendFailures` really fire only on clusters where the collector is installed;
+- `GpuFaultGpuClusterUnavailable` reads the executor's zero-node gauge (`gpu_fault_cluster_executor_zero_node_unavailable`),
+  which only the data-plane collector keeps, so a cluster without the collector cannot page for losing every node --
+  `status` still names it as unavailable;
 - `GpuFaultTelemetryRemoteWriteFailing` / `GpuFaultTelemetryRemoteWriteQueueSaturated` do not select by job, so they also cover
   dropped points and the queue of the data-plane collector (the raw series carry `gpu_cluster`); `GpuFaultAdotSelfMetricsMissing` looks only at the control plane's
   `gpu-fault-adot-self`; the data plane's own job is named `gpu-fault-adot-dataplane-self`, deliberately different; the absence of the data-plane collector is reported by

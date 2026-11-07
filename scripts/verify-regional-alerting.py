@@ -27,6 +27,14 @@ EXPECTED_GROUPS = {
     "gpu-fault-telemetry-pipeline",
 }
 RUNBOOK_DOCUMENT = "docs/en/administrator-operations.md"
+# The two ADOT collectors that write into the one AMP workspace: the control
+# plane's own, and the per-GPU-cluster data-plane collector, which alone
+# scrapes the executor, the Completion Watcher and the reconciler. A rule may
+# read a family either one keeps.
+COLLECTOR_CONFIGS = (
+    "deploy/observability/adot-control-plane.yaml",
+    "deploy/dataplane/adot-dataplane.yaml",
+)
 # The triage cards live under one section and are titled with the bare alert
 # name, so the anchor is derivable from the alert. Any other `###` heading in
 # the document is a normal numbered subsection and is not an alert card.
@@ -313,27 +321,41 @@ def _static_defects(root: Path) -> list[str]:
     for alert in sorted(prometheus_rule_alerts - amp_alerts):
         defects.append(f"alert only exists in the unloaded PrometheusRule: {alert}")
 
-    documents = list(
-        yaml.safe_load_all(
-            (root / "deploy/observability/adot-control-plane.yaml").read_text(
-                encoding="utf-8"
-            )
-        )
-    )
-    collector = next(
-        document
-        for document in documents
-        if document and document.get("kind") == "ConfigMap"
-    )
-    config = yaml.safe_load(collector["data"]["collector.yaml"])
-    # Every scrape job, not just the first: the self-telemetry job carries the
-    # only evidence that remote_write is delivering anything, and its keep filter
-    # and its label drops are as load-bearing as the control-plane job's.
-    scrapes = config["receivers"]["prometheus"]["config"]["scrape_configs"]
+    # Every scrape job of both collectors, not just the first: the
+    # self-telemetry job carries the only evidence that remote_write is
+    # delivering anything, and its keep filter and its label drops are as
+    # load-bearing as the control-plane job's; the data-plane jobs are the only
+    # path of the executor's families (GpuFaultGpuClusterUnavailable).
+    scrapes = collector_scrapes(root)
     for scrape in scrapes:
         defects.extend(collector_label_defects(scrape))
     defects.extend(keep_filter_defects(scrapes, amp_rules))
     return defects
+
+
+def collector_scrapes(root: Path) -> list[dict[str, Any]]:
+    """Every scrape job of every collector in ``COLLECTOR_CONFIGS``, in order.
+
+    The keep filters are unioned across both collectors as they are across
+    jobs (``keep_filter_defects``): a metric reaches AMP if any job of either
+    keeps it. Reading the control-plane collector alone reported the
+    executor's ``gpu_fault_cluster_executor_*`` families -- kept only by the
+    data-plane collector -- as dropped.
+    """
+
+    scrapes: list[dict[str, Any]] = []
+    for relative in COLLECTOR_CONFIGS:
+        documents = list(
+            yaml.safe_load_all((root / relative).read_text(encoding="utf-8"))
+        )
+        collector = next(
+            document
+            for document in documents
+            if document and document.get("kind") == "ConfigMap"
+        )
+        config = yaml.safe_load(collector["data"]["collector.yaml"])
+        scrapes.extend(config["receivers"]["prometheus"]["config"]["scrape_configs"])
+    return scrapes
 
 
 def _live_rule_defects(path: Path) -> tuple[list[str], set[str]]:

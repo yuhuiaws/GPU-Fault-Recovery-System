@@ -53,6 +53,45 @@ groups:
           description: >-
             Ensure the metrics scraper targets ingress replicas and check
             ingress connectivity to the shared control-plane store.
+      # A GPU cluster whose node selector selects no node while its provider
+      # does not declare that capacity zero. The collector-silence and
+      # stale-Agent alerts count ACTIVE Agents only and the departed-node
+      # cleanup retires the Agents of the nodes that left, so a cluster that
+      # lost every node was silent everywhere but `status`. Each cluster's
+      # executor reaches the deploy host's verdict on its own
+      # (gpu_fault.zero_node_capacity, cluster_executor/zero_node_probe.py) and
+      # exports it; the series reach AMP only through the per-GPU-cluster
+      # collector (deploy/dataplane/adot-dataplane.yaml, job
+      # gpu-fault-dataplane), whose target relabels add gpu_cluster. `max`
+      # across the executor replicas fails closed, as `status` does;
+      # label_replace gives the alert the cluster_id Alertmanager groups on and
+      # the SNS subject leads with. 30 minutes outlasts the departure guard and
+      # a spot replacement or scale-up still joining. A cluster parked on
+      # purpose reads 0 here and never fires.
+      - alert: GpuFaultGpuClusterUnavailable
+        expr: >-
+          label_replace(max by (control_plane_cluster, region, gpu_cluster)
+          (gpu_fault_cluster_executor_zero_node_unavailable) == 1,
+          "cluster_id", "$1", "gpu_cluster", "(.+)")
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          summary: A GPU cluster has no node and its provider does not declare it parked
+          runbook_url: docs/en/administrator-operations.md#gpufaultgpuclusterunavailable
+          description: >-
+            For 30 minutes the node selector of GPU cluster
+            {{ $labels.gpu_cluster }} has selected no node while its provider
+            does not declare that capacity zero: a covered node group or
+            instance group still wants nodes (lost, or still joining), one is
+            not ACTIVE/InService, the selector covers no group, a Karpenter
+            NodePool could still launch a selected node, or the executor could
+            not read the provider. No GPU fault on that cluster is detected or
+            remediated until nodes return. Run `gpu-fault-admin status
+            --state-dir STATE_DIR`: its zero-node header names the state and
+            the reason, and the executor log line `GPU cluster without nodes
+            (unavailable)` says the same. A cluster scaled to zero on purpose
+            reads parked and does not page.
   # Health of the delivery path itself, read from the collector's own counters
   # (the gpu-fault-adot-self scrape job). Every other group in this file assumes
   # that what AMP holds is what the control plane published; when that stops
