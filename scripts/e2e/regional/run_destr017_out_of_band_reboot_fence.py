@@ -1169,6 +1169,7 @@ def execute_case(
                 compensation_failed="FAILED"
                 in (evidence.get("compensation_statuses") or []),
                 incident_recovered=recovered,
+                node_held=evidence.get("node_held") is True,
             )
         )
         if recovered:

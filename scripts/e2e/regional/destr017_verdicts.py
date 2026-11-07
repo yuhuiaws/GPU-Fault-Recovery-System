@@ -199,6 +199,7 @@ def fence_evidence(workflow: dict[str, Any]) -> dict[str, Any]:
     executions = workflow.get("step_executions") or []
     verify = _executions_of(executions, FENCE_STEP_OPERATION)
     compensation = _executions_of(executions, COMPENSATION_OPERATION)
+    completed = workflow.get("completed_operations") or []
     return {
         "workflow_status": workflow.get("status"),
         "workflow_error_variant": fence_variant(str(workflow.get("error") or "")),
@@ -212,7 +213,12 @@ def fence_evidence(workflow: dict[str, Any]) -> dict[str, Any]:
         "executed_operations": sorted(
             {str(item.get("operation")) for item in executions}
         ),
-        "completed_operations": workflow.get("completed_operations") or [],
+        "completed_operations": completed,
+        # The chain's own cordon is still on the node: its MARK_UNSCHEDULABLE
+        # completed and no RESTORE_SCHEDULING released it (the reset plan has
+        # no QUARANTINE; the product's rule is handoff_hold.record_held_nodes).
+        "node_held": "MARK_UNSCHEDULABLE" in completed
+        and "RESTORE_SCHEDULING" not in completed,
     }
 
 
@@ -399,6 +405,7 @@ def successor_errors(
     forbidden_escalations: dict[str, Any],
     compensation_failed: bool,
     incident_recovered: bool = False,
+    node_held: bool = False,
 ) -> list[str]:
     """The escalation the fenced workflow is allowed to open.
 
@@ -411,6 +418,14 @@ def successor_errors(
     (QUARANTINED). If the node self-healed and the incident RECOVERED, an
     operator escalation is not owed -- and one that raced the recovery and failed
     is not a case failure -- so once the forbidden rungs are cleared this returns.
+
+    A fenced chain whose restore compensation succeeded still holds the node
+    when its cordon was never released (``node_held``: MARK_UNSCHEDULABLE
+    completed, RESTORE_SCHEDULING did not). From b262 (R23:
+    ``failure_outcome.held_chain_hand_off`` and ``owes_hand_off``) such a
+    reset chain, whose failed GPU-client check has no rung, hands the held
+    node to support (stage ``held_chain_step``) with the same plan as the
+    containment hand-off, so the same exactly-one support successor is owed.
     """
 
     errors: list[str] = []
@@ -421,16 +436,21 @@ def successor_errors(
         )
     if incident_recovered:
         return errors
-    if not compensation_failed:
+    if not compensation_failed and not node_held:
         if successor_workflow or successor_incident:
             errors.append(
-                "a support escalation exists although no containment step failed"
+                "a support escalation exists although no containment step failed "
+                "and the fenced chain released the node"
             )
         return errors
     if not successor_workflow:
         errors.append(
             "the failed restore compensation opened no support escalation; the "
             "node was left unrestored with nobody accountable"
+            if compensation_failed
+            else "the fenced chain still held the node and opened no support "
+            "escalation (held_chain_step hand-off); the node was left cordoned "
+            "with nobody accountable"
         )
         return errors
     expected_request_id = f"workflow-{SUPPORT_EVENT_PREFIX}{predecessor_request_id}"

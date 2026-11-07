@@ -12633,11 +12633,15 @@ BDF must show no kernel-sourced reset row at all (this case has no GPU reset any
      reached that step); the old generation's command has no SUCCEEDED result;
      `RESTART_NODE`/`REPLACE_NODE`/
      `RESET_ALL_GPUS_NVSWITCHES` do not appear in the plan.
-  10. Successor checks: when `QUARANTINED` and the compensation failed, **exactly** one support successor is opened
+  10. Successor checks: when `QUARANTINED` and the compensation failed -- or the compensation succeeded while the
+      fenced chain still holds the node (its `MARK_UNSCHEDULABLE` completed and its `RESTORE_SCHEDULING` never did: the
+      GPU-client check that failed after the cordon has no rung, and the product hands the still-held node to support,
+      stage `held_chain_step`) -- **exactly** one support successor is opened
       (`workflow-support-after-<W>`, with steps `FREEZE_EVIDENCE →
       MARK_UNSCHEDULABLE → QUARANTINE → ESCALATE_SUPPORT`,
       `official_action=ESCALATE_OPERATOR`, no `predecessor_workflow_id`,
-      sharing `lifetime_deadline_at` with the original workflow); `reboot`/`replace`/`drain`
+      sharing `lifetime_deadline_at` with the original workflow; the same plan either way); a chain whose compensation
+      succeeded and that released the node must have no support successor; `reboot`/`replace`/`drain`
       successors must not exist in either outcome. When `RECOVERED`, a separate support successor is not mandatory, but there must be a
       successful recovery successor whose `predecessor_workflow_id` points at the fenced workflow; it must not preempt the original workflow,
       must not execute a reset or any other forbidden node action, and must not involve another node. A bare
