@@ -4485,7 +4485,11 @@ For the behaviour coverage see `tests/departed_nodes/` (both providers end to en
 PostgreSQL, every refusal, the single writer, the resumed restart), `tests/execution/test_cluster_executor_node_inventory.py`,
 `tests/regional/test_departed_node_status.py`, `tests/admin/test_admin_config_departed_node_cleanup.py`,
 `tests/regional/test_parked_gpu_cluster_proof.py`, `tests/regional/test_parked_gpu_cluster_release.py`,
-`tests/regional/test_zero_node_release_waves.py` and `tests/deploy/test_reconciler_zero_node_cluster.py`.
+`tests/regional/test_zero_node_release_waves.py`, `tests/regional/test_zero_node_snapshot_concurrency.py` (the
+candidate preflight of a parked and a populated cluster in parallel threads), `tests/regional/test_zero_node_deploy_engine.py`
+(a DATA_PLANE_COMPATIBLE release with Agent waves through the real `RegionalRelease`, its thread pools and report
+snapshot, over a parked cluster beside a populated, a parked and an unavailable one: the deploy, its commit and its
+automatic rollback) and `tests/deploy/test_reconciler_zero_node_cluster.py`.
 
 ---
 ## 8. Interface Design
