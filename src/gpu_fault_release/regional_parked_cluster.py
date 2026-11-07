@@ -26,9 +26,10 @@ cluster is in one of two states (``state_of``):
   selector that covers no group, a NodePool that could supply the scope, a
   provider read that failed.
 
-The rule is ``gpu_fault.zero_node_capacity``; this module reads its documents
-on the deploy host. The proof reads the documents ``regional_contexts`` already
-reads --
+The rule is ``gpu_fault.zero_node_capacity``, which every GPU cluster's
+executor also reads to set its zero-node gauges; this module reads its
+documents on the deploy host. The proof reads the documents
+``regional_contexts`` already reads --
 ``describe-nodegroup``, ``describe-cluster``, the Karpenter NodePools of the
 automatic-update advisory -- so it needs no new permission; it is asked only of
 a cluster whose node list is empty, at most once per report snapshot, and never

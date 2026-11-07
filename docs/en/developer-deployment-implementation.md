@@ -1090,6 +1090,16 @@ without that reason, or a Job that failed on its own, keeps the normal backoff. 
 Role/RoleBinding `gpu-fault-cluster-executor-node-keys` in `deploy/dataplane/cluster-action-executor.yaml` (`secrets`
 `get`/`patch`, `resourceNames` limited to that Secret), unchanged by the statement path.
 
+The same manifest's ClusterRole carries one read beyond the workload kinds: get/list on `nodepools.karpenter.sh`, for
+the executor's zero-node check (`src/gpu_fault/cluster_executor/zero_node_probe.py`, a `ClaimLoop` housekeeping job every
+60 s). Only while its selector selects no node does the check read the provider -- that NodePool list, and on an
+eks-managed cluster `eks:ListNodegroups` on the cluster's ARN (`executor_policy_document`) plus the
+`eks:DescribeNodegroup` the reboot path already holds, on HyperPod `sagemaker:DescribeCluster` -- and judge it with the
+rule the deploy host uses (`src/gpu_fault/zero_node_capacity.py`), exporting the
+`gpu_fault_cluster_executor_zero_node_*` gauges. The RBAC rule rolls with the executor manifest; the IAM statement
+reaches a live role through the `executor_role` bootstrap task, whose read-only probe re-puts an inline policy that
+differs.
+
 ### 6.2 Node Key Custody
 
 custody is forward-looking forensics over the trusted delivery path above, not a second key synchronizer. The administrator procedure is in

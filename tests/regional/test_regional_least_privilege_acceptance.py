@@ -279,7 +279,19 @@ def test_blast003_the_executor_rbac_and_iam_stay_minimal() -> None:
         "jobs": {"get", "list", "watch"},
         "pytorchjobs": {"get", "list", "watch"},
         "jobsets": {"get", "list", "watch"},
+        "nodepools": {"get", "list"},
     }
+    # The zero-node check's read: Karpenter NodePools, get/list only, in their
+    # own API group -- a NodePool that could launch a selected node means the
+    # cluster without nodes is not parked.
+    nodepool_rule = next(
+        rule for rule in role["rules"] if rule["resources"] == ["nodepools"]
+    )
+    assert nodepool_rule == {
+        "apiGroups": ["karpenter.sh"],
+        "resources": ["nodepools"],
+        "verbs": ["get", "list"],
+    }, nodepool_rule
     assert {"secrets", "configmaps", "clusterroles", "clusterrolebindings"}.isdisjoint(
         verbs
     ), sorted(verbs)

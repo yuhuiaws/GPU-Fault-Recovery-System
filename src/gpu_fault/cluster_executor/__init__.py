@@ -25,6 +25,9 @@ import surface and splits the code along the seams it already had:
 * ``node_inventory`` -- ``NodeInventoryReporter``: the periodic report of every
   Kubernetes Node name of the cluster, the control plane's evidence that a node
   left (the departed-node cleanup).
+* ``zero_node_probe`` -- ``ZeroNodeCapacityProbe``: the periodic check of a
+  cluster whose selector selects no node -- parked by its provider, or
+  unavailable -- exported as the ``zero_node_*`` gauges an alert reads.
 
 ``SpareReservationSweep`` lives in ``gpu_fault.spare_reservation_sweep`` and is
 re-exported here, where it always was.
@@ -86,6 +89,10 @@ from gpu_fault.cluster_executor.regional_client import (
     RegionalHyperPodSubmissionStore,
     RegionalIncidentOwnershipProvider,
 )
+from gpu_fault.cluster_executor.zero_node_probe import (
+    ZERO_NODE_PROBE_INTERVAL_SECONDS,
+    ZeroNodeCapacityProbe,
+)
 from gpu_fault.spare_reservation_sweep import (
     SPARE_RESERVATION_SWEEP_INTERVAL_SECONDS,
     SPARE_RESERVATION_TTL_SECONDS,
@@ -107,6 +114,7 @@ __all__ = [
     "SPARE_RESERVATION_TTL_SECONDS",
     "STOPPED_BETWEEN_STEPS_STATUS_SOURCE",
     "TRANSPORT_RETRYABLE_SOURCE",
+    "ZERO_NODE_PROBE_INTERVAL_SECONDS",
     "ClusterActionExecutor",
     "ClusterExecutorClaimError",
     "ClusterExecutorError",
@@ -122,6 +130,7 @@ __all__ = [
     "RegionalHyperPodSubmissionStore",
     "RegionalIncidentOwnershipProvider",
     "SpareReservationSweep",
+    "ZeroNodeCapacityProbe",
     "adapter_facing_details",
     "cluster_executor_metrics",
     "execute_batched_command",

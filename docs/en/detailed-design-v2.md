@@ -4476,6 +4476,12 @@ over a cluster whose groups declare no GPU instance type the installer knows. Ze
 nothing. The rule is one pure module, `src/gpu_fault/zero_node_capacity.py`: it judges the provider documents handed to
 it (`capacity_proof`; the node-group facts HyperPod coverage is judged on live there too), and the release engine's
 `regional_parked_cluster` and `admin/bootstrap_ownership` keep their names for it as re-exports, so no second copy can drift.
+Every GPU cluster's executor is its second reader (`cluster_executor/zero_node_probe.py`, a `ClaimLoop` housekeeping job
+every 60 s): it counts the selected nodes and, only when the API lists none, reads the provider with its own grants
+(HyperPod `DescribeCluster`; EKS `ListNodegroups`/`DescribeNodegroup`; Karpenter NodePools get/list) and exports
+`gpu_fault_cluster_executor_selected_nodes`, `..._zero_node_parked`, `..._zero_node_unavailable` and
+`..._last_zero_node_check_timestamp`; fed the same provider state, both readers reach the same proof
+(`tests/regional/test_zero_node_capacity_parity.py`).
 The proof reads only what `regional_contexts` already reads; the departed-node cleanup itself does not consult it. It never opens a read snapshot (`regional_release_state.read_snapshot`):
 the snapshot's cache lives on the release object every thread shares, and a release step -- the candidate preflight, the
 cluster rollout -- runs its clusters in parallel threads whose node safety reads must stay fresh (`gpu_node_items`

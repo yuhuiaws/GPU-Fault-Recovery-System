@@ -1,11 +1,18 @@
 """Whether a GPU cluster whose selector selects no node is parked or unavailable.
 
 One pure rule over the provider documents a reader hands in: nothing here reads
-a source. The deploy host (``gpu_fault_release.regional_parked_cluster``:
-``status``, every release step and the administrator verbs) reads them through
-the AWS CLI and ``kubectl``; any other reader that hands in the same documents
-gets the same verdict and the same reason, so no second copy of the rule exists
-to drift.
+a source. Two readers hand them in:
+
+* the deploy host (``gpu_fault_release.regional_parked_cluster``: ``status``,
+  every release step and the administrator verbs), through the AWS CLI and
+  ``kubectl``;
+* each GPU cluster's executor (``gpu_fault.cluster_executor.zero_node_probe``:
+  the ``gpu_fault_cluster_executor_zero_node_*`` gauges), through boto3 and its
+  Kubernetes client, with the executor's own grants.
+
+Fed the same provider state, both reach the same proof -- state, reason and
+groups (``tests/regional/test_zero_node_capacity_parity.py``) -- so the gauges
+and ``status`` cannot disagree about a cluster.
 
 A cluster is *parked* when its provider declares that capacity zero:
 

@@ -65,8 +65,10 @@ incarnation/boot_id. Only the provider call differs:
 | `eks-managed` | `ec2:RebootInstances` on exactly the instance ids preflight resolved and the Node providerID re-read at submission confirms; a changed providerID refuses | `eks describe-cluster` ACTIVE and every target's `eks.amazonaws.com/nodegroup` node group ACTIVE; target instances must agree on `eks:cluster-name` (pin with `GPU_FAULT_EKS_CLUSTER_NAME`); EC2 state must be running; a target node group with EKS node auto repair on (`nodeRepairConfig.enabled=true`) is refused, the counterpart of HyperPod's `NodeRecovery=None` (join/deploy discovery and the release preflight refuse it too) | warm-spare handover only: the Executor builds the spare coordinator on both providers (`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=true`) and `REPLACE_NODE` (`HEALTHY_WARM_SPARE_ONLY`) moves the workload to a declared spare at the Kubernetes level; `REPLACE` is not in the allowlist and `submit` refuses it; the `regional-eks-safe` profile OWNs `nodeReplace` through `gpu-fault-eks-adapter` (`warm-spare-v1`); without a declared spare the step fails closed | not built; no `hyperpod-managed-*` owners |
 
 The eks-managed executor IAM needs only `ec2:DescribeInstances`, `ec2:RebootInstances`
-(conditioned on `aws:ResourceTag/eks:cluster-name`), `eks:DescribeCluster` and `eks:DescribeNodegroup`,
-and no `sagemaker:*`. The node scope is `GPU_FAULT_NODE_SELECTOR`; the CPU node group must never match. The
+(conditioned on `aws:ResourceTag/eks:cluster-name`), `eks:DescribeCluster` and `eks:DescribeNodegroup`, and
+`eks:ListNodegroups` on the cluster's own ARN (the zero-node check of a cluster whose selector selects no node), and no
+`sagemaker:*`. Its ClusterRole holds one read beyond the workload kinds for the same check: get/list on
+`nodepools.karpenter.sh`. The node scope is `GPU_FAULT_NODE_SELECTOR`; the CPU node group must never match. The
 `eks:UpdateNodegroupConfig` / `sagemaker:UpdateCluster` that release the ownership label `gpu-fault.io/control-plane`
 (the last step of `remove-cluster`/`uninstall`) belong to the operator identity running the command alone and are
 granted to no runtime role. So do `iam:GetOpenIDConnectProvider`, `iam:ListOpenIDConnectProviderTags`, `iam:ListRoles` (every

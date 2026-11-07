@@ -179,7 +179,10 @@ def executor_policy_document(
     (``eks-managed``): ``ec2:DescribeInstances`` (a read EC2 only grants on
     ``*``) and ``ec2:RebootInstances`` on the instances tagged by EKS with this
     cluster's name -- no ``sagemaker:*`` at all, and no stop, terminate or
-    launch, so a replacement can never come from the data plane.
+    launch, so a replacement can never come from the data plane. The one EKS
+    list, ``eks:ListNodegroups``, is on the cluster's own ARN: the zero-node
+    check (``cluster_executor.zero_node_probe``) reads the node groups of a
+    cluster whose selector selects no node, as the deploy host's proof does.
     """
 
     if ClusterProvider(provider) is ClusterProvider.EKS_MANAGED:
@@ -202,6 +205,12 @@ def executor_policy_document(
                         f"arn:{eks.partition}:eks:{eks.region}:{eks.account}:"
                         f"nodegroup/{eks.resource_name}/*/*",
                     ],
+                },
+                {
+                    "Sid": "ListEksNodegroups",
+                    "Effect": "Allow",
+                    "Action": "eks:ListNodegroups",
+                    "Resource": eks_cluster_arn,
                 },
                 {
                     "Sid": "RebootClusterInstances",

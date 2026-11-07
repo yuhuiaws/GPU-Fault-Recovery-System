@@ -38,6 +38,7 @@ from gpu_fault.cluster_executor.lease import DEFAULT_MAX_EXECUTION_SECONDS
 from gpu_fault.cluster_executor.metrics import loop_breadcrumb_is_fresh
 from gpu_fault.cluster_executor.node_inventory import NodeInventoryReporter
 from gpu_fault.cluster_executor.node_key_sync import NodeActionKeySync
+from gpu_fault.cluster_executor.zero_node_probe import ZeroNodeCapacityProbe
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
@@ -207,6 +208,9 @@ def executor_from_environment() -> ClusterActionExecutor:
         node_inventory=NodeInventoryReporter(
             regional_client, kubernetes_adapter.core, executor_id=executor_id
         ),
+        # The gauges GpuFaultGpuClusterUnavailable pages on when the cluster's
+        # selector selects no node and its provider does not declare it parked.
+        zero_node_probe=_zero_node_probe_from_environment(kubernetes_adapter),
         # Only set when this executor actually owns HyperPod mutations.
         # Left None otherwise so an unexpectedly routed RESTART_NODE or
         # REPLACE_NODE fails the adapter's confirmation gate instead of
@@ -419,6 +423,46 @@ def _node_key_sync_from_environment(
             else None
         ),
     )
+
+
+def _zero_node_probe_from_environment(
+    kubernetes_adapter: KubernetesWorkflowAdapter,
+) -> ZeroNodeCapacityProbe | None:
+    """The zero-node check, or None with one WARNING naming why it is off.
+
+    It reads the variables the executor already has: ``GPU_FAULT_NODE_SELECTOR``
+    (for HyperPod, by default the cluster-name label of
+    ``GPU_FAULT_HYPERPOD_CLUSTER``), ``GPU_FAULT_CLUSTER_PROVIDER``, the
+    provider's cluster name (``GPU_FAULT_HYPERPOD_CLUSTER`` /
+    ``GPU_FAULT_EKS_CLUSTER_NAME``) and ``AWS_REGION``. Off, the cluster's
+    zero-node gauges stay 0 and nothing pages for it.
+    """
+
+    try:
+        selector = node_selector()
+        provider = cluster_provider()
+        if not selector:
+            raise ValueError(
+                "GPU_FAULT_NODE_SELECTOR and GPU_FAULT_HYPERPOD_CLUSTER are unset"
+            )
+        return ZeroNodeCapacityProbe(
+            kubernetes_adapter.core,
+            custom=getattr(kubernetes_adapter, "custom", None),
+            provider=provider,
+            node_selector=selector,
+            hyperpod_cluster=os.getenv("GPU_FAULT_HYPERPOD_CLUSTER") or "",
+            eks_cluster=os.getenv("GPU_FAULT_EKS_CLUSTER_NAME", ""),
+            region_name=(
+                os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or None
+            ),
+        )
+    except ValueError as exc:
+        LOGGER.warning(
+            "the zero-node check is off, so nothing pages if this cluster "
+            "loses every node: %s",
+            exc,
+        )
+        return None
 
 
 def _eks_node_evidence(selector: str) -> EksNodeEvidence | None:

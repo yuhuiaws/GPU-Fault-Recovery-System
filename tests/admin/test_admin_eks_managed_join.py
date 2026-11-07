@@ -543,6 +543,7 @@ def test_eks_managed_executor_policy_is_ec2_only_and_tag_scoped() -> None:
         "ec2:RebootInstances",
         "eks:DescribeCluster",
         "eks:DescribeNodegroup",
+        "eks:ListNodegroups",
     }, "an eks-managed executor holds EC2 describe/reboot and EKS describe reads"
     describe_eks = next(
         item for item in document["Statement"] if item["Sid"] == "DescribeEksCluster"
@@ -551,6 +552,15 @@ def test_eks_managed_executor_policy_is_ec2_only_and_tag_scoped() -> None:
         identity.eks_arn,
         f"arn:aws:eks:{REGION}:{ACCOUNT}:nodegroup/gpu-e/*/*",
     ], "EKS reads are scoped to this cluster and its node groups"
+    list_groups = next(
+        item for item in document["Statement"] if item["Sid"] == "ListEksNodegroups"
+    )
+    assert list_groups == {
+        "Sid": "ListEksNodegroups",
+        "Effect": "Allow",
+        "Action": "eks:ListNodegroups",
+        "Resource": identity.eks_arn,
+    }, "the zero-node check lists this cluster's node groups, on its ARN alone"
     reboot = next(
         item
         for item in document["Statement"]

@@ -33,6 +33,7 @@ LAYERS = (
     "metrics",
     "node_key_sync",
     "node_inventory",
+    "zero_node_probe",
 )
 # The names the module published before the split, as importers spell them.
 PUBLIC_NAMES = (

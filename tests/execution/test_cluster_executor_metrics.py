@@ -117,9 +117,13 @@ EXPECTED_METRICS = {
     "gpu_fault_cluster_executor_consecutive_transport_degraded_cycles": "gauge",
     "gpu_fault_cluster_executor_claim_loop_alive": "gauge",
     "gpu_fault_cluster_executor_stuck_executions": "gauge",
+    "gpu_fault_cluster_executor_selected_nodes": "gauge",
+    "gpu_fault_cluster_executor_zero_node_parked": "gauge",
+    "gpu_fault_cluster_executor_zero_node_unavailable": "gauge",
     "gpu_fault_cluster_executor_last_claim_timestamp": "gauge",
     "gpu_fault_cluster_executor_last_loop_iteration_timestamp": "gauge",
     "gpu_fault_cluster_executor_last_lease_renewal_timestamp": "gauge",
+    "gpu_fault_cluster_executor_last_zero_node_check_timestamp": "gauge",
 }
 
 

@@ -210,6 +210,24 @@ def cluster_executor_metrics() -> MetricFamily:
                 "in a retryable transport error on this executor's own network; "
                 "resets to 0 on the first clean cycle (see _idle_delay).",
             ),
+            (
+                "selected_nodes",
+                "Nodes this cluster's node selector selects, as the API listed "
+                "them at the last zero-node check (zero_node_probe).",
+            ),
+            (
+                "zero_node_parked",
+                "1 while the selector selects no node and the provider declares "
+                "that capacity zero (every covered group at desired/target 0, no "
+                "NodePool that could supply one): parked on purpose, not paged.",
+            ),
+            (
+                "zero_node_unavailable",
+                "1 while the selector selects no node and the provider does not "
+                "declare zero capacity (a group wanting nodes or not ACTIVE/"
+                "InService, a selector covering no group, a supplying NodePool, a "
+                "failed provider read); GpuFaultGpuClusterUnavailable reads it.",
+            ),
         ),
         timestamps=(
             (
@@ -227,6 +245,12 @@ def cluster_executor_metrics() -> MetricFamily:
                 "Unix seconds of the last successful lease renewal of a command "
                 "in flight; it keeps moving while every slot holds a long "
                 "command and last_claim_timestamp does not.",
+            ),
+            (
+                "last_zero_node_check_timestamp",
+                "Unix seconds of the last zero-node check that read the selected "
+                "nodes; it stops moving while the node list cannot be read, and "
+                "the three zero-node gauges then keep their last values.",
             ),
         ),
     )
@@ -279,6 +303,16 @@ class ClusterExecutorMetrics:
 
         if amount > 0:
             self.family.inc(DIRECT_SERIES["spare_reservations_reclaimed_total"], amount)
+
+    def zero_node_state(
+        self, *, selected: int, parked: bool, unavailable: bool
+    ) -> None:
+        """The zero-node check's verdict (``zero_node_probe``), set together."""
+
+        self.family.set("selected_nodes", selected)
+        self.family.set("zero_node_parked", 1 if parked else 0)
+        self.family.set("zero_node_unavailable", 1 if unavailable else 0)
+        self.family.mark("last_zero_node_check_timestamp")
 
 
 def loop_breadcrumb_is_fresh(path: str, max_age_seconds: float) -> bool:

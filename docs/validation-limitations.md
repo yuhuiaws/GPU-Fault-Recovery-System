@@ -48,7 +48,12 @@ engine-tested only. So is `remove-cluster` of a cluster whose GPU node-key
 Secret still holds keys of departed nodes: the departure proof (the unfiltered
 node list, HyperPod `list-cluster-nodes`, EC2 and the fleet's recorded instance
 ids) runs against fake reads through the real removal state machine, never
-against a live cluster.
+against a live cluster. The executor's zero-node gauges are proven against
+fake Kubernetes, EKS, SageMaker and Karpenter clients -- the check itself, its
+place in the claim loop and its parity with the deploy host's proof over the
+same provider state; on a live site only the parked reading of a cluster
+scaled to zero can be observed, never the unavailable one, which needs lost
+capacity.
 
 ## Xid linkage and Drain P2P recovery
 

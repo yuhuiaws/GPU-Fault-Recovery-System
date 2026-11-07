@@ -45,6 +45,7 @@ from gpu_fault.regional import (
 )
 from gpu_fault.cluster_executor.node_inventory import NodeInventoryReporter
 from gpu_fault.cluster_executor.node_key_sync import NodeActionKeySync
+from gpu_fault.cluster_executor.zero_node_probe import ZeroNodeCapacityProbe
 from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 
 # Deliberately the pre-split module's name and not ``__name__``: the log format
@@ -189,6 +190,7 @@ class ClusterActionExecutor:
         spare_reservation_sweep: SpareReservationSweep | None = None,
         node_key_sync: NodeActionKeySync | None = None,
         node_inventory: NodeInventoryReporter | None = None,
+        zero_node_probe: ZeroNodeCapacityProbe | None = None,
     ) -> None:
         _validate_settings(
             poll_seconds=poll_seconds,
@@ -219,6 +221,7 @@ class ClusterActionExecutor:
         self.spare_reservation_sweep = spare_reservation_sweep
         self.node_key_sync = node_key_sync
         self.node_inventory = node_inventory
+        self.zero_node_probe = zero_node_probe
         self.client = client
         self.adapters = adapters
         self.executor_id = executor_id
@@ -836,6 +839,12 @@ class ClusterActionExecutor:
         if self.node_inventory is not None:
             self.node_inventory.report()
 
+    def observe_zero_node_capacity(self) -> None:
+        """Set the zero-node gauges when due; never raises (``zero_node_probe``)."""
+
+        if self.zero_node_probe is not None:
+            self.zero_node_probe.observe(self.metrics)
+
     def run(self) -> None:
         """Claim and execute until a stop is requested, then drain.
 
@@ -993,6 +1002,7 @@ class ClaimLoop:
                 executor.sweep_spare_reservations()
                 executor.sync_node_action_keys()
                 executor.report_node_inventory()
+                executor.observe_zero_node_capacity()
 
     def _next_claim_wait(self) -> float | None:
         """Seconds until the next claim; None waits for a command to finish."""

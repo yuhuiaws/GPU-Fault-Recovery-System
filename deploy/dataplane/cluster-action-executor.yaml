@@ -33,7 +33,10 @@ metadata:
 # .render_workload_namespace_rbac). GPU_FAULT_ALLOWED_WORKLOAD_NAMESPACES
 # below is therefore no longer the only boundary: a command naming a
 # namespace outside the list is refused by the executor *and* by the API
-# server.
+# server. The one read beyond them: get/list on Karpenter NodePools, which the
+# zero-node check (cluster_executor/zero_node_probe.py) reads only while the
+# node selector selects no node -- a NodePool that could launch a selected node
+# means the cluster is not parked. A cluster without the CRD answers 404.
 rules:
   - apiGroups: [""]
     resources: ["nodes"]
@@ -50,6 +53,9 @@ rules:
   - apiGroups: ["jobset.x-k8s.io"]
     resources: ["jobsets"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["karpenter.sh"]
+    resources: ["nodepools"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

@@ -1614,8 +1614,9 @@ Semantics and boundaries of `eks-managed`:
   `eks:cluster-name` tag of every instance it touches).
   The node `--node-instance-id` is the EC2 instance id from `spec.providerID` (HyperPod nodes keep the Node UID).
 - IAM: the Executor role is granted only `ec2:DescribeInstances`, `ec2:RebootInstances` conditioned on
-  `aws:ResourceTag/eks:cluster-name`, and `eks:DescribeCluster` / `eks:DescribeNodegroup` scoped to this cluster and
-  its node group ARNs -- no `sagemaker:*` at all; the role name derives from the `cluster_id`. The deploy-host
+  `aws:ResourceTag/eks:cluster-name`, `eks:DescribeCluster` / `eks:DescribeNodegroup` scoped to this cluster and
+  its node group ARNs, and `eks:ListNodegroups` on this cluster's ARN alone (the zero-node check, §5.0.6) -- no
+  `sagemaker:*` at all; the role name derives from the `cluster_id`. The deploy-host
   identity running `workflow-reconcile` additionally needs `ec2:DescribeInstances` (the departed-node EC2 proof); the
   operator identity running `remove-cluster`/`uninstall` additionally needs `eks:UpdateNodegroupConfig` (eks-managed) /
   `sagemaker:UpdateCluster` (HyperPod) to release the ownership label (the "release" row of §5.0.0),
@@ -4008,7 +4009,23 @@ and the collector-readiness step waits for nothing while the cluster still has n
 refusals stay, before anything is created on the cluster: a cluster whose groups declare no GPU instance type the installer
 knows, and a cluster registered for node-key custody. A node that joins while the join runs is not deferred (only an upgrade
 defers newcomers): the join's node roll installs it in a wave and the Executor's node-key sync keys it within a minute; one
-that joins afterwards is installed by the steady-state Reconciler. **Alerts:** nothing pages for a fleet without nodes whose product Deployments
+that joins afterwards is installed by the steady-state Reconciler.
+
+**The executor's verdict.** Each GPU cluster's executor reaches the same verdict on its own
+(`cluster_executor/zero_node_probe.py`; the rule is shared with the deploy host, `src/gpu_fault/zero_node_capacity.py`):
+every 60 s it counts the nodes its selector selects and, only when the API lists none, reads the provider with its own
+grants -- HyperPod `sagemaker:DescribeCluster` on the cluster's ARN; EKS `eks:ListNodegroups` on the cluster's ARN and
+`eks:DescribeNodegroup` on its node groups; get/list on `nodepools.karpenter.sh` in the executor ClusterRole (a cluster
+without the CRD has no NodePool). It exports `gpu_fault_cluster_executor_selected_nodes`,
+`gpu_fault_cluster_executor_zero_node_parked` (1: parked), `gpu_fault_cluster_executor_zero_node_unavailable` (1:
+unavailable; the reason is in the executor's log line `GPU cluster without nodes (unavailable): ...`, written once per
+change of state) and `gpu_fault_cluster_executor_last_zero_node_check_timestamp`; the cluster's data-plane ADOT
+collector delivers them to AMP with its `gpu_cluster` label. A node list the executor cannot read moves nothing (the
+timestamp stops; one WARNING per failed check). Both grants arrive with the release: the IAM one through the
+`executor_role` bootstrap task of `deploy`, whose read-only probe re-puts an inline policy that differs, the RBAC one
+with the executor manifest.
+
+**Alerts:** nothing pages for a fleet without nodes whose product Deployments
 still run on its other nodes -- the collector-silence, stale-Agent and topology alerts count ACTIVE Agents only;
 `GpuFaultDataplaneCollectorMissing` fires for the cluster only when no node is left to run its watcher, which is a real fault.
 An unavailable cluster is therefore seen in `status`, the deploy log and the deploy record, not through an alert.
