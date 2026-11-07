@@ -471,9 +471,9 @@ kubeconfig and logs are untouched; the reinstall does not need these inputs prep
   Complete it fails closed and rolls no component;
 - The Runtime Profile content is unchanged, or a new plan has been generated per this section and approved independently.
 - A GPU cluster without GPU nodes, parked or unavailable, does not stand in the way: the release rolls its Deployments and
-  Reconciler and skips its node work (§5.0.6). A release is refused before any change (`zero_node_gpu_clusters`) only when it
-  could not finish or roll back: Agent waves while every GPU cluster has zero nodes, or a Reconciler roll over a cluster whose
-  node groups declare no GPU instance type the installer knows.
+  Reconciler and skips its node work (§5.0.6), even with every GPU cluster at zero nodes. A release is refused before any
+  change (`zero_node_gpu_clusters`) only when it could not finish: a Reconciler roll over a cluster whose node groups declare
+  no GPU instance type the installer knows.
 - If the change touches `ddl*.py`, Processor claim/retry/completion or the PostgreSQL pool,
   the CAP-005 runner has passed with zero skips on an isolated PostgreSQL 16 database.
 
@@ -3873,9 +3873,10 @@ the Agent-endpoint CIDR coverage has no node to cover.
 A failed release rolls back that cluster's Reconciler alone, on the previous installer template the release snapshot pinned
 (nothing is rendered and nothing is restored on nodes; the control plane's Agent pins come from the clusters with live
 Agents), the automatic rollback's `sync-state` accepts it, and a resume asks nothing of nodes it never had. Nodes that joined
-in the middle of a release are rolled like newcomers. The other refusal: a release with Agent waves while **every** GPU
-cluster of the site has zero nodes -- its rollback could not derive the Agent pins from any live Agent -- is refused by the
-same preflight check before anything is changed; scale one cluster up first.
+in the middle of a release are rolled like newcomers. With **every** GPU cluster of the site at zero nodes a release still
+proceeds, Agent waves included: no Agent ran, so its rollback restores the previous release's own Agent pins, as the
+control plane's `-config-core` carried them when the release started, and each CPU tier still rolls once
+(`rollback-agent-pins source=previous-config-core reason=no-cluster-had-a-node clusters=<ids>` on the deploy output).
 
 **Capacity that returns needs no command.** Raise the group's desired (or target) count, or let the provider replace the
 lost capacity: the new nodes carry the group's ownership label, the executor's node-key sync attests them, the steady-state
@@ -4279,7 +4280,7 @@ check that `sha256sum <file>` equals the `expected` value of the error, and reru
 | step FAILED with an unclear reason | `status_source` and the executor traceback | REG-14.4 |
 | All Agents non-ACTIVE | node token, systemd, artifact/config/profile pins | REG-14.5 |
 | `status` fails with `<id> has no Kubernetes nodes`, `has no Ready GPU nodes` or `has no registered Node Agents`, ending with `; not parked: ...`, and the header has `GPU cluster <id> unavailable: ...` (a deploy's preflight and verify read `WARN` for the same findings) | The cluster is unavailable: it lost every node without its provider declaring zero capacity; the reason names the node group or instance group that still wants nodes (an outage or a scale-up still joining), one being replaced, or a selector that covers no group. Deploys proceed over it; restore the capacity, or scale its groups to zero to park it | §5.0.6 |
-| The deploy preflight fails `zero_node_gpu_clusters`: `every GPU cluster has zero nodes (...): a release with Agent waves ...`, or `GPU cluster(s) <id> (declared: ...) have zero nodes and no node group declaring a GPU instance type the installer knows ...` | The release could not finish or roll back, and nothing was changed: with every cluster at zero nodes its rollback could not restore the control plane's Agent pins from any live Agent; with no known GPU instance type declared the Reconciler's installer template cannot be rendered. Scale a node group up and let its nodes join (or declare a supported instance type on the group), then deploy again | §5.0.6 |
+| The deploy preflight fails `zero_node_gpu_clusters`: `GPU cluster(s) <id> (declared: ...) have zero nodes and no node group declaring a GPU instance type the installer knows ...` | The release could not finish, and nothing was changed: with no known GPU instance type declared the Reconciler's installer template cannot be rendered. Scale a node group up and let its nodes join, or declare a supported instance type on the group, then deploy again | §5.0.6 |
 | A replacement node has no Agent for long, its installer Job keeps showing `FailedMount ... references non-existent secret key` | Whether the GPU Secret `gpu-fault-node-action-keys` has the node's key name; executor log `node action key sync` (404/403/409 explained in §6) and the start-up WARNING `get no Node Action key until the next deploy`; whether `GPU_FAULT_NODE_KEY_SYNC_SECONDS` is 0 | §6 |
 | operator API returns 403 | Whether the execution token and cluster token are mixed up | REG-14.6 |
 | HyperPod outcome unknown | CloudTrail, actual node state, idempotent submission record | REG-14.7 |

@@ -4468,11 +4468,12 @@ kind proceeds over either state: the Agent snapshot records an explicit entry wi
 Reconciler is rolled with the release's node runtime (its installer template rendered from a node of the declared group,
 `render_node`, so a later joiner installs the current release), and the CPU roll's heartbeat barrier, the rollback
 (Reconciler only, on the pinned previous template; Agent pins from the clusters with live Agents -- when the snapshot
-records every cluster with a zero-node entry no Agent ran, no Agent pin is staged and the CPU restore puts the previous
-release's own `-config-core` back, while a snapshot short of an entry per cluster still refuses), the resume and
-`sync-state` all carry the entry. A release is refused at its deploy preflight (`zero_node_gpu_clusters`) only when it could
-not finish or roll back: Agent waves while every GPU cluster has zero nodes, or a Reconciler roll over a cluster whose groups
-declare no GPU instance type the installer knows. The proof reads only what `regional_contexts` already reads; the
+records every cluster with a zero-node entry no Agent ran, and the controller stage stages the previous release's own pins
+from the `-config-core` the capture recorded (`cpu_role_config_maps`), so the CPU restore keeps the tiers it restarted and
+rolls each once; a snapshot short of an entry per cluster still refuses), the resume and `sync-state` all carry the entry.
+A release is refused at its deploy preflight (`zero_node_gpu_clusters`) only when it could not finish: a Reconciler roll
+over a cluster whose groups declare no GPU instance type the installer knows. Zero nodes on every GPU cluster refuse
+nothing. The proof reads only what `regional_contexts` already reads; the
 departed-node cleanup itself does not consult it. It never opens a read snapshot (`regional_release_state.read_snapshot`):
 the snapshot's cache lives on the release object every thread shares, and a release step -- the candidate preflight, the
 cluster rollout -- runs its clusters in parallel threads whose node safety reads must stay fresh (`gpu_node_items`

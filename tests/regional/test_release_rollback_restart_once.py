@@ -710,15 +710,15 @@ def test_a_tier_the_controller_stage_restarted_is_rolled_once(
     _assert_no_pod_keeps_a_candidate_start_up_input(site)
 
 
-def test_an_agent_rollback_with_no_node_on_any_cluster_stages_no_agent_pin(
+def test_an_agent_rollback_with_no_node_on_any_cluster_is_rolled_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The release started with no node on its one GPU cluster, so no Agent
-    reported an identity: the controller stage patches no ``-config-core``
-    and the CPU restore puts the previous one back, which leaves no Pod on a
-    candidate start-up input. The CPU restore restarts the tiers the
-    controller stage restarted onto the candidate's ``-config-core``: the
-    second roll is the price of having no Agent pin to stage first."""
+    reported an identity: the controller stage stages the previous release's
+    own Agent pins, from the ``-config-core`` the capture recorded, exactly as
+    it stages live Agents' -- the tiers it restarts start from them, the CPU
+    restore keeps those Pods, and the rollback pays one roll, as with live
+    Agents."""
 
     site = Site()
     _agent(site)
@@ -741,14 +741,21 @@ def test_an_agent_rollback_with_no_node_on_any_cluster_stages_no_agent_pin(
 
     timing = rollback.run()
 
-    assert patched == [{}], "no Agent pin is staged"
-    assert "config-core-changed" not in _cpu_restart(timing, "controller_stage")[
-        "restarted"
-    ].get("worker", [])
-    assert _cpu_restart(timing, "cpu_restore")["restarted"] == {
-        role: ["config-maps-changed"] for role in EVERY_TIER
-    }
-    assert rollback.rolled == [EVERY_TIER, EVERY_TIER]
+    assert patched == [PREVIOUS_PINS], "the captured -config-core's Agent pins"
+    controller = _cpu_restart(timing, "controller_stage")
+    restore = _cpu_restart(timing, "cpu_restore")
+    assert "config-core-changed" in controller["restarted"]["worker"]
+    assert sorted(controller["restarted_onto"]) == sorted(EVERY_TIER)
+    assert [build["force_restart_roles"] for build in rollback.builds] == [
+        EVERY_TIER,
+        [],
+    ]
+    assert restore["restarted"] == {}
+    assert restore["kept"] == EVERY_TIER
+    assert rollback.rolled == [EVERY_TIER, []], "the CPU restore rolls nothing"
+    assert _seconds(timing, "controller_stage") == APPLY_SECONDS + ONE_ROLL
+    assert _seconds(timing, "cpu_restore") == APPLY_SECONDS
+    assert timing["t_safe_seconds"] == 2 * APPLY_SECONDS + ONE_ROLL
     _assert_no_pod_keeps_a_candidate_start_up_input(site)
 
 

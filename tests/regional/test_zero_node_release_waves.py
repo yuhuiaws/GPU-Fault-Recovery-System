@@ -6,7 +6,8 @@ its node work is skipped and recorded, and only its steady-state Reconciler
 rolls -- with the release's own node runtime, so a node that joins later
 installs the current release, never the previous one. Its rollback restores
 that Reconciler alone, its resume asks nothing of nodes it never had, and the
-rollback's Agent pins come from the clusters that had live Agents.
+rollback's Agent pins come from the clusters that had live Agents -- or, with
+no node on any cluster, from the previous release's own ``-config-core``.
 """
 
 from __future__ import annotations
@@ -364,24 +365,56 @@ def _zero_node(state: str) -> dict[str, Any]:
     )
 
 
-def test_with_no_node_on_any_cluster_the_rollback_stages_no_agent_pin(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Every cluster the release covers recorded an explicit zero-node entry,
-    parked or unavailable: no Agent ran to report an identity, so there is no
-    pin to stage -- the CPU restore puts the previous ``-config-core`` back --
-    and the rollback says so, naming the clusters and the source."""
+#: The Agent pins every CPU role's ``-config-core`` carried when the release
+#: started, as the capture records them (``cpu_role_config_maps``).
+CAPTURED_PINS = {
+    "GPU_FAULT_REQUIRED_AGENT_VERSION": "0.9.0",
+    "GPU_FAULT_REQUIRED_POLICY_VERSION": "policy-v0",
+    "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": "hyperpod-v1",
+}
 
-    site = RollbackSite()
-    previous = {
+
+def _captured_config_maps(**overrides: dict[str, str]) -> dict[str, dict[str, str]]:
+    maps = {
+        f"{deployment}-config-core": {
+            "GPU_FAULT_PROCESSOR_WORKERS": "24",
+            **CAPTURED_PINS,
+        }
+        for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
+    }
+    for name, data in overrides.items():
+        maps[name] = data
+    return maps
+
+
+def _without_any_node(site: RollbackSite, **fields: Any) -> dict[str, Any]:
+    """The previous state of a release that started with no node anywhere:
+    gpu-a unavailable, gpu-eks parked."""
+
+    return {
         **_previous(site),
         "agent_identities": {
             HYPERPOD: _zero_node("unavailable"),
             EKS: _zero_node("parked"),
         },
+        **fields,
     }
 
-    assert rollback_controller_config_for(site, previous, "hyperpod-v1") == {}
+
+def test_with_no_node_on_any_cluster_the_rollback_stages_the_captured_pins(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every cluster the release covers recorded an explicit zero-node entry,
+    parked or unavailable: no Agent ran to report an identity. The pins staged
+    are the previous release's own, from the ``-config-core`` the capture
+    recorded, and the rollback says so, naming the clusters and the source."""
+
+    site = RollbackSite()
+    previous = _without_any_node(site, cpu_role_config_maps=_captured_config_maps())
+
+    assert rollback_controller_config_for(site, previous, "hyperpod-v1") == (
+        CAPTURED_PINS
+    )
     line = next(
         item
         for item in capsys.readouterr().err.splitlines()
@@ -393,6 +426,52 @@ def test_with_no_node_on_any_cluster_the_rollback_stages_no_agent_pin(
         "clusters=" + ",".join(sorted([HYPERPOD, EKS])),
     ):
         assert field in line, line
+
+
+@pytest.mark.parametrize(
+    "captured",
+    [
+        pytest.param({}, id="no-cpu-state-captured"),
+        pytest.param(
+            _captured_config_maps(
+                **{
+                    f"{inventory.CPU_RUNTIME_DEPLOYMENTS[0]}-config-core": {
+                        **CAPTURED_PINS,
+                        "GPU_FAULT_REQUIRED_POLICY_VERSION": "policy-v2",
+                    }
+                }
+            ),
+            id="roles-that-disagree",
+        ),
+        pytest.param(
+            _captured_config_maps(
+                **{
+                    f"{inventory.CPU_RUNTIME_DEPLOYMENTS[-1]}-config-core": {
+                        "GPU_FAULT_PROCESSOR_WORKERS": "24"
+                    }
+                }
+            ),
+            id="a-role-without-the-pins",
+        ),
+    ],
+)
+def test_with_no_node_and_no_captured_pins_the_rollback_stages_none(
+    capsys: pytest.CaptureFixture[str], captured: dict[str, dict[str, str]]
+) -> None:
+    """A release without a CPU stage captures no ``-config-core`` and changes
+    none; roles that disagree name no single pin. Nothing is staged then: the
+    CPU restore puts the previous ``-config-core`` back as it is."""
+
+    site = RollbackSite()
+    previous = _without_any_node(site, cpu_role_config_maps=captured)
+
+    assert rollback_controller_config_for(site, previous, "hyperpod-v1") == {}
+    line = next(
+        item
+        for item in capsys.readouterr().err.splitlines()
+        if item.startswith("rollback-agent-pins ")
+    )
+    assert "source=none" in line and "reason=no-cluster-had-a-node" in line, line
 
 
 @pytest.mark.parametrize(

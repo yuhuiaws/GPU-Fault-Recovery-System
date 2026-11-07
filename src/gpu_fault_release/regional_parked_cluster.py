@@ -64,13 +64,13 @@ that cluster; everything else is judged as for any cluster:
   declared group (``render_node``), so a node that joins later installs the
   current release. The CPU roll's heartbeat barrier, the rollback (the
   Reconciler alone, on its pinned previous template; Agent pins from the
-  clusters with live Agents), the resume and ``sync-state`` all carry the
-  entry;
+  clusters with live Agents, or -- no node on any cluster -- the previous
+  release's own ``-config-core``), the resume and ``sync-state`` all carry
+  the entry;
 * a release is refused at its deploy preflight (``release_refusal``) only when
-  it could not finish or roll back: Agent waves while every GPU cluster has
-  zero nodes (the rollback derives the Agent pins from live Agents), or a
-  Reconciler or Agent roll over a cluster whose groups declare no GPU instance
-  type the installer knows (there is no node to render its template from).
+  it could not finish: a Reconciler or Agent roll over a cluster whose groups
+  declare no GPU instance type the installer knows (there is no node to
+  render its template from). Zero nodes on every GPU cluster refuse nothing.
 
 Capacity that returns needs no command: the group's ownership label reaches
 the new nodes, the executor's node-key sync attests them, the steady-state
@@ -1128,38 +1128,23 @@ def zero_node_summary(state: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def release_refusal(
-    release: Any, checks: Iterable[Any], plan: ReleaseExecutionPlan
+    checks: Iterable[Any], plan: ReleaseExecutionPlan
 ) -> dict[str, Any] | None:
     """The failing deploy preflight check of a release that could not finish
-    or roll back over the site's clusters without nodes; ``None`` for every
-    other release (``zero_node_clusters`` of the preflight's ``checks``):
+    over the site's clusters without nodes; ``None`` for every other release
+    (``zero_node_clusters`` of the preflight's ``checks``): a Reconciler or
+    Agent roll over a cluster whose node groups declare no GPU instance type
+    the installer knows -- its installer template is rendered from a declared
+    node (``render_node``), and there is none.
 
-    * Agent waves while no GPU cluster has a node: a rollback restores the
-      control plane's Agent pins from the live Agents the release snapshot
-      recorded, and there are none;
-    * a Reconciler or Agent roll over a cluster whose node groups declare no
-      GPU instance type the installer knows: its installer template is
-      rendered from a declared node (``render_node``), and there is none.
+    Zero nodes on every GPU cluster refuse nothing: with no live Agent to take
+    them from, a rollback stages the previous release's own Agent pins
+    (``regional_release_rollback_context.rollback_controller_config_for``).
     """
 
     zero_nodes = zero_node_clusters(checks)
     if not zero_nodes:
         return None
-    configured = {str(target.cluster_id) for target in release.config.clusters}
-    if (
-        plan.has(ReleaseComponent.AGENT)
-        and configured
-        and configured.issubset(zero_nodes)
-    ):
-        return _refusal(
-            zero_nodes,
-            "every GPU cluster has zero nodes ("
-            + ", ".join(sorted(configured))
-            + "): a release with Agent waves snapshots the live Agents its "
-            "rollback restores the control plane's Agent pins from, and there is "
-            "none. Scale a node group of one cluster back up and let its nodes "
-            "join, then deploy again. Nothing was changed.",
-        )
     unrenderable = sorted(
         cluster_id
         for cluster_id, entry in zero_nodes.items()

@@ -32,6 +32,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_parked_cluster as PARKED
 from gpu_fault_release import regional_release_agent_set as AGENT_SET
 from gpu_fault_release import regional_release_fleet_rollout as FLEET
@@ -525,8 +526,8 @@ def _bind(
 
     # The rollback's CPU side: the controller stage keeps its one zero-node
     # question -- the Agent pins it restores, from the clusters with live
-    # Agents, or none when no cluster had one -- and records them; the CPU
-    # restores are recorded.
+    # Agents, or the previous -config-core's when no cluster had one -- and
+    # records them; the CPU restores are recorded.
     def stage_controller(release_arg: Any, *, previous: Any, **kwargs: Any) -> dict:
         pins = rollback_controller_config_for(
             release_arg, previous, kwargs["runtime_profile_version"]
@@ -562,6 +563,18 @@ def _bind(
         lambda target, *_a, **_k: deploy.record("wait-agents", target.cluster_id),
     )
     return deploy
+
+
+def _config_core_pins(release: Any) -> dict[str, str]:
+    """The Agent pins the previous release's ``-config-core`` carried."""
+
+    return {
+        "GPU_FAULT_REQUIRED_AGENT_VERSION": "0.10.0",
+        "GPU_FAULT_REQUIRED_POLICY_VERSION": "policy-v1",
+        "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": str(
+            release.config.runtime_profile_version
+        ),
+    }
 
 
 def _capture(release: Any, deploy: Deploy) -> dict[str, Any]:
@@ -603,6 +616,15 @@ def _capture(release: Any, deploy: Deploy) -> dict[str, Any]:
         },
         "agent_identities": identities,
         "aurora_refresh": aurora_refresh_snapshot(release.config.namespace),
+        # Every CPU role's ConfigMaps as they were: what the CPU restore puts
+        # back.
+        "cpu_role_config_maps": {
+            f"{deployment}-config-core": {
+                "GPU_FAULT_PROCESSOR_WORKERS": "24",
+                **_config_core_pins(release),
+            }
+            for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
+        },
     }
     deploy.previous = previous
     return previous
@@ -749,16 +771,19 @@ def _assert_rolled_back_on_the_previous_template(
     ), "on the previous template the snapshot pinned"
 
 
-def _assert_rollback_pins(deploy: Deploy, hyperpod: str) -> None:
-    pins = [value for name, value in deploy.calls if name == "rollback-controller-pins"]
+def _staged_pins(deploy: Deploy) -> list[Any]:
+    return [value for name, value in deploy.calls if name == "rollback-controller-pins"]
+
+
+def _assert_rollback_pins(release: Any, deploy: Deploy, hyperpod: str) -> None:
+    pins = _staged_pins(deploy)
     if hyperpod == "nodes":
         assert [item["GPU_FAULT_REQUIRED_AGENT_VERSION"] for item in pins] == [
             "0.10.0"
         ], "the Agent pins come from the cluster with live Agents"
     else:
-        assert pins == [{}], (
-            "no Agent ran: no pin to stage, the CPU restore puts the previous "
-            "-config-core back"
+        assert pins == [_config_core_pins(release)], (
+            "no Agent ran: the previous release's own -config-core pins"
         )
 
 
@@ -785,26 +810,26 @@ def test_a_failed_verification_rolls_the_deploy_back_over_clusters_without_nodes
         _assert_rolled_back_on_the_previous_template(
             runner, context, forward_runs=len(ZERO_NODE_SCRIPTS)
         )
-    _assert_rollback_pins(deploy, hyperpod)
+    _assert_rollback_pins(release, deploy, hyperpod)
     _assert_zero_node_entries(release, deploy, hyperpod, phase="rollback")
     assert deploy.snapshot_steps() == {"_capture"}, deploy.snapshot_openers
 
 
 @pytest.mark.parametrize(
-    ("interrupted", "resumed_from", "rolled_on_resume", "staged_on_resume"),
+    ("interrupted", "resumed_from", "rolled_on_resume", "staged_again"),
     [
         pytest.param(
             CONTROLLER_STAGE,
             "rollback-controller-staging",
             {"gpu-a-context", "gpu-eks-context"},
-            [{}],
+            True,
             id="in-the-controller-stage",
         ),
         pytest.param(
             "gpu-a-context",
             "rollback-data-restoring",
             {"gpu-a-context"},
-            [],
+            False,
             id="in-gpu-a-s-data-restore",
         ),
     ],
@@ -815,7 +840,7 @@ def test_an_interrupted_rollback_with_every_cluster_parked_resumes_to_rolled_bac
     interrupted: str,
     resumed_from: str,
     rolled_on_resume: set[str],
-    staged_on_resume: list[dict[str, str]],
+    staged_again: bool,
 ) -> None:
     """The automatic rollback stops in ``rollback-failed``; a new deploy-host
     process resumes it from the persisted state alone where it stopped --
@@ -832,9 +857,10 @@ def test_an_interrupted_rollback_with_every_cluster_parked_resumes_to_rolled_bac
         release.upgrade(diff=DIFF)
     assert deploy.phases[-1] == "rollback-failed", deploy.phases
     assert not runner.interrupt, "the interruption happened"
-    assert [
-        value for name, value in deploy.calls if name == "rollback-controller-pins"
-    ] == [{}], "the controller stage ran with no Agent pin to stage"
+    pins = _config_core_pins(release)
+    assert _staged_pins(deploy) == [pins], (
+        "the controller stage staged the previous -config-core's pins"
+    )
 
     resumed = ROLLOUT.RegionalRelease(release.config, runner)  # type: ignore[arg-type]
     again = _bind(resumed, runner, monkeypatch, store=deploy.store)
@@ -846,9 +872,9 @@ def test_an_interrupted_rollback_with_every_cluster_parked_resumes_to_rolled_bac
         again.phases
     )
     assert "rollback-verified" in again.phases
-    assert [
-        value for name, value in again.calls if name == "rollback-controller-pins"
-    ] == staged_on_resume
+    assert _staged_pins(again) == ([pins] if staged_again else []), (
+        "a resumed controller stage stages the same pins from the persisted state"
+    )
     scripts = runner.scripts[before:]
     assert {env["GPU_FAULT_KUBECTL_CONTEXT"] for env in scripts} == rolled_on_resume
     for context in rolled_on_resume:

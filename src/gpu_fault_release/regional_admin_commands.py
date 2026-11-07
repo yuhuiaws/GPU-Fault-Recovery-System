@@ -911,12 +911,13 @@ def _deploy_preflight_report(release: Any) -> dict[str, Any]:
     report = build_preflight_report(
         release, repair_plan=plan, bootstrap=bootstrap, include_workflow=not repair
     )
-    # A release with Agent waves needs one cluster with live Agents for its
-    # rollback's pins: refused here, before any repair or write, when no GPU
-    # cluster has a node (one or more parked clusters alone never refuse).
+    # A release that rolls the Reconciler over a cluster without nodes renders
+    # its installer template from a declared node: refused here, before any
+    # repair or write, when no group declares one. Zero nodes alone, on one
+    # cluster or on all of them, never refuse.
     checks = report.get("checks")
     if isinstance(checks, list):
-        refusal = parked_cluster.release_refusal(release, checks, plan)
+        refusal = parked_cluster.release_refusal(checks, plan)
         if refusal is not None:
             report = _report("preflight", release, [*checks, refusal])
     if not repair or not report["healthy"]:

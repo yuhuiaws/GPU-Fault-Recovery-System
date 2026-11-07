@@ -13,7 +13,8 @@ A cluster without nodes that is not parked -- its group still wants nodes:
 an outage -- is *unavailable*: ``status`` keeps failing on it, with the
 reason, while a deploy, its preflight and verify file its zero-node findings
 as ``WARN`` and proceed; every other finding of the cluster still gates. Only
-a release that could not finish or roll back is refused up front.
+a release that could not finish is refused up front; zero nodes on every
+cluster refuse nothing.
 """
 
 from __future__ import annotations
@@ -682,9 +683,12 @@ def test_a_reconciler_roll_is_refused_over_a_cluster_it_cannot_render(
         assert check["summary"].endswith("Nothing was changed."), check["summary"]
 
 
-def test_agent_waves_are_refused_at_preflight_when_no_cluster_has_a_node(
+def test_agent_waves_pass_the_preflight_when_no_cluster_has_a_node(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Zero GPU nodes anywhere block no deploy: an Agent-wave release over a
+    site whose only GPU cluster is parked is not refused."""
+
     report = _deploy_preflight(
         monkeypatch,
         "DATA_PLANE_COMPATIBLE",
@@ -692,11 +696,11 @@ def test_agent_waves_are_refused_at_preflight_when_no_cluster_has_a_node(
         only_the_parked_cluster=True,
     )
 
-    assert report["healthy"] is False, report
-    refusal = next(
-        item for item in report["checks"] if item["name"] == "zero_node_gpu_clusters"
+    assert report["healthy"] is True, report
+    assert all(item["name"] != "zero_node_gpu_clusters" for item in report["checks"]), (
+        "no zero-node refusal"
     )
-    assert refusal["summary"].endswith("Nothing was changed."), refusal["summary"]
+    assert list(report["zero_node_clusters"]) == [EKS]
 
 
 def test_the_cpu_roll_inventory_holds_a_parked_cluster_with_no_agents(

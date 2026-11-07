@@ -352,16 +352,6 @@ def _checks(proof: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _release(*cluster_ids: str) -> Any:
-    from types import SimpleNamespace
-
-    return SimpleNamespace(
-        config=SimpleNamespace(
-            clusters=[SimpleNamespace(cluster_id=item) for item in cluster_ids]
-        )
-    )
-
-
 AGENT_WAVES = ReleaseExecutionPlan(
     nodes=(
         ReleaseComponent.CPU_STAGE,
@@ -383,41 +373,17 @@ AGENT_WAVES = ReleaseExecutionPlan(
     ],
     ids=["agent-waves", "executor", "control-plane-only"],
 )
-def test_no_release_kind_is_refused_while_another_cluster_has_nodes(
+def test_no_release_kind_is_refused_for_zero_nodes_alone(
     plan: ReleaseExecutionPlan,
 ) -> None:
-    """Zero GPU nodes affect only their own cluster: a parked cluster beside a
-    populated one never refuses a release."""
+    """Zero GPU nodes affect only their own cluster: a parked cluster never
+    refuses a release, beside a populated cluster or with every cluster at
+    zero -- an Agent-wave release's rollback then stages the previous
+    release's own Agent pins, there being no live Agent to take them from."""
 
     proof = _eks({GROUP: nodegroup()})
 
-    assert (
-        PARKED.release_refusal(
-            _release("gpu-a", "gpu-eks-cluster"), _checks(proof), plan
-        )
-        is None
-    )
-
-
-def test_agent_waves_are_refused_only_when_no_cluster_has_a_node() -> None:
-    """The rollback of an Agent-wave release restores the control plane's Agent
-    pins from live Agents; with every cluster at zero there is none."""
-
-    proof = _eks({GROUP: nodegroup()})
-    release = _release("gpu-eks-cluster")
-
-    refusal = PARKED.release_refusal(release, _checks(proof), AGENT_WAVES)
-
-    assert refusal is not None and refusal["status"] == "FAIL", refusal
-    assert refusal["name"] == "zero_node_gpu_clusters"
-    assert refusal["summary"].startswith(
-        "every GPU cluster has zero nodes (gpu-eks-cluster): "
-    ), refusal["summary"]
-    assert refusal["summary"].endswith("Nothing was changed."), refusal["summary"]
-    executor_only = ReleaseExecutionPlan(nodes=(ReleaseComponent.EXECUTOR,))
-    assert PARKED.release_refusal(release, _checks(proof), executor_only) is None, (
-        "a release without Agent waves restores no Agent pin"
-    )
+    assert PARKED.release_refusal(_checks(proof), plan) is None
 
 
 def test_an_unproven_cluster_is_reported_unavailable_with_its_reason() -> None:
@@ -428,18 +394,9 @@ def test_an_unproven_cluster_is_reported_unavailable_with_its_reason() -> None:
     assert entry["state"] == "unavailable", entry
     assert entry["reason"] == proof["reason"]
     assert "not_gating_findings" not in entry, "a check that filed none"
-    refusal = PARKED.release_refusal(
-        _release("gpu-eks-cluster"), _checks(proof), AGENT_WAVES
+    assert PARKED.release_refusal(_checks(proof), AGENT_WAVES) is None, (
+        "an outage does not refuse a release, beside a populated cluster or not"
     )
-    assert refusal is not None and refusal["summary"].startswith(
-        "every GPU cluster has zero nodes (gpu-eks-cluster): "
-    ), "no live Agent anywhere, parked or not"
-    assert (
-        PARKED.release_refusal(
-            _release("gpu-a", "gpu-eks-cluster"), _checks(proof), AGENT_WAVES
-        )
-        is None
-    ), "beside a populated cluster an outage does not refuse a release"
 
 
 @pytest.mark.parametrize(
@@ -468,9 +425,7 @@ def test_a_reconciler_roll_needs_a_declared_gpu_instance_type(
     group = {**nodegroup(desired=desired), "instanceTypes": ["x9.huge"]}
     proof = _eks({GROUP: group})
 
-    refusal = PARKED.release_refusal(
-        _release("gpu-a", "gpu-eks-cluster"), _checks(proof), plan
-    )
+    refusal = PARKED.release_refusal(_checks(proof), plan)
 
     assert (refusal is not None) is refused, refusal
     if refusal is not None:
@@ -487,9 +442,7 @@ def test_a_reconciler_roll_needs_a_declared_gpu_instance_type(
 def test_a_selector_that_covers_no_group_declares_nothing_to_render() -> None:
     proof = _eks({GROUP: nodegroup(labelled=False), CPU_GROUP: cpu_nodegroup()})
 
-    refusal = PARKED.release_refusal(
-        _release("gpu-a", "gpu-eks-cluster"), _checks(proof), AGENT_WAVES
-    )
+    refusal = PARKED.release_refusal(_checks(proof), AGENT_WAVES)
 
     assert refusal is not None and "(declared: none)" in refusal["summary"], refusal
 

@@ -16,7 +16,10 @@ from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseErro
 from gpu_fault_release.regional_release_diff import ReleaseComponent
 from gpu_fault_release.regional_release_images import previous_executor_image
 from gpu_fault_release.regional_release_interfaces import RollbackTargetArguments
-from gpu_fault_release.regional_release_legacy import rollback_controller_config
+from gpu_fault_release.regional_release_legacy import (
+    ROLLBACK_CONTROLLER_CONFIG_FIELDS,
+    rollback_controller_config,
+)
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_profile_model import cluster_runtime_profiles
 from gpu_fault_release.regional_release_progress import RollbackCompensationPlan
@@ -153,32 +156,60 @@ def _started_without_any_node(release: Any, identities: dict[str, Any]) -> bool:
     )
 
 
+def _captured_config_core_pins(previous: dict[str, Any]) -> dict[str, str]:
+    """The Agent pins every CPU role's ``-config-core`` carried when the
+    release started (``cpu_role_config_maps``); none (``{}``) when the capture
+    took no CPU state -- the release changed no ``-config-core`` -- or the
+    roles disagree."""
+
+    maps = previous.get("cpu_role_config_maps")
+    if not isinstance(maps, dict):
+        return {}
+    values: set[tuple[str, ...]] = set()
+    for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
+        data = maps.get(f"{deployment}-config-core")
+        if not isinstance(data, dict):
+            return {}
+        values.add(
+            tuple(str(data.get(key) or "") for key in ROLLBACK_CONTROLLER_CONFIG_FIELDS)
+        )
+    if len(values) != 1:
+        return {}
+    (pins,) = values
+    return dict(zip(ROLLBACK_CONTROLLER_CONFIG_FIELDS, pins)) if all(pins) else {}
+
+
 def rollback_controller_config_for(
     release: Any, previous: dict[str, Any], site_runtime_profile_version: str
 ) -> dict[str, str]:
-    """The previous Agent identity pins the rolled-back controller is staged
-    with; none (``{}``) when the release started without a node on every
-    cluster.
+    """The previous Agent pins the rolled-back controller is staged with;
+    none (``{}``) when there is none to stage
+    (``RollbackRestartPlan.patch_controller_config`` patches nothing).
 
     Only clusters that had live Agents carry the pins; a cluster the release
     started without a node on recorded none (``regional_parked_cluster``). When
-    every cluster recorded none, no Agent ran to report an identity: there is
-    no pin to stage (``RollbackRestartPlan.patch_controller_config`` patches
-    nothing), and the CPU restore puts the previous release's own
-    ``-config-core`` back (``cpu_role_config_maps``). Anything less refuses as
-    before (``rollback_controller_config``): a snapshot with no entry, or one
-    whose live Agent set is empty while a cluster has no zero-node entry.
+    every cluster recorded none, no Agent ran to report an identity, and the
+    pins are the previous release's own, as every CPU role's ``-config-core``
+    carried them when the release started (``_captured_config_core_pins``):
+    the patch the CPU restore would make, made first, so a tier the controller
+    stage restarts already starts from them and the CPU restore keeps it -- one
+    roll, as with live Agents. None when the capture holds no such pins; the
+    CPU restore then puts the previous ``-config-core`` back as it is.
+    Anything less than a zero-node entry per cluster refuses as before
+    (``rollback_controller_config``): a snapshot with no entry, or one whose
+    live Agent set is empty while a cluster has no zero-node entry.
     """
 
     identities = previous.get("agent_identities") or {}
     if _started_without_any_node(release, identities):
+        pins = _captured_config_core_pins(previous)
         narrate_step(
             "rollback-agent-pins",
-            source="previous-config-core",
+            source="previous-config-core" if pins else "none",
             reason="no-cluster-had-a-node",
             clusters=",".join(sorted(str(cluster_id) for cluster_id in identities)),
         )
-        return {}
+        return pins
     return rollback_controller_config(
         parked_cluster.live_identities(identities),
         site_runtime_profile_version=site_runtime_profile_version,
