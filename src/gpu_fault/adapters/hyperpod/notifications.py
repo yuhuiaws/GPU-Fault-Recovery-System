@@ -156,6 +156,36 @@ class HyperPodNotificationMixin:
         match = re.search(r"-xid-(\d+)$", context.incident.event_id)
         return int(match.group(1)) if match is not None else None
 
+    def _submission_record_state(self, context: WorkflowStepContext) -> str | None:
+        """What the provider-submission ledger holds for this step:
+        ``on_record`` (a record in any state), ``none`` (the store answered it
+        has none: every store raises a ``LookupError`` for a missing record --
+        ``NotFoundError`` in the memory and shared stores, ``KeyError`` from
+        the regional client), ``unknown`` (the lookup failed), or ``None``
+        without a durable ledger to ask."""
+
+        store = getattr(getattr(self, "dispatcher", None), "adapter", None)
+        store = getattr(store, "store", None)
+        if store is None:
+            return None
+        try:
+            record = store.get_hyperpod_submission(
+                context.request.confirm_cluster_name,
+                hyperpod_submission_idempotency_key(
+                    context.workflow.request_id,
+                    context.step_index,
+                    context.step.operation,
+                ),
+            )
+        except LookupError:
+            return "none"
+        except Exception:  # noqa: BLE001 - an unreadable ledger proves nothing
+            LOGGER.exception(
+                "submission ledger lookup failed for %s", context.workflow.request_id
+            )
+            return "unknown"
+        return "none" if record is None else "on_record"
+
     def _submission_unrecorded(self, context: WorkflowStepContext) -> bool:
         """True only when the submission ledger provably holds no record for
         this step: the reservation itself was refused before any provider call.

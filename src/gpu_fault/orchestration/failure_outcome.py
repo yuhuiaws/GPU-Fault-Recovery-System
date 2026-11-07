@@ -165,6 +165,52 @@ def fabric_manager_restart_reason(execution: WorkflowStepExecution) -> str | Non
     return f"RESTART_FABRIC_MANAGER failed with no verdict on the unit: {cause}"
 
 
+#: The step detail the node lifecycle adapter writes when it refuses a
+#: RESTART_NODE / REPLACE_NODE before any provider call because the scheduler
+#: does not show the node isolated by this incident right now
+#: (``adapters/hyperpod/lifecycle._observe_isolation``, HyperPod and plain
+#: EKS): :data:`ISOLATION_NOT_ISOLATED` -- the node was read and its cordon,
+#: its quarantine taint, its incident or its fencing-token annotation is not
+#: this workflow's; :data:`ISOLATION_UNOBSERVABLE` -- no Kubernetes node
+#: answers to it, or the adapter has no Kubernetes client to read it with.
+#: Nothing about the hardware was learned: the escalation puts the isolation
+#: back and hands the node over (``containment_or_release``), or hands it
+#: over alone when it cannot be observed at all (``containment_refused``),
+#: instead of climbing from the reboot to the replacement.
+LIFECYCLE_ISOLATION_DETAIL = "isolation_not_observed"
+ISOLATION_NOT_ISOLATED = "NOT_ISOLATED"
+ISOLATION_UNOBSERVABLE = "UNOBSERVABLE"
+LIFECYCLE_OPERATIONS = frozenset(
+    {WorkflowOperation.RESTART_NODE, WorkflowOperation.REPLACE_NODE}
+)
+
+
+def lifecycle_isolation_refused(details: Mapping[str, Any] | None) -> str | None:
+    """The kind of a node lifecycle refusal for want of observed isolation
+    (:data:`LIFECYCLE_ISOLATION_DETAIL`), or ``None``."""
+
+    value = details.get(LIFECYCLE_ISOLATION_DETAIL) if details is not None else None
+    return value if value in (ISOLATION_NOT_ISOLATED, ISOLATION_UNOBSERVABLE) else None
+
+
+def lifecycle_isolation_refusals(
+    failed: Sequence[WorkflowStepExecution],
+) -> list[str] | None:
+    """The refusal kinds when every FAILED RESTART_NODE / REPLACE_NODE of a
+    record is such a refusal; ``None`` when none failed or one failed for
+    another reason (a provider refusal, a preflight gate, a lost spare: the
+    ladder's own rung)."""
+
+    kinds = [
+        lifecycle_isolation_refused(item.details)
+        for item in failed
+        if item.operation in LIFECYCLE_OPERATIONS
+    ]
+    if not kinds or any(kind is None for kind in kinds):
+        return None
+    return [kind for kind in kinds if kind is not None]
+
+
 def unknown_outcome_failure(details: Mapping[str, Any] | None) -> bool:
     """Whether a FAILED step's details say its outcome is not actually known.
 

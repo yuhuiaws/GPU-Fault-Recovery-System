@@ -1726,7 +1726,12 @@ failed `systemctl` call carry no structured detail of their own: the fold
 tells them apart by the wording the agent's executor gives them, pinned
 against the real handler; a Fabric Manager unit that is not installed reads
 as a unit that failed (the agent does not read the unit's load state before
-the restart), so it still climbs to the reboot. So is the support hand-off of a validate-then-readmit
+the restart), so it still climbs to the reboot. A reboot or replacement the
+node lifecycle adapter refused before its provider call because it could not
+observe the node's isolation takes the containment hand-off instead of the
+replacement rung, its reason naming the isolation problem: software-tested
+only (`tests/execution/test_lifecycle_isolation_refusal.py`), no live case
+refuses a reboot for isolation. So is the support hand-off of a validate-then-readmit
 record whose validation fails with no recovery step before it while its cordon
 still holds the node (stage `held_chain_step`;
 `tests/orchestration/test_cov95_runtime_escalation.py`,

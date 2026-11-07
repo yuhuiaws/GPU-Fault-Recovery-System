@@ -64,6 +64,11 @@ from gpu_fault.operation_registry import (
     OperationAdapter,
     operations_for_adapter,
 )
+from gpu_fault.orchestration.failure_outcome import (
+    ISOLATION_NOT_ISOLATED,
+    ISOLATION_UNOBSERVABLE,
+    LIFECYCLE_ISOLATION_DETAIL,
+)
 
 
 @dataclass(frozen=True)
@@ -72,6 +77,55 @@ class ObservedIsolation:
 
     verified: list[str]
     nodes: dict[str, dict[str, Any]]
+
+
+#: What a refusal's reason adds when the provider-submission ledger answers.
+_SUBMISSION_NOTES = {
+    "on_record": "a reboot submission for this step is on record; "
+    "the node may already have rebooted",
+    "unknown": "whether a reboot submission for this step is on record "
+    "is unknown (the ledger lookup failed)",
+}
+
+
+def isolation_refusal(
+    context: WorkflowStepContext,
+    message: str,
+    kind: str,
+    problem: str,
+    *,
+    node_id: str | None,
+    submission: str | None,
+    evidence: dict[str, Any],
+) -> WorkflowStepOutcome:
+    """A node lifecycle step refused before any provider call because the
+    node's isolation could not be observed (``failure_outcome
+    .LIFECYCLE_ISOLATION_DETAIL``): the escalation puts the isolation back and
+    hands the node over instead of climbing to the next rung. Every node of
+    the step says why in ``node_failures``, which the hand-off's reason
+    quotes, with what the submission ledger holds for a reboot."""
+
+    operation = context.step.operation.value
+    note = _SUBMISSION_NOTES.get(submission or "")
+    reasons = {
+        node: (
+            f"{operation} not submitted, isolation not observed: {problem}"
+            if node_id is None or node == node_id
+            else f"{operation} not submitted: isolation not observed on {node_id}"
+        )
+        + (f"; {note}" if note else "")
+        for node in context.step.node_ids
+    }
+    return WorkflowStepOutcome.failed(
+        message,
+        details={
+            "safety_rejection": True,
+            LIFECYCLE_ISOLATION_DETAIL: kind,
+            **evidence,
+            **({"provider_submission_record": submission} if submission else {}),
+            "node_failures": {node: [reason] for node, reason in reasons.items()},
+        },
+    )
 
 
 class HyperPodLifecycleStepAdapter(
@@ -262,6 +316,14 @@ class HyperPodLifecycleStepAdapter(
                 reasserted.append(node_id)
         return {"isolation_reasserted": reasserted} if reasserted else {}
 
+    def _reboot_submission_state(self, context: WorkflowStepContext) -> str | None:
+        """The submission ledger's answer for a reboot step; a replacement
+        never submits to the provider (``hyperpod.HyperPodAction.REPLACE``)."""
+
+        if context.step.operation is not WorkflowOperation.RESTART_NODE:
+            return None
+        return self._submission_record_state(context)
+
     def _observe_isolation(
         self, context: WorkflowStepContext
     ) -> ObservedIsolation | WorkflowStepOutcome:
@@ -273,10 +335,15 @@ class HyperPodLifecycleStepAdapter(
         the provider mutation. Unresolvable identity fails closed.
         """
         if self.kubernetes_adapter is None:
-            return WorkflowStepOutcome.failed(
+            return isolation_refusal(
+                context,
                 f"{self.provider_label} mutation requires the Kubernetes adapter "
                 "to observe node isolation",
-                details={"safety_rejection": True},
+                ISOLATION_UNOBSERVABLE,
+                "the lifecycle adapter has no Kubernetes client to read the node",
+                node_id=None,
+                submission=self._reboot_submission_state(context),
+                evidence={},
             )
         core = self.kubernetes_adapter.core
         verified: set[str] = set()
@@ -297,21 +364,26 @@ class HyperPodLifecycleStepAdapter(
                 kubernetes_node = candidate
                 break
             if node is None or kubernetes_node is None:
-                return WorkflowStepOutcome.failed(
+                return isolation_refusal(
+                    context,
                     f"cannot resolve Kubernetes node for {node_id}; isolation "
                     "cannot be observed",
-                    details={
-                        "safety_rejection": True,
-                        "node_id": node_id,
-                        "candidates": candidates,
-                    },
+                    ISOLATION_UNOBSERVABLE,
+                    "no Kubernetes node resolves (tried " + ", ".join(candidates) + ")",
+                    node_id=node_id,
+                    submission=self._reboot_submission_state(context),
+                    evidence={"node_id": node_id, "candidates": candidates},
                 )
             problems = self._isolation_problems(node, context)
             if problems:
-                return WorkflowStepOutcome.failed(
+                return isolation_refusal(
+                    context,
                     f"node {node_id} is not isolated: " + "; ".join(problems),
-                    details={
-                        "safety_rejection": True,
+                    ISOLATION_NOT_ISOLATED,
+                    "; ".join(problems),
+                    node_id=node_id,
+                    submission=self._reboot_submission_state(context),
+                    evidence={
                         "node_id": node_id,
                         "kubernetes_node": kubernetes_node,
                         "isolation_problems": problems,

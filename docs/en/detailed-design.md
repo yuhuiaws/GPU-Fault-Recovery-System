@@ -2474,7 +2474,16 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    (`failure_outcome.fabric_manager_restart_reason`). A reset that never ran still climbs: its chain cordoned the
    node, stopped its work and quiesced its GPU services first.
 2. `RESTART_NODE` fails: create a `REPLACE_NODE` workflow with
-   `replacement_strategy=HEALTHY_WARM_SPARE_ONLY`.
+   `replacement_strategy=HEALTHY_WARM_SPARE_ONLY`. Not so for a reboot or a replacement the node lifecycle adapter
+   refused before its provider call because it could not observe the node's isolation
+   (`adapters/hyperpod/lifecycle._observe_isolation`, HyperPod and plain EKS; step detail `isolation_not_observed`):
+   the node is not cordoned, its quarantine taint, incident or fencing-token annotation is not this workflow's, or no
+   Kubernetes node answers to it. Nothing reached the provider and nothing about the hardware was learned, so
+   neither ladder takes a rung: the hand-off puts the isolation back (`containment_or_release`: FREEZE_EVIDENCE →
+   MARK_UNSCHEDULABLE → QUARANTINE → ESCALATE_SUPPORT), or hands the node over alone when it cannot be observed at
+   all (`containment_refused`), its reason naming the isolation problem and, for a reboot, a submission of the step
+   the provider-submission ledger holds ("the node may already have rebooted"). A reboot the provider or its
+   preflight refused keeps the replacement rung.
 3. Replacement only allows a warm spare that has passed the independent health state machine's validation and has been atomically reserved; the managed/provider
    replacement Adapter rejects this strategy.
 4. Replacement fails: keep unschedulable/quarantine, execute `ESCALATE_SUPPORT`,

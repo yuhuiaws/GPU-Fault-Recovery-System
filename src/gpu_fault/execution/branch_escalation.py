@@ -42,6 +42,7 @@ from gpu_fault.orchestration.escalation import (
     node_action_refused_before_acting,
     unknown_outcome_failure,
 )
+from gpu_fault.orchestration.failure_outcome import lifecycle_isolation_refused
 from gpu_fault.orchestration.validation_evidence import validation_unobserved_failure
 
 if TYPE_CHECKING:
@@ -159,9 +160,10 @@ class BranchEscalator:
         # DESTR-025: the reboot rung's VALIDATE_GPU climbed to a REPLACE_NODE
         # no spare could serve, and the exhausted branch quarantined the node).
         unobserved = validation_unobserved_failure(details)
+        unisolated = lifecycle_isolation_refused(details) is not None
         rung = (
             None
-            if unknown or rejected or refused or unobserved
+            if unknown or rejected or refused or unobserved or unisolated
             else next_rung(step.operation, recovery_context, details)
         )
         taken = workflow.branch_escalation_counts.get(lineage_node, 0)
@@ -192,6 +194,8 @@ class BranchEscalator:
                         "the node (submit-remediation --disposition restore); "
                         "no rung"
                         if unobserved
+                        else "the node's isolation could not be observed; no rung"
+                        if unisolated
                         else "no further rung"
                         if rung is None
                         else f"{taken} rung(s) already taken"

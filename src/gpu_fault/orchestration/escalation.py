@@ -27,11 +27,13 @@ from gpu_fault.operation_registry import (
 )
 from gpu_fault.orchestration.failure_outcome import (
     EXECUTOR_REJECTED_STATUS_SOURCE as EXECUTOR_REJECTED_STATUS_SOURCE,
+    ISOLATION_NOT_ISOLATED,
     NO_SECOND_TICKET_OPERATIONS as _NO_SECOND_TICKET_OPERATIONS,
     UNKNOWN_OUTCOME_FLAGS as _UNKNOWN_OUTCOME_FLAGS,
     executor_rejected_failure as executor_rejected_failure,
     fabric_manager_unit_failed,
     held_chain_hand_off,
+    lifecycle_isolation_refusals,
     node_failure_reasons,
     reported_failed_nodes,
     unknown_outcome_failure as unknown_outcome_failure,
@@ -887,6 +889,16 @@ class HardwareEscalationService:
             }
         ):
             failed_stage = "software_or_firmware_remediation"
+            next_action = RecoveryAction.ESCALATE_OPERATOR
+            next_operation = WorkflowOperation.ESCALATE_SUPPORT
+        elif (refused := lifecycle_isolation_refusals(failed_executions)) is not None:
+            # A reboot or replacement refused for want of observed isolation:
+            # put it back and hand over, no rung (``failure_outcome``).
+            failed_stage = (
+                CONTAINMENT_STAGE
+                if ISOLATION_NOT_ISOLATED in refused
+                else CONTAINMENT_REFUSED_STAGE
+            )
             next_action = RecoveryAction.ESCALATE_OPERATOR
             next_operation = WorkflowOperation.ESCALATE_SUPPORT
         elif WorkflowOperation.REPLACE_NODE in failed_operation_set:
