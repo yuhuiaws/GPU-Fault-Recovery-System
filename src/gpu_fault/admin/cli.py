@@ -124,9 +124,9 @@ from gpu_fault.admin.membership_lock import (
     reload_site_for_mutation,
     site_mutation_identity as _admin_config_site_identity,
 )
+from gpu_fault.admin.custody_zero_nodes import assert_site_custody_current
 from gpu_fault.admin.node_key_custody_admin_entry import (
     add_custody_command,
-    assert_site_custody_current,
     run_custody_command,
 )
 from gpu_fault.admin.release_child import (

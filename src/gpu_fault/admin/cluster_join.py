@@ -1402,14 +1402,10 @@ def _join_cluster_locked(
         raise ProcessSupervisionLost(
             "previous join command ownership is unproven; automatic retry is forbidden"
         )
-    from gpu_fault.admin.node_key_custody_admin_entry import (
-        CUSTODY_PAUSE_ERRORS,
-        assert_site_custody_current,
-        record_join_custody_pause,
-    )
+    from gpu_fault.admin import custody_zero_nodes as custody
 
     active_runner = runner or CommandRunner()
-    assert_site_custody_current(request.site, active_runner)
+    custody.assert_site_custody_current(request.site, active_runner)
     if state.get("phase") == "COMPLETED":
         if _completed_state_is_current(request, state):
             if not _done(state, "RELEASE_STATE_UPDATED"):
@@ -1475,8 +1471,8 @@ def _join_cluster_locked(
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
         write_json_atomic(state_path, state)
         raise
-    except CUSTODY_PAUSE_ERRORS as exc:
-        record_join_custody_pause(state_path, state, exc)
+    except custody.CUSTODY_PAUSE_ERRORS as exc:
+        custody.record_join_custody_pause(state_path, state, exc)
         raise
     except (Exception, KeyboardInterrupt) as exc:
         try:

@@ -3979,7 +3979,8 @@ retired (`REVOKED`) or proven departed by its provider, and no node carries anyt
 cleanup reads `SKIPPED` with that reason; the node-key Secrets go with the namespaces as for any cluster. A record whose
 instance the provider still has (`an active fleet node is missing: ...`) or a node list that cannot be read still refuses
 (`node cleanup has no proven fleet targets`). `rotate-token` of such a cluster skips and records its node roll (§6.1) and
-completes; the next deploy is not blocked by it. **Alerts:** nothing pages for a fleet without nodes whose product Deployments
+completes; the next deploy is not blocked by it. The custody check of `preflight`, `deploy -f` and `join-cluster` skips a
+custody-registered cluster without nodes (§6.2). **Alerts:** nothing pages for a fleet without nodes whose product Deployments
 still run on its other nodes -- the collector-silence, stale-Agent and topology alerts count ACTIVE Agents only;
 `GpuFaultDataplaneCollectorMissing` fires for the cluster only when no node is left to run its watcher, which is a real fault.
 An unavailable cluster is therefore seen in `status`, the deploy log and the deploy record, not through an alert.
@@ -4238,6 +4239,11 @@ privately from its bound source and names it in the key task's evidence (`custod
 at its start and records it in the signed `Started.derived_extra_keys` (node -> digest), after which it is written out of the GPU
 Secret like every key of a node that is not authorized. Any other value, a mixed set, or a CPU mirror value that differs refuses
 the whole set (`live keys differ from the signed predecessor` / `does not match deployed key sources`).
+The custody check that `preflight`, `deploy -f` and every `join-cluster` run first probes each registered cluster in turn; a
+registered cluster whose selector selects no node at all (parked or unavailable, §5) holds no key and has no node binding, so it
+is skipped with a `zero-node-gpu-cluster ... step=custody recorded="no node, no custody binding to check"` line instead of
+refusing the whole site (`administrator custody node inventory is incomplete or ambiguous`). Every other registered cluster is
+probed as before; when nodes return, their new binding is judged like any changed binding.
 
 **Command**
 

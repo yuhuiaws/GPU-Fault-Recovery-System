@@ -35,8 +35,10 @@ without nodes as an empty, proven target set; that is proven offline only,
 through the real cleanup script and tools over a fake Kubernetes API and a fake
 `aws`, never on a live cluster. `rotate-token` skips and records the node
 roll of such a cluster; that is proven offline through the real rotation and
-its real node roll with fake reads. Configured node-key custody still needs a
-node on that cluster.
+its real node roll with fake reads. The custody check of `preflight`,
+`deploy -f` and `join-cluster` skips a custody-registered cluster without
+nodes; that is proven offline only (custody is not configured on the live
+site), and custody itself still needs a node to authorize keys for.
 
 ## Xid linkage and Drain P2P recovery
 
