@@ -50,10 +50,13 @@ NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-}"
 NODE_DEPENDENCY_IMAGE="${GPU_FAULT_NODE_DEPENDENCY_IMAGE:-}"
 NODE_WHEELHOUSE_SHA256="${GPU_FAULT_NODE_WHEELHOUSE_SHA256:-}"
 PREFLIGHT_ONLY="${GPU_FAULT_RECONCILER_PREFLIGHT_ONLY:-false}"
-# A GPU cluster the release engine proved parked at zero nodes: with no node
-# selected the script requires, keys and preflights none and renders the
-# installer template from GPU_FAULT_ZERO_NODE_RENDER_NODE, the node document
-# the cluster's node groups declare (regional_parked_cluster.render_node).
+# A GPU cluster the release engine found without nodes (parked or
+# unavailable): with no node selected the script requires, keys and preflights
+# none and renders the installer template from GPU_FAULT_ZERO_NODE_RENDER_NODE,
+# the node document the cluster's node groups declare
+# (regional_parked_cluster.render_node). With a pinned template
+# (GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP, a rollback's previous one) nothing
+# is rendered and the render node may be empty.
 ZERO_NODE_CLUSTER="${GPU_FAULT_ZERO_NODE_CLUSTER:-false}"
 ZERO_NODE_RENDER_NODE="${GPU_FAULT_ZERO_NODE_RENDER_NODE:-}"
 REQUIRE_ROLLBACK_SLOT="${GPU_FAULT_REQUIRE_ROLLBACK_SLOT:-false}"
@@ -278,22 +281,29 @@ if (( ${#NODES[@]} == 0 )); then
             "${HYPERPOD_CLUSTER}" "${NODE_SELECTOR}" >&2
         exit 1
     }
-    # Only the node the template is rendered from enters the rendering inputs;
-    # no key, preflight or installation is ever asked of it.
-    NODE_INVENTORY_JSON="$(jq -ce '
-        select(type == "object"
-            and (.metadata.name | type == "string" and length > 0)
-            and (.metadata.labels["node.kubernetes.io/instance-type"]
-                | type == "string" and length > 0))
-        | {items: [.]}
-    ' <<<"${ZERO_NODE_RENDER_NODE}")" || {
-        printf 'ERROR: zero-node cluster %s has no valid render node\n' \
-            "${CLUSTER_ID}" >&2
-        exit 2
-    }
+    if [[ -z "${ZERO_NODE_RENDER_NODE}" && -n "${TEMPLATE_CONFIG_MAP_OVERRIDE}" ]]; then
+        # The pinned template is admitted as it is: nothing is rendered.
+        NODE_INVENTORY_JSON='{"items":[]}'
+        ZERO_NODE_TEMPLATE="the pinned installer template ${TEMPLATE_CONFIG_MAP_OVERRIDE} is kept"
+    else
+        # Only the node the template is rendered from enters the rendering
+        # inputs; no key, preflight or installation is ever asked of it.
+        NODE_INVENTORY_JSON="$(jq -ce '
+            select(type == "object"
+                and (.metadata.name | type == "string" and length > 0)
+                and (.metadata.labels["node.kubernetes.io/instance-type"]
+                    | type == "string" and length > 0))
+            | {items: [.]}
+        ' <<<"${ZERO_NODE_RENDER_NODE}")" || {
+            printf 'ERROR: zero-node cluster %s has no valid render node\n' \
+                "${CLUSTER_ID}" >&2
+            exit 2
+        }
+        ZERO_NODE_TEMPLATE="the installer template is rendered from the declared node group"
+    fi
     ZERO_NODES="true"
-    printf 'zero-node GPU cluster %s: no node selected (selector %s); no node is required, keyed or preflighted; the installer template is rendered from the declared node group\n' \
-        "${CLUSTER_ID}" "${NODE_SELECTOR}" >&2
+    printf 'zero-node GPU cluster %s: no node selected (selector %s); no node is required, keyed or preflighted; %s\n' \
+        "${CLUSTER_ID}" "${NODE_SELECTOR}" "${ZERO_NODE_TEMPLATE}" >&2
 fi
 # This digest describes names only and cannot authorize key or template reuse.
 NODE_SET_SHA256="$(printf '%s\n' ${NODES[@]+"${NODES[@]}"} | sort | sha256sum | awk '{print $1}')"
@@ -438,7 +448,7 @@ if active:
 fi
 
 if [[ "${ZERO_NODES}" == "true" ]]; then
-    NODE="$(jq -r '.items[0].metadata.name' <<<"${NODE_INVENTORY_JSON}")"
+    NODE="$(jq -r '.items[0].metadata.name // ""' <<<"${NODE_INVENTORY_JSON}")"
 else
     NODE="${NODES[0]}"
 fi

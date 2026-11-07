@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault_release import regional_parked_cluster as PARKED
 from gpu_fault_release import regional_release_preflight as preflight
 from gpu_fault_release.regional_release_config import ReleaseError
 from tests.regional._cov95_release_checks import TOPIC, CheckedRelease
@@ -158,7 +159,6 @@ class ContextRelease(ResourceRelease):
         ("recovery", "NodeRecovery=None"),
         ("empty-cidrs", "requires Agent endpoint CIDRs"),
         ("bad-cidrs", "Agent endpoint CIDRs are invalid"),
-        ("no-nodes", "has no Kubernetes nodes"),
         ("no-address", "do not cover nodes"),
         ("cidr", "do not cover nodes"),
     ],
@@ -179,6 +179,33 @@ def test_context_preflight_binds_eks_hyperpod_and_agent_address_scope(
     assert release.iam == [], "failed cluster identity must not reach IAM acceptance"
     assert all("apply" not in args for args, _kwargs in release.runner.calls), (
         "context preflight must remain read-only on failure"
+    )
+
+
+def test_context_preflight_files_a_cluster_without_nodes_outside_status() -> None:
+    """A GPU cluster without any node (``regional_parked_cluster``): a finding
+    for every caller but ``status``, whose gate still refuses it before IAM
+    acceptance; the cluster's other gates still run."""
+
+    release = ContextRelease()
+    release.fault = "no-nodes"
+    with (
+        PARKED.gating_findings(release),
+        pytest.raises(ReleaseError, match="has no Kubernetes nodes"),
+    ):
+        preflight.ensure_region_contexts(release)
+    assert release.iam == [], "status refuses before IAM acceptance"
+
+    facts = preflight.ensure_region_contexts(release)
+
+    entry = facts["providers"]["gpu-a"]
+    assert entry["parked"]["parked"] is False, entry
+    assert entry["zero_node_findings"][0].startswith(
+        "gpu-a has no Kubernetes nodes; not parked: "
+    ), entry
+    assert release.iam == ["gpu-a"], "the executor IAM still gates"
+    assert all("apply" not in args for args, _kwargs in release.runner.calls), (
+        "context preflight stays read-only"
     )
 
 

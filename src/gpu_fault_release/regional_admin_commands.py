@@ -1113,7 +1113,9 @@ def build_status(release: Any, *, full: bool) -> dict[str, Any]:
     again inside.
     """
 
-    with read_snapshot(release):
+    # An unavailable GPU cluster's zero-node findings fail ``status`` only:
+    # the operator's view stays red while a deploy proceeds over it.
+    with read_snapshot(release), parked_cluster.gating_findings(release):
         state = release._load_state()
         release._apply_health_baseline(state)
         if full:

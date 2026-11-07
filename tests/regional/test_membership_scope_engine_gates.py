@@ -193,7 +193,16 @@ def test_another_clusters_lost_node_is_a_finding_of_the_join_preflight(
     assert code == 0, report
     assert report["healthy"] is True
     assert checks["regional_contexts"]["status"] == "WARN", checks["regional_contexts"]
-    assert checks["regional_contexts"]["details"]["not_gating"] == {OTHER: [finding]}
+    if lost == "no-nodes":
+        # A cluster without nodes that is not parked: a zero-node finding,
+        # which gates no preflight, scoped or not (regional_parked_cluster).
+        details = checks["regional_contexts"]["details"]
+        assert details["providers"][OTHER]["zero_node_findings"] == [finding]
+        assert report["zero_node_clusters"][OTHER]["state"] == "unavailable"
+    else:
+        assert checks["regional_contexts"]["details"]["not_gating"] == {
+            OTHER: [finding]
+        }
     assert checks["workflow_safety"]["status"] == "WARN", checks["workflow_safety"]
     assert checks["workflow_safety"]["details"]["not_gating"] == {
         OTHER: ["1 active destructive workflow(s): workflow-departed-node"]

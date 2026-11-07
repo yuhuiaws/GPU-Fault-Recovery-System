@@ -1,10 +1,11 @@
-"""``deploy-node-installer-reconciler.sh`` for a GPU cluster parked at zero nodes.
+"""``deploy-node-installer-reconciler.sh`` for a GPU cluster without nodes.
 
 With ``GPU_FAULT_ZERO_NODE_CLUSTER=true`` and no node selected the script
 requires, keys and preflights none, renders the installer template from the
 node the cluster's groups declare (``regional_parked_cluster.render_node``) and
 applies the steady-state Reconciler, so a node that joins later installs this
-release. Without the switch an empty node set refuses, as it always did.
+release. A pinned template (a rollback's previous one) is kept as it is, with
+no render node. Without the switch an empty node set refuses, as it always did.
 
 The render node is never a node a Job runs for: the Reconciler fills each real
 node into the Jobs it builds from the template. So for the same node group, a
@@ -43,6 +44,7 @@ CLUSTER = "gpu-eks-cluster"
 SELECTOR = f"gpu-fault.io/control-plane={SITE}"
 REAL = "ip-10-0-33-205.us-west-2.compute.internal"
 PROVIDER_ID = "aws:///us-west-2c/i-00000000000000001"
+TEMPLATE_PREFIX = "gpu-fault-node-installer-template-"
 
 
 def _proof() -> dict[str, Any]:
@@ -119,6 +121,10 @@ def zero_node_environment(tmp_path: Path) -> dict[str, str]:
                     }}))
                 elif kind == "jobs":
                     print('{"items":[]}')
+                elif kind == "configmap" and (root / "configmaps" / name).is_file():
+                    print(json.dumps({"data": {
+                        "job.yaml": (root / "configmaps" / name).read_text()
+                    }}))
                 else:
                     raise SystemExit("unexpected read " + json.dumps(args))
             elif "apply" in args:
@@ -240,6 +246,62 @@ def test_a_zero_node_preflight_proves_the_template_without_a_node_batch(
     assert _records(tmp_path, "admissions.jsonl"), (
         "but admits the template and Reconciler"
     )
+
+
+def test_a_pinned_template_is_kept_without_a_render_node(
+    zero_node_environment: dict[str, str], tmp_path: Path
+) -> None:
+    """A rollback: the template a forward run rendered is pinned by name and
+    content, so nothing is rendered and no declared node is needed."""
+
+    first = _run(zero_node_environment)
+    assert first.returncode == 0, first.stderr
+    rendered = next(
+        document
+        for batch in _records(tmp_path, "applies.jsonl")
+        for document in batch
+        if document.get("kind") == "ConfigMap"
+        and document["metadata"]["name"].startswith(TEMPLATE_PREFIX)
+    )
+    name, text = rendered["metadata"]["name"], rendered["data"]["job.yaml"]
+    (tmp_path / "configmaps").mkdir()
+    (tmp_path / "configmaps" / name).write_text(text)
+    (tmp_path / "applies.jsonl").unlink()
+
+    result = _run(
+        {
+            **zero_node_environment,
+            "GPU_FAULT_ZERO_NODE_RENDER_NODE": "",
+            "GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP": name,
+            "GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256": hashlib.sha256(
+                text.encode()
+            ).hexdigest(),
+        }
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"the pinned installer template {name} is kept" in result.stderr
+    applied = [
+        document for batch in _records(tmp_path, "applies.jsonl") for document in batch
+    ]
+    assert not [
+        item
+        for item in applied
+        if item.get("kind") == "ConfigMap"
+        and item["metadata"]["name"].startswith(TEMPLATE_PREFIX)
+    ], "no template rendered"
+    reconciler = next(item for item in applied if item.get("kind") == "Deployment")
+    assert name in json.dumps(reconciler), "the Reconciler points at the pinned one"
+
+
+def test_an_empty_render_node_without_a_pinned_template_refuses(
+    zero_node_environment: dict[str, str], tmp_path: Path
+) -> None:
+    result = _run({**zero_node_environment, "GPU_FAULT_ZERO_NODE_RENDER_NODE": ""})
+
+    assert result.returncode == 2
+    assert f"zero-node cluster {CLUSTER} has no valid render node" in result.stderr
+    assert _records(tmp_path, "applies.jsonl") == [], "nothing applied"
 
 
 def test_an_empty_node_set_still_refuses_without_the_zero_node_switch(

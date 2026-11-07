@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from gpu_fault_release import regional_parked_cluster as parked_cluster
@@ -304,15 +305,35 @@ def _zero_node_runtime(
     mutation_started: Callable[[], None] | None,
     candidate_preflight_completed: bool,
 ) -> tuple[str, str]:
-    """The node runtime of a cluster parked at zero nodes: no node to preflight,
-    wave or wait for, so only the steady-state Reconciler rolls -- with the very
+    """The node runtime of a cluster without nodes: no node to preflight, wave
+    or wait for, so only the steady-state Reconciler rolls -- with the very
     identity, template and images ``_finalize_node_runtime`` would hand it --
     and a node that joins later installs this release's runtime. The skipped
-    work is narrated and recorded (``regional_parked_cluster``)."""
+    work is narrated and recorded (``regional_parked_cluster``).
+
+    A rollback restores the previous template (``steady_template_config_map``,
+    pinned by the release snapshot): its preflight admits that template, so
+    neither needs a node to render one from."""
 
     assert candidate.zero_nodes is not None
+    steady_content = (
+        candidate.template_content_sha256
+        if not steady_template_config_map
+        or steady_template_config_map == candidate.template_config_map
+        else None
+    )
     if not candidate_preflight_completed:
-        ensure_node_candidate_preflight(release, target, candidate)
+        ensure_node_candidate_preflight(
+            release,
+            target,
+            replace(
+                candidate,
+                template_config_map=steady_template_config_map,
+                template_content_sha256=steady_content,
+            )
+            if steady_template_config_map
+            else candidate,
+        )
     if mutation_started is not None:
         mutation_started()
     identity = release._deploy_reconciler(
@@ -329,12 +350,7 @@ def _zero_node_runtime(
         template_config_map=(
             steady_template_config_map or candidate.template_config_map
         ),
-        template_content_sha256=(
-            candidate.template_content_sha256
-            if not steady_template_config_map
-            or steady_template_config_map == candidate.template_config_map
-            else None
-        ),
+        template_content_sha256=steady_content,
         allowed_node_names=None,
         max_unavailable=candidate.max_unavailable,
         runtime_image=steady_runtime_image or candidate.runtime_image,
@@ -416,10 +432,11 @@ def _node_runtime_candidate(
     )
     # The node set and its failure-domain map are two views of one node list,
     # so they share a single read instead of listing every node twice.
-    # A cluster parked at zero nodes has no node to roll: its node work is
-    # skipped and recorded, and only the steady-state Reconciler rolls
-    # (``_zero_node_runtime``). Asked before the node read, which refuses an
-    # empty node set; any cluster not proven parked keeps that refusal.
+    # A cluster without nodes -- parked or unavailable -- has no node to roll:
+    # its node work is skipped and recorded, and only the steady-state
+    # Reconciler rolls (``_zero_node_runtime``). Asked before the node read,
+    # which refuses an empty node set (a node list that cannot be read keeps
+    # that refusal).
     zero_nodes = (
         None
         if release.runner.dry_run

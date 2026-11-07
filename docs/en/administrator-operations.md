@@ -40,7 +40,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | [Deployment and Operations Manual](deployment-and-operations-manual.md) §9 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | The residue a node leaves after a spot reclaim, a scale-in or a provider replacement (Agent record still ACTIVE, workflows that never changed the node, ESCALATED incidents) | No command: the control plane's departed-node cleanup ends it once the node is proven gone (switch `spec.workflow.departedNodeCleanup`, on by default); the `departed nodes:` lines of `gpu-fault-admin status` list the nodes cleaned, pending and left to the operator, with the exact commands | [§10.1.1](#1011-what-a-departed-gpu-node-leaves-behind-spot-reclaim-scale-in-provider-replacement) |
-| Keep a GPU cluster in the site with every GPU node group scaled to zero (parked: no node to protect until it scales back up) | No command: scale the groups to zero; `status` stays healthy and names it in a `parked GPU cluster <id>` line; every deploy proceeds, rolling that cluster's Deployments and Reconciler and skipping its node work | [§5.0.6](#506-a-gpu-cluster-parked-at-zero-nodes) |
+| Keep a GPU cluster in the site with every GPU node group scaled to zero (parked: no node to protect until it scales back up), or read why a cluster that lost every node is unavailable | No command: scale the groups to zero; `status` stays healthy and names it in a `parked GPU cluster <id>` line. A cluster whose nodes are gone without its groups scaled to zero is unavailable: `status` fails with the reason (`GPU cluster <id> unavailable: ...`). Either way every deploy proceeds, rolling that cluster's Deployments and Reconciler and skipping its node work | [§5.0.6](#506-a-gpu-cluster-without-gpu-nodes-parked-or-unavailable) |
 | A GPU cluster's remediation storm breaker is open (alert `GpuFaultRemediationStormBreakerOpen`, a `remediation storm breaker` line in status): once the common cause is understood, resume automatic remediation, or hand the held workflows to people | `gpu-fault-admin remediation-storm release --state-dir ... --cluster-id <c> --reason ... --reference ...`; `abort` hands them over; both take `--dry-run` first | §8 `GpuFaultRemediationStormBreakerOpen` |
 | Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement (the manual fallback when the departed-node cleanup is off or refuses), and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
 | Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back; the manual fallback when the departed-node cleanup is off or refuses) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once; for a node whose provider identity is unknown (no instance id in the node name, no EC2 instance id on the record; ledger reason `provider_identity_unknown`) add `--node <node> --accept-unknown-provider-identity --reason <why>` | §10.2 |
@@ -470,9 +470,10 @@ kubeconfig and logs are untouched; the reinstall does not need these inputs prep
   run it synchronously once (`create job --from=cronjob`, wait for Complete, default 300 seconds); if the Job does not
   Complete it fails closed and rolls no component;
 - The Runtime Profile content is unchanged, or a new plan has been generated per this section and approved independently.
-- A GPU cluster parked at zero nodes does not stand in the way: the release rolls its Deployments and Reconciler and skips
-  its node work (§5.0.6). Only a release with Agent waves while every GPU cluster has zero nodes is refused before any change
-  (`zero_node_gpu_clusters`).
+- A GPU cluster without GPU nodes, parked or unavailable, does not stand in the way: the release rolls its Deployments and
+  Reconciler and skips its node work (§5.0.6). A release is refused before any change (`zero_node_gpu_clusters`) only when it
+  could not finish or roll back: Agent waves while every GPU cluster has zero nodes, or a Reconciler roll over a cluster whose
+  node groups declare no GPU instance type the installer knows.
 - If the change touches `ddl*.py`, Processor claim/retry/completion or the PostgreSQL pool,
   the CAP-005 runner has passed with zero skips on an isolated PostgreSQL 16 database.
 
@@ -3782,17 +3783,17 @@ Running the printed commands also needs `sagemaker:UpdateCluster`, `sagemaker:Up
 `autoscaling:UpdateAutoScalingGroup`. No runtime role is granted any of them. The HyperPod instance group's own execution
 role needs `cloudwatch:DescribeAlarms` for automatic rollbacks (AWS, Evidence above).
 
-#### 5.0.6 A GPU cluster parked at zero nodes
+#### 5.0.6 A GPU cluster without GPU nodes: parked or unavailable
 
-When every GPU node group of a cluster is scaled to zero on purpose -- an EKS managed node group to `desiredSize` 0, a
-HyperPod instance group to `TargetCount` 0 -- and the cluster stays in the site, the product calls it **parked**. Zero GPU
-nodes affect only that cluster: they never block a deploy or an upgrade of the site, and never the other GPU clusters or the
-CPU control plane. Its other nodes, its own Deployments (executor, watcher, collector, node installer reconciler, data-plane
-ADOT) and the executor's path to the control plane stay up and keep being rolled and verified; the departed-node cleanup
-ends the records of the nodes that left (§10.1.1). No command parks or unparks a cluster: the provider's own scaling does.
+When a GPU cluster's recorded node selector selects no Kubernetes node at all (none, Ready or not) -- its GPU node groups
+scaled to zero on purpose, or its capacity lost -- the product asks the cluster's provider and puts the cluster in one of two
+states, **parked** or **unavailable**. Zero GPU nodes affect only that cluster: in either state they never block a deploy or
+an upgrade of the site, and never the other GPU clusters or the CPU control plane. Its other nodes, its own Deployments
+(executor, watcher, collector, node installer reconciler, data-plane ADOT) and the executor's path to the control plane stay
+up and keep being rolled and verified; the departed-node cleanup ends the records of the nodes that left (§10.1.1). No
+command changes the state: the provider's own scaling does.
 
-**What is proven parked.** Only a cluster whose recorded node selector selects no Kubernetes node at all (none, Ready or not)
-is asked, and its provider must declare the capacity zero:
+**Parked: the provider declares the capacity zero.**
 
 - `eks-managed`: at least one managed node group the selector covers, every one of them `ACTIVE` at
   `scalingConfig.desiredSize` 0, and no Karpenter NodePool that could launch a node the selector selects -- a NodePool whose
@@ -3801,33 +3802,46 @@ is asked, and its provider must declare the capacity zero:
 - `hyperpod`: every instance group the selector covers `InService` at `TargetCount` 0 and `CurrentCount` 0 (derived from the
   `DescribeCluster` fields; see the validation limitations).
 
+**Unavailable: every other cluster without nodes.** The reason says why it is not parked: a covered group that wants nodes
+(`node group <g> wants 2 node(s) (desiredSize 2): its nodes are lost or still joining` -- an outage such as a Spot reclaim of
+every node, or a scale-up still joining), a group that is not `ACTIVE`/`InService` (being created, updated or replaced), a
+selector that covers no group, a NodePool that could supply the scope, a provider read that failed.
+
 The proof reads what the `regional_contexts` check already reads (`eks:ListNodegroups`, `eks:DescribeNodegroup`,
 `sagemaker:DescribeCluster`, the Karpenter NodePool list of the automatic-update advisory), so it needs no new permission;
-it is read once per report. Anything else is **not** parked and fails exactly as a cluster without nodes always did, the
-message now ending with why: a covered group that wants nodes (`node group <g> wants 2 node(s) (desiredSize 2): its nodes
-are lost or still joining` -- an outage, or a scale-up still joining), a group that is not `ACTIVE`/`InService` (being
-created, updated or replaced), a selector that covers no group, a NodePool that could supply the scope, a read that failed.
-The three failing shapes are `<id> has no Kubernetes nodes; not parked: ...` (`regional_contexts`), `<id> has no Ready GPU
-nodes; not parked: ...` (`gpu_cluster:<id>`; `HyperPod nodes` on a HyperPod cluster) and `<id> has no registered Node Agents;
-not parked: ...` (`control_api`). Agents still live on nodes the selector no longer selects (a label removed from a group)
-are an Agent coverage drift, never a park.
+it is read once per report, in the same snapshot as the node list, and never carried from one step of a release to the next.
 
-**What `status` and `verify` show for a parked cluster.**
+**What `status` shows.**
 
-- `healthy: yes` stays possible: the header gains `parked GPU cluster <id> (<provider>): no node selected; <proof> (<group>:
-  desiredSize 0, min 0, max <n>); not a failure -- ...`.
-- The JSON names it at its top, `zero_node_clusters.<id>` with `state` `parked`, `provider`, `reason` and `groups` (each
-  covered group's desired or target and current counts, its declared instance types and labels), and per check under
-  `parked`: in `control_api` `details.clusters.<id>`, in `gpu_cluster:<id>` `details` and in `regional_contexts`
+- Parked: `healthy: yes` stays possible; the header gains `parked GPU cluster <id> (<provider>): no node selected; <proof>
+  (<group>: desiredSize 0, min 0, max <n>); not a failure -- ...`.
+- Unavailable: `status` keeps failing on it, `healthy: NO`, and the header gains `GPU cluster <id> unavailable: no node
+  selected; <reason>; the deploy skips its node work`. The failing checks are `regional_contexts` (`<id> has no Kubernetes
+  nodes; not parked: <reason>`), `gpu_cluster:<id>` (`<id> has no Ready GPU nodes; not parked: ...`; `HyperPod nodes` on a
+  HyperPod cluster) and `control_api` (`<id> has no registered Node Agents; not parked: ...`). This red `status` is the
+  signal of the outage: once the departed-node cleanup has retired the Agents, no alert pages (Alerts, below).
+- The JSON names both at its top, `zero_node_clusters.<id>` with `state` (`parked` or `unavailable`), `provider`, `reason`
+  and `groups` (each covered group's desired or target and current counts, its declared instance types and labels), and per
+  check under `parked`: in `control_api` `details.clusters.<id>`, in `gpu_cluster:<id>` `details` and in `regional_contexts`
   `details.providers.<id>`. `live_release.zero_node_clusters.<id>` is what the last release skipped there (below).
-- `control_api`: zero Ready nodes against zero counted Agents is complete coverage; fleet readiness and collector readiness are
-  not asked (`collector_readiness.parked_not_awaited`).
-- `gpu_cluster:<id>` still judges the Deployments, the node scope, the executor's readiness and its TLS path; its summary reads
-  `<id> data plane is healthy; parked at zero GPU nodes`. `regional_contexts` still judges the context, the provider facts,
-  `/readyz`, the executor IAM and the retired collectors; only the Agent-endpoint CIDR coverage has no node to cover.
 
-**Deploys while a cluster is parked.** Every release kind proceeds -- `NOOP`, `CONTROL_PLANE_ONLY`, `DATA_PLANE_COMPATIBLE`,
-`FULL`, with or without Agent waves. On the parked cluster:
+**What `verify` and the deploy preflight show.** A parked cluster is judged as in `status`. An unavailable cluster's three
+zero-node findings above do not gate them: the check reads `WARN`, its summary ends `; not gating (GPU cluster without nodes,
+unavailable): <finding>`, the finding is kept under the cluster's section (`zero_node_findings`) and in
+`zero_node_clusters.<id>.not_gating_findings` (`check`, `finding`), and the log has one line per finding, for example
+`zero-node-gpu-cluster <time> cluster=<id> state=unavailable check=regional_contexts gating=no finding="<id> has no Kubernetes
+nodes; not parked: ..."`. Every other finding of that cluster still gates: its Deployments, the executor's readiness and TLS
+path, its context and provider binding, the executor IAM, its retired collectors, and the Agents still live on nodes the
+selector no longer selects (a label removed from a group) -- an Agent coverage drift, never a park and never a zero-node
+finding. For a cluster without nodes in either state, zero Ready nodes against zero counted Agents is complete coverage, and
+fleet readiness and collector readiness are not asked (`collector_readiness.zero_node_not_awaited`); `gpu_cluster:<id>` still
+judges the Deployments, the node scope, the executor's readiness and its TLS path (summary `<id> data plane is healthy; parked
+at zero GPU nodes`, or `<id> data plane Deployments and executor are healthy; no GPU node (unavailable)`), and
+`regional_contexts` still judges the context, the provider facts, `/readyz`, the executor IAM and the retired collectors; only
+the Agent-endpoint CIDR coverage has no node to cover.
+
+**Deploys while a cluster has no nodes.** Every release kind proceeds -- `NOOP`, `CONTROL_PLANE_ONLY`,
+`DATA_PLANE_COMPATIBLE`, `FULL`, with or without Agent waves -- whichever the state. On that cluster:
 
 - its cluster-level components (executor, watcher, collector, DCGM exporter, data-plane ADOT, node installer reconciler) roll
   and are verified as on any cluster;
@@ -3835,33 +3849,39 @@ are an Agent coverage drift, never a park.
   is no node preflight batch, fleet rollout, Agent wave or Agent wait. The release log says so in one line per step, for
   example `zero-node-gpu-cluster <time> cluster=<id> state=parked phase=upgrade
   skipped=agent-snapshot,node-preflight-batch,fleet-rollout,agent-waves,agent-wait reconciler=steady-state
-  reconciler_bundle=<12 hex> reconciler_template=<12 hex> reason="..."`, and the release state keeps the same record
-  (`zero_node_clusters`);
+  reconciler_bundle=<12 hex> reconciler_template=<12 hex> reason="..."` (`state=unavailable` for an unavailable cluster), and
+  the release state keeps the same record (`zero_node_clusters`);
 - its steady-state Reconciler is rolled with this release's node runtime, its installer template rendered from a node of the
-  covered group as the group declares it (instance type and labels; a group of a GPU type the installer does not know fails
-  that step). A node that joins later is installed with the current release, never the previous one;
+  covered group as the group declares it (instance type and labels). A node that joins later is installed with the current
+  release, never the previous one. A cluster none of whose covered groups declares a GPU instance type the installer knows
+  (a selector that covers no group declares none) cannot render it: a release that rolls the Reconciler -- every executor and
+  node runtime release -- is refused by the deploy preflight check `zero_node_gpu_clusters` before anything is changed
+  (`GPU cluster(s) <id> (declared: <types>) have zero nodes and no node group declaring a GPU instance type the installer
+  knows: ... Nothing was changed.`);
 - the CPU roll's Agent heartbeat barrier has nothing to wait for there;
-- the verify judges it as `status` does; the release record names it (`verification.zero_node_clusters` in
+- the verify judges it as described above; the release record names it (`verification.zero_node_clusters` in
   `release-deploy/<release>/state.json`, `zero_node_clusters` in the deploy's printed result, `zero_node_clusters` in
   `source-deploy-success.json`).
 
-A failed release rolls back the parked cluster's Reconciler alone (nothing to restore on nodes; the control plane's Agent
-pins come from the clusters with live Agents), the automatic rollback's `sync-state` accepts it, and a resume asks nothing of
-nodes it never had. Nodes that joined in the middle of a release are rolled like newcomers. The one refusal: a release with
-Agent waves while **every** GPU cluster of the site has zero nodes -- its rollback could not derive the Agent pins from any
-live Agent -- is refused by the deploy preflight check `zero_node_gpu_clusters` before anything is changed; scale one cluster
-up first.
+A failed release rolls back that cluster's Reconciler alone, on the previous installer template the release snapshot pinned
+(nothing is rendered and nothing is restored on nodes; the control plane's Agent pins come from the clusters with live
+Agents), the automatic rollback's `sync-state` accepts it, and a resume asks nothing of nodes it never had. Nodes that joined
+in the middle of a release are rolled like newcomers. The other refusal: a release with Agent waves while **every** GPU
+cluster of the site has zero nodes -- its rollback could not derive the Agent pins from any live Agent -- is refused by the
+same preflight check before anything is changed; scale one cluster up first.
 
-**Scaling back up needs no command.** Raise the group's desired (or target) count: the new nodes carry the group's ownership
-label, the executor's node-key sync attests them, the steady-state Reconciler installs them with the current release and their
-Agents register. The cluster stops being parked the moment its selector selects a node; while the nodes install, `status`
-reports them like any joining node (`installer is not Succeeded`, Agent coverage drift) until the Agents are in.
+**Capacity that returns needs no command.** Raise the group's desired (or target) count, or let the provider replace the
+lost capacity: the new nodes carry the group's ownership label, the executor's node-key sync attests them, the steady-state
+Reconciler installs them with the current release and their Agents register. The cluster has nodes again the moment its
+selector selects one; while they install, `status` reports them like any joining node (`installer is not Succeeded`, Agent
+coverage drift) until the Agents are in.
 
-**What still needs nodes.** `uninstall` and `remove-cluster` of a parked cluster refuse in their node cleanup (`node cleanup
-has no proven fleet targets`); `rotate-token` for a parked cluster updates the Secret and the data plane and then stops at its
-node roll. Scale a group back up first. **Alerts:** nothing pages for a parked fleet whose product Deployments still run on
-its other nodes -- the collector-silence, stale-Agent and topology alerts count ACTIVE Agents only;
+**What still needs nodes.** `uninstall` and `remove-cluster` of a cluster without nodes refuse in their node cleanup (`node
+cleanup has no proven fleet targets`); `rotate-token` for such a cluster updates the Secret and the data plane and then stops
+at its node roll. Scale a group back up first. **Alerts:** nothing pages for a fleet without nodes whose product Deployments
+still run on its other nodes -- the collector-silence, stale-Agent and topology alerts count ACTIVE Agents only;
 `GpuFaultDataplaneCollectorMissing` fires for the cluster only when no node is left to run its watcher, which is a real fault.
+An unavailable cluster is therefore seen in `status`, the deploy log and the deploy record, not through an alert.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 
@@ -4251,8 +4271,8 @@ check that `sha256sum <file>` equals the `expected` value of the error, and reru
 | Workflows advance slowly between steps while control-worker CPU is high, Aurora `xact_rollback` climbs or the control-worker logs show `workflow dispatch lease lost` | Whether the dispatch lease changes hands and whether ticks approach the lease: `sum(increase(gpu_fault_workflow_dispatch_lease_acquisitions_total[15m]))` is 0 under a steady holder (1 after a roll), staying above 0 is lease thrash; in `sum by (when) (increase(gpu_fault_workflow_dispatch_lease_losses_total[15m]))`, `mid_tick` is a holder taken over inside its tick (it stops at once and leaves its queued rows to the new holder) and `tick_start` a holder away longer than the lease (a stuck or starved process); `histogram_quantile(0.99, sum by (le) (rate(gpu_fault_workflow_dispatch_tick_seconds_bucket[15m])))` near `GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS` (15 s as shipped) is slow ticks: check the CPU and `gpu_fault_event_loop_lag_seconds` of the Pod whose `gpu_fault_workflow_dispatch_lease_held` is 1; `sum(gpu_fault_workflow_dispatch_lease_held)` should be 1 (0: no process dispatches, 2: an overlap). Do not lengthen the lease for this | `detailed-design-v2.md` §3.7 ④, §10.2 |
 | step FAILED with an unclear reason | `status_source` and the executor traceback | REG-14.4 |
 | All Agents non-ACTIVE | node token, systemd, artifact/config/profile pins | REG-14.5 |
-| `status`/`verify`/deploy preflight fail with `<id> has no Kubernetes nodes`, `has no Ready GPU nodes` or `has no registered Node Agents`, ending with `; not parked: ...` | The cluster lost every node without its provider declaring zero capacity: the reason names the node group or instance group that still wants nodes (an outage or a scale-up still joining), one being replaced, or a selector that covers no group | §5.0.6 |
-| The deploy preflight fails `zero_node_gpu_clusters`: `every GPU cluster has zero nodes (...): a release with Agent waves ...` | Its rollback could not restore the control plane's Agent pins from any live Agent; nothing was changed: scale a node group of one cluster up and let its nodes join, then deploy again | §5.0.6 |
+| `status` fails with `<id> has no Kubernetes nodes`, `has no Ready GPU nodes` or `has no registered Node Agents`, ending with `; not parked: ...`, and the header has `GPU cluster <id> unavailable: ...` (a deploy's preflight and verify read `WARN` for the same findings) | The cluster is unavailable: it lost every node without its provider declaring zero capacity; the reason names the node group or instance group that still wants nodes (an outage or a scale-up still joining), one being replaced, or a selector that covers no group. Deploys proceed over it; restore the capacity, or scale its groups to zero to park it | §5.0.6 |
+| The deploy preflight fails `zero_node_gpu_clusters`: `every GPU cluster has zero nodes (...): a release with Agent waves ...`, or `GPU cluster(s) <id> (declared: ...) have zero nodes and no node group declaring a GPU instance type the installer knows ...` | The release could not finish or roll back, and nothing was changed: with every cluster at zero nodes its rollback could not restore the control plane's Agent pins from any live Agent; with no known GPU instance type declared the Reconciler's installer template cannot be rendered. Scale a node group up and let its nodes join (or declare a supported instance type on the group), then deploy again | §5.0.6 |
 | A replacement node has no Agent for long, its installer Job keeps showing `FailedMount ... references non-existent secret key` | Whether the GPU Secret `gpu-fault-node-action-keys` has the node's key name; executor log `node action key sync` (404/403/409 explained in §6) and the start-up WARNING `get no Node Action key until the next deploy`; whether `GPU_FAULT_NODE_KEY_SYNC_SECONDS` is 0 | §6 |
 | operator API returns 403 | Whether the execution token and cluster token are mixed up | REG-14.6 |
 | HyperPod outcome unknown | CloudTrail, actual node state, idempotent submission record | REG-14.7 |
@@ -6174,8 +6194,8 @@ the one process holding its task lease writes; it judges with the very rule `wor
   10 minutes. An Agent that still holds its lease is never a candidate, whatever a report says.
 
 So a spot reclaim is ended about 10–12 minutes after the node left Kubernetes (the 10-minute guard plus at most one 60 s
-period each of the report and the cleanup). When the nodes that left were all of a cluster's because its GPU node groups
-were scaled to zero, the cluster is then parked (§5.0.6) rather than failing. Residue left by nodes that
+period each of the report and the cleanup). When the nodes that left were all of a cluster's, the cluster is then parked
+(§5.0.6) if its GPU node groups were scaled to zero, and unavailable otherwise. Residue left by nodes that
 departed earlier is ended too: after 10 minutes of an unbroken report chain, a node the chain never listed counts as
 absent from the chain's start.
 

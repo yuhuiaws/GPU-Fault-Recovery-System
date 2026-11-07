@@ -1,12 +1,12 @@
-"""A release with Agent waves over a site where one GPU cluster is parked.
+"""A release with Agent waves over a site where one GPU cluster has no node.
 
-The populated cluster rolls its Agents in waves as always. The parked cluster
-has no node to preflight, wave or wait for: its node work is skipped and
-recorded, and only its steady-state Reconciler rolls -- with the release's own
-node runtime, so a node that joins later installs the current release, never
-the previous one. Its rollback restores that Reconciler alone, its resume asks
-nothing of nodes it never had, and the rollback's Agent pins come from the
-clusters that had live Agents.
+The populated cluster rolls its Agents in waves as always. The cluster without
+nodes -- parked, or unavailable -- has no node to preflight, wave or wait for:
+its node work is skipped and recorded, and only its steady-state Reconciler
+rolls -- with the release's own node runtime, so a node that joins later
+installs the current release, never the previous one. Its rollback restores
+that Reconciler alone, its resume asks nothing of nodes it never had, and the
+rollback's Agent pins come from the clusters that had live Agents.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from gpu_fault_release import regional_release_node_runtime_rollout as NODE_RUNT
 from gpu_fault_release import regional_release_resume_validation as RESUME
 from gpu_fault_release import regional_release_rollback_target as ROLLBACK_TARGET
 from gpu_fault_release import regional_release_validation as VALIDATION
+from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
     ReleaseExecutionPlan,
@@ -46,6 +47,8 @@ from tests.regional._parked_cluster_support import (
     EKS,
     GROUP,
     HYPERPOD,
+    OWNERSHIP,
+    SITE,
     ParkedSite,
     node,
 )
@@ -76,8 +79,7 @@ def _roll(site: WaveSite, phase: str = "upgrade", **extra: Any) -> tuple[str, st
         bundle_cm="candidate-bundle",
         artifact_sha=site.node_wheel_sha,
         config_digest="d" * 64,
-        candidate_preflight_completed=True,
-        **extra,
+        **{"candidate_preflight_completed": True, **extra},
     )
 
 
@@ -125,12 +127,39 @@ def test_an_agent_wave_rolls_only_the_steady_reconciler_of_a_parked_cluster(
         assert field in line, line
 
 
-def test_a_cluster_that_wants_nodes_is_never_rolled_as_parked() -> None:
+def test_a_cluster_that_lost_its_nodes_rolls_only_its_reconciler_as_unavailable(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An outage beside a populated cluster: the release proceeds, the skip is
+    recorded as ``unavailable`` with the reason, and the nodes that come back
+    install the current release."""
+
     site = WaveSite(desired=2)
 
-    with pytest.raises(Exception, match="node"):
-        _roll(site)
-    assert site.reconciler_calls == [], "nothing rolled on an outage"
+    assert _roll(site) == (BUNDLE, TEMPLATE)
+
+    ((_cluster, call),) = site.reconciler_calls
+    assert call["allowed_node_names"] is None
+    assert call["zero_nodes"]["parked"] is False
+    assert call["artifact_sha"] == site.node_wheel_sha, "the current runtime"
+    entry = site.state["zero_node_clusters"][EKS]
+    assert entry["state"] == "unavailable", entry
+    assert entry["reason"].startswith(f"node group {GROUP} wants 2 node(s)"), entry
+    line = next(
+        item
+        for item in capsys.readouterr().err.splitlines()
+        if item.startswith("zero-node-gpu-cluster ")
+    )
+    assert "state=unavailable" in line and 'reason="node group ' in line, line
+
+
+def test_a_cluster_with_a_node_is_never_rolled_as_one_without() -> None:
+    site = WaveSite(desired=2)
+    site.documents[(EKS, "nodes", "-l " + OWNERSHIP)] = {
+        "items": [node("ip-10-0-1-10", {"gpu-fault.io/control-plane": SITE})]
+    }
+
+    assert PARKED.zero_nodes_now(site, site.eks) is None
 
 
 def test_the_node_preflight_of_a_parked_cluster_runs_the_script_without_nodes(
@@ -172,6 +201,36 @@ def test_the_node_preflight_of_a_parked_cluster_runs_the_script_without_nodes(
     labels = render["metadata"]["labels"]
     assert labels["node.kubernetes.io/instance-type"] == "p5en.48xlarge"
     assert labels["eks.amazonaws.com/nodegroup"] == GROUP
+
+
+def test_a_cluster_of_an_unknown_gpu_type_fails_its_reconciler_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No declared instance type the installer knows: no template to render,
+    so the cluster's reconciler step fails before the script runs."""
+
+    site = WaveSite(desired=2)
+    site.provider.nodegroups[GROUP]["instanceTypes"] = ["x9.huge"]
+    scripts: list[list[str]] = []
+    provider_run = site.provider.run
+
+    def run(arguments: list[str], **kwargs: Any) -> str:
+        if str(arguments[0]).endswith("deploy-node-installer-reconciler.sh"):
+            scripts.append(arguments)
+        return provider_run(arguments, **kwargs)
+
+    site.provider.run = run  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        NODE_PREFLIGHT, "build_reconciler_environment", lambda *_a, **_k: {}
+    )
+    monkeypatch.setattr(
+        NODE_PREFLIGHT, "reconciler_template_identity", lambda *_a: TEMPLATE
+    )
+    monkeypatch.setattr(NODE_PREFLIGHT, "pin_installer_version", lambda *_a: None)
+
+    with pytest.raises(ReleaseError, match="declare no GPU instance type"):
+        _roll(site, candidate_preflight_completed=False)
+    assert scripts == [] and site.reconciler_calls == [], "nothing ran or rolled"
 
 
 def test_a_node_that_joins_the_parked_cluster_is_a_newcomer_of_the_release() -> None:
@@ -218,8 +277,8 @@ def _previous(site: ParkedSite) -> dict[str, Any]:
         "config_digest": "7" * 64,
         "node_action_key_version": 2,
     }
-    proof = PARKED.parked_without_nodes(site, site.eks)
-    assert proof is not None, "the fixture's EKS cluster is parked"
+    proof = PARKED.without_nodes(site, site.eks)
+    assert proof is not None, "the fixture's EKS cluster has no node"
     return {
         "metadata": {"required-agent-protocol-version": "3"},
         "cluster_runtime_profiles": {},
@@ -477,12 +536,17 @@ def test_a_full_rollback_of_the_parked_cluster_restores_its_components_and_recon
     monkeypatch.setattr(
         ROLLBACK_TARGET, "validate_rollback_node_template", lambda *_a, **_k: None
     )
-    preflights: list[tuple[str, str, bool]] = []
+    preflights: list[tuple[str, str, bool, str | None]] = []
     monkeypatch.setattr(
         NODE_RUNTIME,
         "ensure_node_candidate_preflight",
         lambda _release, target, candidate: preflights.append(
-            (target.cluster_id, candidate.phase, candidate.zero_nodes is not None)
+            (
+                target.cluster_id,
+                candidate.phase,
+                candidate.zero_nodes is not None,
+                candidate.template_config_map,
+            )
         ),
     )
 
@@ -501,8 +565,9 @@ def test_a_full_rollback_of_the_parked_cluster_restores_its_components_and_recon
         components=frozenset(FULL_GPU) - {ReleaseComponent.OBSERVABILITY},
     )
 
-    assert preflights == [(EKS, "rollback", True)], (
-        "the previous template is admitted in its zero-node mode, no node batch"
+    assert preflights == [(EKS, "rollback", True, "previous-template")], (
+        "the pinned previous template is admitted in its zero-node mode: no "
+        "node batch, no render node"
     )
     assert f"{EKS}:dcgm" in site.applied
     assert f"{EKS}:gpu-fault-cluster-executor" in site.applied

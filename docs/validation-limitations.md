@@ -10,20 +10,26 @@ storage probes and production recovery remain separate acceptance work.
 The broader thermal/RMA and application-fault policy recommendations are not
 claimed as completed by this batch.
 
-## GPU clusters parked at zero nodes
+## GPU clusters without nodes (parked or unavailable)
 
 A cluster whose node selector selects no node is reported parked only when its
-provider declares zero capacity. The eks-managed proof (every covered managed
-node group `ACTIVE` at `scalingConfig.desiredSize` 0, no Karpenter NodePool
-able to launch a selected node) is built from the live node group and NodePool
-shapes. The HyperPod proof (every covered instance group `InService` at
-`TargetCount` and `CurrentCount` 0) is derived from the `DescribeCluster`
-fields; a HyperPod cluster scaled to zero has not been exercised live. The
+provider declares zero capacity, and unavailable otherwise. The eks-managed
+proof (every covered managed node group `ACTIVE` at
+`scalingConfig.desiredSize` 0, no Karpenter NodePool able to launch a selected
+node) is built from the live node group and NodePool shapes. The HyperPod proof
+(every covered instance group `InService` at `TargetCount` and `CurrentCount`
+0) is derived from the `DescribeCluster` fields; a HyperPod cluster scaled to
+zero has not been exercised live. The unavailable state -- a deploy proceeding
+while a cluster's group still wants nodes -- is proven offline only. The
 installer template of a cluster without nodes is rendered from a node of the
 declared group; that it builds the same Job for a joining node as a template
 rendered from a real node is proven offline against the rendering scripts, not
-on a node that joined live. `uninstall`, `remove-cluster` and `rotate-token`
-still need a node on that cluster.
+on a node that joined live. A cluster whose GPU capacity no managed node group
+or instance group declares (Karpenter only) has no node to render from, so a
+release that rolls the Reconciler is refused while it has no node. No alert
+pages for a cluster that has lost every node once its Agents are retired:
+`status` shows it. `uninstall`, `remove-cluster` and `rotate-token` still need
+a node on that cluster.
 
 ## Xid linkage and Drain P2P recovery
 

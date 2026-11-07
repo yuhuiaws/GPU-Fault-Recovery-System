@@ -449,19 +449,38 @@ def mark_not_gating(release: Any, checks: list[dict[str, Any]]) -> list[dict[str
 
 
 def annotate_scope(release: Any, report: dict[str, Any]) -> None:
-    """Name the scope and every finding that did not gate, at the report's top."""
+    """Name the scope and every finding that did not gate, at the report's top:
+    the other clusters' own findings, and the zero-node findings of a cluster
+    without nodes that is not parked (``zero_node_clusters``,
+    ``regional_parked_cluster``), which gate no verify or preflight."""
 
     scope = verify_scope(release)
     if scope is None:
         return
+    zero_nodes = report.get("zero_node_clusters")
     report[SCOPE_KEY] = {
         "verb": scope.verb,
         "target_cluster_ids": list(scope.targets),
         "not_gating_findings": [
-            {"check": str(check.get("name")), "cluster_id": node, "finding": text}
-            for check in report.get("checks") or []
-            if isinstance(check, dict) and check.get("status") == "WARN"
-            for node, text in _findings(check)
+            *(
+                {"check": str(check.get("name")), "cluster_id": node, "finding": text}
+                for check in report.get("checks") or []
+                if isinstance(check, dict) and check.get("status") == "WARN"
+                for node, text in _findings(check)
+            ),
+            *(
+                {
+                    "check": str(item.get("check")),
+                    "cluster_id": str(cluster_id),
+                    "finding": str(item.get("finding")),
+                }
+                for cluster_id, entry in sorted(
+                    (zero_nodes if isinstance(zero_nodes, dict) else {}).items()
+                )
+                if isinstance(entry, dict)
+                for item in entry.get("not_gating_findings") or ()
+                if isinstance(item, dict)
+            ),
         ],
     }
 

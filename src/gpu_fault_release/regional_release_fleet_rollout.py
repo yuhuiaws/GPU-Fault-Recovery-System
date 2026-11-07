@@ -650,8 +650,8 @@ def live_agent_node_names(
 
 def capture_active_agent_node_sets(release: RegionalRelease) -> dict[str, AgentNodeSet]:
     """Every cluster's live Agents, the set a CPU roll's heartbeat barrier
-    waits for; a cluster without one refuses, unless it selects no node and is
-    proven parked (``regional_parked_cluster``): its set is empty."""
+    waits for; a cluster without one refuses, unless it selects no node --
+    parked or unavailable (``regional_parked_cluster``): its set is empty."""
 
     if release.runner.dry_run:
         return {}
@@ -668,16 +668,16 @@ def capture_active_agent_node_sets(release: RegionalRelease) -> dict[str, AgentN
     for cluster_id in sorted(targets):
         if cluster_id in result and result[cluster_id]["node_ids"]:
             continue
-        proof = parked_cluster.parked_without_nodes(release, targets[cluster_id])
+        proof = parked_cluster.without_nodes(release, targets[cluster_id])
         if proof is None:
             missing.append(cluster_id)
             continue
         parked_cluster.narrate(
             cluster_id,
-            state=parked_cluster.PARKED,
+            state=parked_cluster.state_of(proof),
             step="active_agent_node_sets",
             recorded="no live Agent to wait for",
-            reason=json.dumps(str(proof.get("reason"))),
+            reason=str(proof.get("reason")),
         )
         result[cluster_id] = {"node_ids": []}
     if missing:
@@ -1242,7 +1242,9 @@ def deploy_reconciler(
     )
     pin_installer_version(environment, release, target, node_dependency_target)
     if zero_nodes is not None:
-        environment.update(parked_cluster.reconciler_environment(zero_nodes, target))
+        environment.update(
+            parked_cluster.reconciler_environment(zero_nodes, target, environment)
+        )
     release._settle_installer_jobs(target)
     environment["GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT"] = "false"
     # Product reports are diagnostic, not authorization to skip fresh key

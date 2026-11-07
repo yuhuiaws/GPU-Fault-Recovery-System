@@ -4,8 +4,8 @@ Zero selected nodes alone never proves a park: the provider must declare the
 capacity zero (an EKS managed node group at ``desiredSize`` 0, a HyperPod
 instance group at ``TargetCount`` 0) and nothing else -- a Karpenter NodePool
 -- may still launch a node the selector selects. Every other shape is an
-outage, a replacement in progress or a misconfiguration, and stays a failure
-that now says why it is not parked.
+outage, a replacement in progress or a misconfiguration: the cluster is
+*unavailable*, and every message about it says why it is not parked.
 """
 
 from __future__ import annotations
@@ -420,14 +420,78 @@ def test_agent_waves_are_refused_only_when_no_cluster_has_a_node() -> None:
     )
 
 
-def test_an_unproven_cluster_is_not_reported_parked() -> None:
+def test_an_unproven_cluster_is_reported_unavailable_with_its_reason() -> None:
     proof = _eks({GROUP: nodegroup(desired=2)})
 
-    assert PARKED.zero_node_clusters(_checks(proof)) == {}
+    (entry,) = PARKED.zero_node_clusters(_checks(proof)).values()
+
+    assert entry["state"] == "unavailable", entry
+    assert entry["reason"] == proof["reason"]
+    assert "not_gating_findings" not in entry, "a check that filed none"
+    refusal = PARKED.release_refusal(
+        _release("gpu-eks-cluster"), _checks(proof), AGENT_WAVES
+    )
+    assert refusal is not None and refusal["summary"].startswith(
+        "every GPU cluster has zero nodes (gpu-eks-cluster): "
+    ), "no live Agent anywhere, parked or not"
     assert (
-        PARKED.release_refusal(_release("gpu-eks-cluster"), _checks(proof), AGENT_WAVES)
+        PARKED.release_refusal(
+            _release("gpu-a", "gpu-eks-cluster"), _checks(proof), AGENT_WAVES
+        )
         is None
-    ), "a cluster that is not parked fails its own checks instead"
+    ), "beside a populated cluster an outage does not refuse a release"
+
+
+@pytest.mark.parametrize(
+    "plan,refused",
+    [
+        (ReleaseExecutionPlan(nodes=(ReleaseComponent.RECONCILER,)), True),
+        (AGENT_WAVES, True),
+        (ReleaseExecutionPlan(nodes=(ReleaseComponent.EXECUTOR,)), False),
+        (
+            ReleaseExecutionPlan(
+                nodes=(ReleaseComponent.REGISTRY, ReleaseComponent.CPU_FINALIZE)
+            ),
+            False,
+        ),
+    ],
+    ids=["reconciler", "agent-waves", "executor-only", "control-plane-only"],
+)
+@pytest.mark.parametrize("desired", [0, 2], ids=["parked", "unavailable"])
+def test_a_reconciler_roll_needs_a_declared_gpu_instance_type(
+    plan: ReleaseExecutionPlan, refused: bool, desired: int
+) -> None:
+    """The template of a cluster without nodes is rendered from a declared
+    node: with no GPU instance type the installer knows, a release that rolls
+    the Reconciler could neither roll it nor be told so before it started."""
+
+    group = {**nodegroup(desired=desired), "instanceTypes": ["x9.huge"]}
+    proof = _eks({GROUP: group})
+
+    refusal = PARKED.release_refusal(
+        _release("gpu-a", "gpu-eks-cluster"), _checks(proof), plan
+    )
+
+    assert (refusal is not None) is refused, refusal
+    if refusal is not None:
+        assert refusal["summary"] == (
+            "GPU cluster(s) gpu-eks-cluster (declared: x9.huge) have zero nodes "
+            "and no node group declaring a GPU instance type the installer "
+            "knows: a release that rolls the Reconciler renders their installer "
+            "template from a declared node, and there is none. Scale a group up "
+            "and let a node join, or declare a supported instance type on the "
+            "group, then deploy again. Nothing was changed."
+        )
+
+
+def test_a_selector_that_covers_no_group_declares_nothing_to_render() -> None:
+    proof = _eks({GROUP: nodegroup(labelled=False), CPU_GROUP: cpu_nodegroup()})
+
+    refusal = PARKED.release_refusal(
+        _release("gpu-a", "gpu-eks-cluster"), _checks(proof), AGENT_WAVES
+    )
+
+    assert refusal is not None and "(declared: none)" in refusal["summary"], refusal
 
 
 def test_reports_name_each_parked_cluster_with_its_state_and_groups() -> None:
@@ -453,6 +517,79 @@ def test_the_status_header_names_the_parked_cluster_and_its_groups() -> None:
     assert f"({GROUP}: desiredSize 0, min 0, max 2)" in line
     assert "not a failure" in line, line
     assert "join with the current release by themselves" in line, line
+
+
+def test_the_status_header_names_an_unavailable_cluster_and_why() -> None:
+    proof = _eks({GROUP: nodegroup(desired=2)})
+
+    (line,) = PARKED.status_lines({"checks": _checks(proof)})
+
+    assert line == (
+        f"GPU cluster gpu-eks-cluster unavailable: no node selected; node group "
+        f"{GROUP} wants 2 node(s) (desiredSize 2): its nodes are lost or still "
+        "joining; the deploy skips its node work"
+    )
+
+
+def test_a_check_that_filed_findings_reads_warn_once() -> None:
+    proof = _eks({GROUP: nodegroup(desired=2)})
+    checks = _checks(proof)
+    checks[0]["details"]["providers"]["gpu-eks-cluster"]["zero_node_findings"] = [
+        "gpu-eks-cluster has no Kubernetes nodes; not parked: r"
+    ]
+    checks.append({"name": "aurora", "status": "FAIL", "summary": "down"})
+
+    fields = PARKED.report_fields(checks)
+    again = PARKED.report_fields(fields["checks"])
+
+    contexts, aurora = fields["checks"]
+    assert contexts["status"] == "WARN", contexts
+    assert contexts["summary"].endswith(
+        "; not gating (GPU cluster without nodes, unavailable): gpu-eks-cluster "
+        "has no Kubernetes nodes; not parked: r"
+    ), contexts["summary"]
+    assert aurora == checks[1], "another check is left as it is"
+    assert again["checks"] == fields["checks"], "marked once"
+    entry = fields["zero_node_clusters"]["gpu-eks-cluster"]
+    assert entry["not_gating_findings"] == [
+        {
+            "check": "regional_contexts",
+            "finding": "gpu-eks-cluster has no Kubernetes nodes; not parked: r",
+        }
+    ]
+
+
+def test_only_status_gates_the_findings() -> None:
+    from types import SimpleNamespace
+
+    release = SimpleNamespace()
+    proof = _eks({GROUP: nodegroup(desired=2)})
+    section: dict[str, Any] = {}
+
+    PARKED.zero_node_finding(
+        release,
+        section,
+        "c has no Kubernetes nodes",
+        proof,
+        check="regional_contexts",
+        cluster_id="c",
+        details={"x": 1},
+    )
+    assert section["zero_node_findings"] == [
+        PARKED.zero_nodes_failure("c has no Kubernetes nodes", proof)
+    ]
+    with PARKED.gating_findings(release), pytest.raises(PARKED.CheckFailure) as failed:
+        PARKED.zero_node_finding(
+            release,
+            {},
+            "c has no Kubernetes nodes",
+            proof,
+            check="regional_contexts",
+            cluster_id="c",
+            details={"x": 1},
+        )
+    assert failed.value.details == {"x": 1}
+    assert PARKED.gating(release) is False, "restored after the status"
 
 
 # --- the render node and the snapshot entry ------------------------------------
@@ -490,6 +627,24 @@ def test_a_group_of_an_unknown_gpu_type_cannot_render_a_template() -> None:
 
     with pytest.raises(PARKED.ReleaseError, match="declare no GPU instance type"):
         PARKED.render_node(proof, target)
+
+
+def test_a_pinned_template_needs_no_render_node() -> None:
+    """A rollback restores the previous template: nothing is rendered, so a
+    cluster that declares no known GPU instance type rolls back all the same."""
+
+    from types import SimpleNamespace
+
+    proof = _eks({GROUP: {**nodegroup(desired=2), "instanceTypes": ["x9.huge"]}})
+    target = SimpleNamespace(
+        cluster_id="gpu-eks-cluster", provider="eks-managed", hyperpod_cluster_name=""
+    )
+
+    assert PARKED.reconciler_environment(
+        proof, target, {"GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP": "previous"}
+    ) == {"GPU_FAULT_ZERO_NODE_CLUSTER": "true", "GPU_FAULT_ZERO_NODE_RENDER_NODE": ""}
+    with pytest.raises(PARKED.ReleaseError, match="declare no GPU instance type"):
+        PARKED.reconciler_environment(proof, target, {})
 
 
 def test_the_snapshot_entry_has_no_identity_and_no_node() -> None:

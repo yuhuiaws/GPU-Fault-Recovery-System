@@ -102,8 +102,9 @@ def _check(
 
 
 def _report(mode: str, release: Any, checks: list[dict[str, Any]]) -> dict[str, Any]:
+    fields = parked.report_fields(checks)
     counts = {
-        status: sum(item["status"] == status for item in checks)
+        status: sum(item["status"] == status for item in fields["checks"])
         for status in ("PASS", "WARN", "FAIL", "SKIP")
     }
     return {
@@ -111,8 +112,7 @@ def _report(mode: str, release: Any, checks: list[dict[str, Any]]) -> dict[str, 
         "site_name": release.config.site_name,
         "healthy": counts["FAIL"] == 0,
         "summary": counts,
-        "checks": checks,
-        parked.ZERO_NODE_KEY: parked.zero_node_clusters(checks),
+        **fields,
     }
 
 

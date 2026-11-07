@@ -1041,8 +1041,9 @@ def deploy_reconciler_of_cluster(
     release: Any, target: ClusterTarget, *, phase: str, **arguments: Any
 ) -> None:
     """``release._deploy_reconciler`` for a Reconciler-only roll (forward or
-    rollback): a cluster parked at zero nodes gets its Reconciler without any
-    node to require (``regional_parked_cluster``), and the skip is recorded."""
+    rollback): a cluster without nodes, parked or unavailable, gets its
+    Reconciler without any node to require (``regional_parked_cluster``), and
+    the skip is recorded."""
 
     zero_nodes = (
         None

@@ -197,9 +197,11 @@ def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str,
     ACTIVE and ready minutes later), and the refusal names the nodes and the
     Agent records behind the difference.
 
-    A gating cluster without any Agent whose selector selects no node and that
-    is proven parked (``regional_parked_cluster.parked_without_nodes``) is
-    recorded as an explicit entry with no identity and no node.
+    A gating cluster without any Agent whose selector selects no node --
+    parked or unavailable (``regional_parked_cluster.without_nodes``) -- is
+    recorded as an explicit entry with no identity and no node. Live Agents on
+    nodes the selector no longer selects still refuse: their set is not the
+    cluster's (empty) node set.
     """
 
     capture_identities = getattr(release, "_capture_agent_identities", None)
@@ -208,21 +210,21 @@ def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str,
         item for item in release.config.clusters if gates(release, item.cluster_id)
     ]
     others = [item for item in release.config.clusters if item not in gating]
-    parked: dict[str, dict[str, Any]] = {}
+    zero_nodes: dict[str, dict[str, Any]] = {}
 
-    def accepted_parked(target: Any) -> bool:
-        proof = parked_cluster.parked_without_nodes(release, target)
+    def accepted_zero_nodes(target: Any) -> bool:
+        proof = parked_cluster.without_nodes(release, target)
         if proof is None:
             return False
-        if target.cluster_id not in parked:
+        if target.cluster_id not in zero_nodes:
             parked_cluster.narrate(
                 target.cluster_id,
-                state=parked_cluster.PARKED,
+                state=parked_cluster.state_of(proof),
                 step=CHECK,
                 recorded="no Agent identity, no node",
-                reason=json.dumps(str(proof.get("reason"))),
+                reason=str(proof.get("reason")),
             )
-        parked[target.cluster_id] = proof
+        zero_nodes[target.cluster_id] = proof
         return True
 
     problem = ""
@@ -230,13 +232,13 @@ def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str,
         identities = (
             capture_identities()
             if capture_identities is not None
-            else state.capture_agent_identities(release, parked=accepted_parked)
+            else state.capture_agent_identities(release, parked=accepted_zero_nodes)
         )
         problem = ""
         for target, expected_nodes in state._map_clusters(
             release,
             lambda target: set(release._target_node_names(target)),
-            targets=[item for item in gating if item.cluster_id not in parked],
+            targets=[item for item in gating if item.cluster_id not in zero_nodes],
             failure="active Agent set capture",
         ):
             captured_nodes = set(identities[target.cluster_id]["node_ids"])
@@ -257,7 +259,7 @@ def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str,
                 **identities,
                 **{
                     cluster_id: parked_cluster.zero_node_identity(proof)
-                    for cluster_id, proof in parked.items()
+                    for cluster_id, proof in zero_nodes.items()
                 },
             }
         if attempt == 0:

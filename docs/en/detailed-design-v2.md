@@ -4451,21 +4451,27 @@ default true, the default kept out of records) is rendered into all three roles'
 from it whether to write, `control_api_inspect` reports it in `status`; the guard is `DEPARTED_AGENT_GUARD_AGE`, shared
 with the CLI and not configurable.
 
-**A cluster left without any node: parked, or failing.** When the nodes that left were every node a cluster's selector
-selects, the release engine asks the provider whether that was declared (`src/gpu_fault_release/regional_parked_cluster.py`):
-every EKS managed node group the selector covers `ACTIVE` at `scalingConfig.desiredSize` 0 and no Karpenter NodePool able to
-launch a selected node, or every covered HyperPod instance group `InService` at `TargetCount`/`CurrentCount` 0. Proven, the
-cluster is *parked*, and zero GPU nodes affect only that cluster: `status`/`verify` judge its Deployments and executor as
-always, read zero Agents for zero nodes as full coverage, ask no fleet or collector readiness and name it
-(`zero_node_clusters`, the `parked GPU cluster` header line, the deploy record); every release kind proceeds -- the Agent
-snapshot records an explicit entry with no identity and no node (`zero_node_identity`), the node preflight batch, fleet
-rollout, waves and waits are skipped and recorded, the steady-state Reconciler is rolled with the release's node runtime
-(its installer template rendered from a node of the declared group, `render_node`, so a later joiner installs the current
-release), the CPU roll's heartbeat barrier, the rollback (Reconciler only, Agent pins from the clusters with live Agents),
-the resume and `sync-state` all carry the entry. Only a release with Agent waves while every GPU cluster has zero nodes is
-refused at its deploy preflight (`zero_node_gpu_clusters`). Not proven -- a group that still wants nodes, one being
-replaced, a selector that covers no group, a failed read -- the cluster fails as before, the refusal naming why. The proof
-reads only what `regional_contexts` already reads; the departed-node cleanup itself does not consult it.
+**A cluster left without any node: parked, or unavailable.** When the nodes that left were every node a cluster's
+selector selects, the release engine asks the provider whether that was declared
+(`src/gpu_fault_release/regional_parked_cluster.py`): every EKS managed node group the selector covers `ACTIVE` at
+`scalingConfig.desiredSize` 0 and no Karpenter NodePool able to launch a selected node, or every covered HyperPod instance
+group `InService` at `TargetCount`/`CurrentCount` 0. Proven, the cluster is *parked*; not proven -- a group that still wants
+nodes, one being replaced, a selector that covers no group, a failed read -- it is *unavailable*, every message naming why.
+Zero GPU nodes affect only that cluster, in either state. `status`/`verify` judge its Deployments and executor as always,
+read zero Agents for zero nodes as full coverage, ask no fleet or collector readiness and name it (`zero_node_clusters`, the
+`status` header, the deploy record). A parked cluster is not a finding; an unavailable cluster's zero-node findings (no
+Kubernetes node, no Ready node, no registered Agent) fail `status` only -- the operator's view stays red -- while a deploy, its
+preflight and verify and every other engine mode file them as `WARN` (`zero_node_finding`); every other finding of the
+cluster, coverage drift of Agents still live on nodes the selector no longer selects among them, still gates. Every release
+kind proceeds over either state: the Agent snapshot records an explicit entry with no identity and no node
+(`zero_node_identity`), the node preflight batch, fleet rollout, waves and waits are skipped and recorded, the steady-state
+Reconciler is rolled with the release's node runtime (its installer template rendered from a node of the declared group,
+`render_node`, so a later joiner installs the current release), and the CPU roll's heartbeat barrier, the rollback
+(Reconciler only, on the pinned previous template; Agent pins from the clusters with live Agents), the resume and
+`sync-state` all carry the entry. A release is refused at its deploy preflight (`zero_node_gpu_clusters`) only when it could
+not finish or roll back: Agent waves while every GPU cluster has zero nodes, or a Reconciler roll over a cluster whose groups
+declare no GPU instance type the installer knows. The proof reads only what `regional_contexts` already reads; the
+departed-node cleanup itself does not consult it.
 
 Code basis: `src/gpu_fault/departed_node_cleanup.py::DepartedNodeCleanup.run_once`,
 `src/gpu_fault/departed_node_cleanup_actions.py::DepartureWrites`, `src/gpu_fault/departed_nodes.py`,
@@ -4474,7 +4480,8 @@ Code basis: `src/gpu_fault/departed_node_cleanup.py::DepartedNodeCleanup.run_onc
 For the behaviour coverage see `tests/departed_nodes/` (both providers end to end on the in-memory store and on
 PostgreSQL, every refusal, the single writer, the resumed restart), `tests/execution/test_cluster_executor_node_inventory.py`,
 `tests/regional/test_departed_node_status.py`, `tests/admin/test_admin_config_departed_node_cleanup.py`,
-`tests/regional/test_parked_gpu_cluster_proof.py` and `tests/regional/test_parked_gpu_cluster_release.py`.
+`tests/regional/test_parked_gpu_cluster_proof.py`, `tests/regional/test_parked_gpu_cluster_release.py`,
+`tests/regional/test_zero_node_release_waves.py` and `tests/deploy/test_reconciler_zero_node_cluster.py`.
 
 ---
 ## 8. Interface Design

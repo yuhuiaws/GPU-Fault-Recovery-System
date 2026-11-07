@@ -26,10 +26,11 @@ kind: ``ready``, ``age_seconds`` and the threshold the control plane applied,
 with how long the check waited and how many polls it made -- so a FAIL names
 the stale node and collector instead of only the cluster.
 
-A cluster parked at zero GPU nodes (``regional_parked_cluster``) has no ACTIVE
-Agent, so the control plane never calls it ready; nothing there will report,
-so it is neither waited for nor failed, and the evidence names it under
-``parked_not_awaited``.
+A cluster without GPU nodes (``regional_parked_cluster``) has no ACTIVE Agent,
+so the control plane never calls it ready; nothing there will report, so it is
+neither waited for nor failed -- a parked cluster always, an unavailable one
+outside ``status`` -- and the evidence names it under
+``zero_node_not_awaited``.
 """
 
 from __future__ import annotations
@@ -129,8 +130,10 @@ def judge_collector_readiness(
     # A cluster-scoped verify (join-cluster / remove-cluster) neither waits for
     # nor fails on another cluster's collectors: they are its findings.
     others = not_gating_ids(release, snapshots)
-    # Nor on a parked cluster's: it has no Agent that could ever report.
-    parked = parked_cluster.not_awaited(clusters, snapshots)
+    # Nor on a cluster's without nodes: it has no Agent that could ever report.
+    parked = parked_cluster.not_awaited(
+        clusters, snapshots, gate=parked_cluster.gating(release)
+    )
     thresholds = _thresholds(report)
     budget = _capped_grace(grace_seconds)
     started = monotonic()

@@ -74,7 +74,7 @@ class NodeMutationPreflight:
     #: Nodes of ``node_names`` already on their way out (NotReady or being
     #: deleted) when the forward roll read them; judged for departure first.
     leaving_nodes: tuple[str, ...] = ()
-    #: The proof of a cluster that selected no node and is parked
+    #: The proof of a cluster that selected no node, parked or unavailable
     #: (``regional_parked_cluster``): ``node_names`` is empty, the node work is
     #: skipped and only the steady-state Reconciler rolls.
     zero_nodes: Mapping[str, Any] | None = None
@@ -231,7 +231,9 @@ def run_node_installer_preflight(
     if candidate.zero_nodes is not None:
         # No node to preflight: the script proves the template and its inputs.
         environment.update(
-            parked_cluster.reconciler_environment(candidate.zero_nodes, target)
+            parked_cluster.reconciler_environment(
+                candidate.zero_nodes, target, environment
+            )
         )
     environment.update(
         {

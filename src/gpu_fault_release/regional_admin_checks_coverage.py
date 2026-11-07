@@ -466,7 +466,7 @@ def counted_agents(cluster: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def check_agent_coverage(
-    cluster_id: str, cluster: dict[str, Any]
+    cluster_id: str, cluster: dict[str, Any], *, release: Any = None
 ) -> list[dict[str, Any]]:
     """Refuse a cluster whose counted Agents do not match its Ready Nodes.
 
@@ -476,7 +476,9 @@ def check_agent_coverage(
     (``regional_release_verify_churn``): those nodes' Agents are not counted,
     and the refusal names each Agent without a Ready Node whose departure the
     verify could not prove, with the reason. A parked cluster (no node, no
-    counted Agent, ``regional_parked_cluster.is_parked``) returns none.
+    counted Agent, ``regional_parked_cluster.is_parked``) returns none; so does
+    an unavailable one judged for ``release`` outside ``status``, its finding
+    filed (``regional_parked_cluster.zero_node_finding``).
     """
 
     excused = churn_excused(cluster)
@@ -489,12 +491,20 @@ def check_agent_coverage(
         if parked_cluster.is_parked(cluster):
             # Zero Ready nodes, zero Agents: a parked cluster is fully covered.
             return []
-        raise ReleaseError(
-            parked_cluster.zero_nodes_failure(
-                f"{cluster_id} has no registered Node Agents",
-                cluster.get(parked_cluster.PARKED_KEY),
+        message = f"{cluster_id} has no registered Node Agents"
+        proof = cluster.get(parked_cluster.PARKED_KEY)
+        if release is not None and parked_cluster.is_zero_node(cluster):
+            parked_cluster.zero_node_finding(
+                release,
+                cluster,
+                message,
+                cluster[parked_cluster.PARKED_KEY],
+                check="control_api",
+                cluster_id=cluster_id,
+                details={"clusters": {cluster_id: {parked_cluster.PARKED_KEY: proof}}},
             )
-        )
+            return []
+        raise ReleaseError(parked_cluster.zero_nodes_failure(message, proof))
     expected_nodes = {str(item) for item in cluster.get("expected_node_ids") or []}
     agent_nodes = {str(item.get("node_id")) for item in agents}
     if agent_nodes != expected_nodes:
@@ -536,10 +546,10 @@ def judge_cluster_fleet(release: Any, cluster_id: str, cluster: dict[str, Any]) 
     that fails (a cluster-scoped verify files it as another cluster's finding,
     ``regional_verify_scope.judge_clusters``)."""
 
-    agents = check_agent_coverage(cluster_id, cluster)
+    agents = check_agent_coverage(cluster_id, cluster, release=release)
     if not agents:
-        # Parked (``check_agent_coverage``): no Agent runs a Runtime Profile and
-        # there is no node to ask fleet readiness about.
+        # No node (``check_agent_coverage``): no Agent runs a Runtime Profile
+        # and there is no node to ask fleet readiness about.
         return
     expected_profile = runtime_profile_version_for(release.config, cluster_id)
     if any(item.get("runtime_profile_version") != expected_profile for item in agents):

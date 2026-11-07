@@ -512,13 +512,13 @@ def _validate_agent_endpoint_cidrs(
     cluster_id: str,
     node_selector: str,
     configured_cidrs: tuple[str, ...],
-    parked: Callable[[], dict[str, Any]] | None = None,
+    zero_nodes: Callable[[], dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Every selected node's InternalIP lies in the Agent endpoint CIDRs.
 
-    A cluster whose selector selects no node fails, unless ``parked`` proves it
-    parked (``regional_parked_cluster``): then the proof is returned and there
-    is no node to cover; the failure says why the cluster is not parked.
+    A cluster whose selector selects no node has no node to cover: with
+    ``zero_nodes`` its proof (``regional_parked_cluster``, parked or not) is
+    returned for the caller to judge; without, it fails as it always did.
     """
 
     try:
@@ -543,14 +543,9 @@ def _validate_agent_endpoint_cidrs(
     )
     nodes = json.loads(raw).get("items") or []
     if not nodes:
-        proof = parked() if parked is not None else None
-        if proof is None or proof.get("parked") is not True:
-            raise ReleaseError(
-                parked_cluster.zero_nodes_failure(
-                    f"{cluster_id} has no Kubernetes nodes", proof
-                )
-            )
-        return proof
+        if zero_nodes is None:
+            raise ReleaseError(f"{cluster_id} has no Kubernetes nodes")
+        return zero_nodes()
     uncovered: list[str] = []
     for node in nodes:
         addresses = [
@@ -576,8 +571,9 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
     (the cluster ids and, per eks-managed cluster, its node groups' facts; per
     GPU cluster and for the CPU control-plane cluster, ``control_plane``, the
     ``automatic_node_updates`` advisory block; ``eks_support``, every site EKS
-    cluster's version and its support end date; per GPU cluster parked at zero
-    nodes, ``parked``, the proof read from the same provider documents)."""
+    cluster's version and its support end date; per GPU cluster without nodes,
+    ``parked``, the proof read from the same provider documents, and when it is
+    unavailable ``zero_node_findings``)."""
 
     config = release.config
     runner = release.runner
@@ -655,12 +651,29 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
             cluster_id=target.cluster_id,
             node_selector=node_selector(target),
             configured_cidrs=target.agent_endpoint_allowed_cidrs,
-            parked=lambda: parked_cluster.provider_proof(
+            zero_nodes=lambda: parked_cluster.provider_proof(
                 release, target, described=described, groups=groups
             ),
         )
         if proof is not None:
-            providers[target.cluster_id][parked_cluster.PARKED_KEY] = proof
+            entry = providers[target.cluster_id]
+            entry[parked_cluster.PARKED_KEY] = proof
+            if proof.get("parked") is not True:
+                # Unavailable: a finding that fails ``status`` only; every
+                # other gate of the cluster below still runs and gates.
+                parked_cluster.zero_node_finding(
+                    release,
+                    entry,
+                    f"{target.cluster_id} has no Kubernetes nodes",
+                    proof,
+                    check="regional_contexts",
+                    cluster_id=target.cluster_id,
+                    details={
+                        "providers": {
+                            target.cluster_id: {parked_cluster.PARKED_KEY: proof}
+                        }
+                    },
+                )
         release._validate_executor_iam_role(target)
         preflight_retired_collectors(release, target)
         # Advisory only (automatic_node_updates): recorded beside the facts it
