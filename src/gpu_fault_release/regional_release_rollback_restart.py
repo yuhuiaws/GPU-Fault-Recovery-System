@@ -376,9 +376,12 @@ class RollbackRestartPlan:
         """Patch every ``-config-core`` with the previous Agent identities.
 
         A tier whose ``-config-core`` the patch changes restarts: those values
-        are ``envFrom`` env, read once.
+        are ``envFrom`` env, read once. No identity to stage (no Agent ran on
+        any cluster) patches nothing.
         """
 
+        if not config:
+            return
         release = self.release
         names = {
             role: f"{deployment}-config-core"

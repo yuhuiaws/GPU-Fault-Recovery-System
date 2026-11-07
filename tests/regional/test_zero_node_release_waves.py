@@ -346,8 +346,90 @@ def test_the_rollback_of_a_parked_cluster_verifies_no_agent_and_its_pins_come_fr
     VALIDATION.validate_agent_rollback_target(site, previous, site.eks)
     pins = rollback_controller_config_for(site, previous, "hyperpod-v1")
 
+    assert pins is not None
     assert pins["GPU_FAULT_REQUIRED_AGENT_VERSION"] == "0.10.0"
     assert pins["GPU_FAULT_REQUIRED_POLICY_VERSION"] == "policy-v1"
+
+
+def _zero_node(state: str) -> dict[str, Any]:
+    """The explicit entry a snapshot records for a cluster without nodes."""
+
+    return PARKED.zero_node_identity(
+        {
+            "parked": state == "parked",
+            "provider": "hyperpod",
+            "reason": f"{state} for the test",
+            "groups": [],
+        }
+    )
+
+
+def test_with_no_node_on_any_cluster_the_rollback_stages_no_agent_pin(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Every cluster the release covers recorded an explicit zero-node entry,
+    parked or unavailable: no Agent ran to report an identity, so there is no
+    pin to stage -- the CPU restore puts the previous ``-config-core`` back --
+    and the rollback says so, naming the clusters and the source."""
+
+    site = RollbackSite()
+    previous = {
+        **_previous(site),
+        "agent_identities": {
+            HYPERPOD: _zero_node("unavailable"),
+            EKS: _zero_node("parked"),
+        },
+    }
+
+    assert rollback_controller_config_for(site, previous, "hyperpod-v1") == {}
+    line = next(
+        item
+        for item in capsys.readouterr().err.splitlines()
+        if item.startswith("rollback-agent-pins ")
+    )
+    for field in (
+        "source=previous-config-core",
+        "reason=no-cluster-had-a-node",
+        "clusters=" + ",".join(sorted([HYPERPOD, EKS])),
+    ):
+        assert field in line, line
+
+
+@pytest.mark.parametrize(
+    ("identities", "refusal"),
+    [
+        pytest.param({}, "snapshot is empty", id="no-entry"),
+        pytest.param(
+            {EKS: _zero_node("parked")},
+            "snapshot is empty",
+            id="a-cluster-without-an-entry",
+        ),
+        pytest.param(
+            {EKS: _zero_node("parked"), HYPERPOD: {}},
+            "agent_version differs across clusters",
+            id="an-empty-identity-beside-a-zero-node-entry",
+        ),
+        pytest.param(
+            {
+                EKS: _zero_node("parked"),
+                HYPERPOD: {"node_ids": [], PARKED.ZERO_NODES_IDENTITY_KEY: {}},
+            },
+            "snapshot is empty",
+            id="a-zero-node-entry-in-no-known-state",
+        ),
+    ],
+)
+def test_a_snapshot_short_of_an_entry_per_cluster_still_refuses_the_rollback_pins(
+    identities: dict[str, Any], refusal: str
+) -> None:
+    """Only an explicit zero-node entry for every cluster means no Agent ran;
+    anything less is a snapshot that cannot say which pins to restore."""
+
+    site = RollbackSite()
+    previous = {**_previous(site), "agent_identities": identities}
+
+    with pytest.raises(ReleaseError, match=refusal):
+        rollback_controller_config_for(site, previous, "hyperpod-v1")
 
 
 def test_the_zero_node_rollback_runs_the_parked_path_of_the_node_runtime() -> None:

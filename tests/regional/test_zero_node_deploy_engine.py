@@ -11,7 +11,8 @@ unavailable -- ``TargetCount`` 1, its node lost. The real code covers the
 previous-state capture's Agent set, the candidate preflight of both clusters
 in parallel, the CPU stage and its heartbeat barrier, both clusters' rollout
 (the zero-node path, the fleet waves), the finalize barrier, the commit and,
-when the post-rollout verification fails, the automatic rollback.
+when the post-rollout verification fails, the automatic rollback -- and its
+resume after an interruption.
 
 Only what leaves the process is scripted: every kubectl/aws read answers
 from ``EngineRunner``, the reconciler script and the in-Pod probes are
@@ -40,6 +41,7 @@ from gpu_fault_release import regional_release_rollback_target as ROLLBACK_TARGE
 from gpu_fault_release import regional_release_state as STATE
 from gpu_fault_release import regional_release_validation as VALIDATION
 from gpu_fault_release import rollout as ROLLOUT
+from gpu_fault_release.regional_admin_commands import run_resume
 from gpu_fault_release.regional_release_diff import ReleaseChangeKind, ReleaseDiff
 from gpu_fault_release.regional_release_probes import probe_label
 from gpu_fault_release.regional_release_rollback_context import (
@@ -63,6 +65,7 @@ EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-eks"
 GROUP = "gpu-p5en-group"
 NODE = "hyperpod-i-1"
 PREVIOUS_TEMPLATE = "previous-template"
+CONTROLLER_STAGE = "controller-stage"
 
 #: ``gpu-a``'s instance group as ``describe-cluster`` reports it
 #: (``TargetCount``, ``CurrentCount``): its node with an Agent, parked, or
@@ -106,7 +109,9 @@ def _clusters() -> list[dict[str, Any]]:
 class EngineRunner:
     """The engine's commands, answered like the site: ``gpu-a`` as
     ``hyperpod`` says (``HYPERPOD_GROUPS``), ``gpu-eks`` parked; every command
-    is recorded."""
+    is recorded. A context in ``interrupt`` fails its next rollback
+    Reconciler deploy once (``CONTROLLER_STAGE``: the rollback's controller
+    stage)."""
 
     dry_run = False
 
@@ -117,6 +122,7 @@ class EngineRunner:
         self.probes: list[str] = []
         self.barriers: list[dict[str, Any]] = []
         self.configmaps: dict[str, dict[str, str]] = {}
+        self.interrupt: set[str] = set()
         self.lock = threading.Lock()
 
     def answer_probe(self, name: str, input_text: str | None) -> str:
@@ -279,8 +285,18 @@ class EngineRunner:
     def _reconciler(self, environment: dict[str, str]) -> str:
         zero = environment.get(PARKED.ZERO_NODE_CLUSTER_ENV) == "true"
         preflight = environment.get("GPU_FAULT_RECONCILER_PREFLIGHT_ONLY") == "true"
+        context = environment.get("GPU_FAULT_KUBECTL_CONTEXT", "")
         with self.lock:
             self.scripts.append(environment)
+            interrupted = (
+                context in self.interrupt
+                and not preflight
+                and environment.get("GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP")
+                == PREVIOUS_TEMPLATE
+            )
+            self.interrupt.discard(context if interrupted else "")
+        if interrupted:
+            raise ROLLOUT.ReleaseError(f"{context}: the deploy host was interrupted")
         products = environment.get(FLEET.INSTALLER_PRODUCTS_FILE_ENV)
         if products:
             Path(products).write_text(
@@ -509,12 +525,18 @@ def _bind(
 
     # The rollback's CPU side: the controller stage keeps its one zero-node
     # question -- the Agent pins it restores, from the clusters with live
-    # Agents -- and records them; the CPU restores are recorded.
+    # Agents, or none when no cluster had one -- and records them; the CPU
+    # restores are recorded.
     def stage_controller(release_arg: Any, *, previous: Any, **kwargs: Any) -> dict:
         pins = rollback_controller_config_for(
             release_arg, previous, kwargs["runtime_profile_version"]
         )
         deploy.record("rollback-controller-pins", pins)
+        with runner.lock:
+            interrupted = CONTROLLER_STAGE in runner.interrupt
+            runner.interrupt.discard(CONTROLLER_STAGE)
+        if interrupted:
+            raise ROLLOUT.ReleaseError("the deploy host was interrupted")
         return {}
 
     monkeypatch.setattr(ORCHESTRATION, "_stage_rollback_controller", stage_controller)
@@ -727,14 +749,20 @@ def _assert_rolled_back_on_the_previous_template(
     ), "on the previous template the snapshot pinned"
 
 
-def _assert_rollback_pins(deploy: Deploy) -> None:
+def _assert_rollback_pins(deploy: Deploy, hyperpod: str) -> None:
     pins = [value for name, value in deploy.calls if name == "rollback-controller-pins"]
-    assert [item["GPU_FAULT_REQUIRED_AGENT_VERSION"] for item in pins] == ["0.10.0"], (
-        "the Agent pins come from the cluster with live Agents"
-    )
+    if hyperpod == "nodes":
+        assert [item["GPU_FAULT_REQUIRED_AGENT_VERSION"] for item in pins] == [
+            "0.10.0"
+        ], "the Agent pins come from the cluster with live Agents"
+    else:
+        assert pins == [{}], (
+            "no Agent ran: no pin to stage, the CPU restore puts the previous "
+            "-config-core back"
+        )
 
 
-@pytest.mark.parametrize("hyperpod", SITES[:1])
+@pytest.mark.parametrize("hyperpod", SITES)
 def test_a_failed_verification_rolls_the_deploy_back_over_clusters_without_nodes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hyperpod: str
 ) -> None:
@@ -757,6 +785,85 @@ def test_a_failed_verification_rolls_the_deploy_back_over_clusters_without_nodes
         _assert_rolled_back_on_the_previous_template(
             runner, context, forward_runs=len(ZERO_NODE_SCRIPTS)
         )
-    _assert_rollback_pins(deploy)
+    _assert_rollback_pins(deploy, hyperpod)
     _assert_zero_node_entries(release, deploy, hyperpod, phase="rollback")
     assert deploy.snapshot_steps() == {"_capture"}, deploy.snapshot_openers
+
+
+@pytest.mark.parametrize(
+    ("interrupted", "resumed_from", "rolled_on_resume", "staged_on_resume"),
+    [
+        pytest.param(
+            CONTROLLER_STAGE,
+            "rollback-controller-staging",
+            {"gpu-a-context", "gpu-eks-context"},
+            [{}],
+            id="in-the-controller-stage",
+        ),
+        pytest.param(
+            "gpu-a-context",
+            "rollback-data-restoring",
+            {"gpu-a-context"},
+            [],
+            id="in-gpu-a-s-data-restore",
+        ),
+    ],
+)
+def test_an_interrupted_rollback_with_every_cluster_parked_resumes_to_rolled_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    interrupted: str,
+    resumed_from: str,
+    rolled_on_resume: set[str],
+    staged_on_resume: list[dict[str, str]],
+) -> None:
+    """The automatic rollback stops in ``rollback-failed``; a new deploy-host
+    process resumes it from the persisted state alone where it stopped --
+    the controller stage judges the persisted zero-node entries again, a
+    cluster already rolled back is not rolled again -- and rolls back to the
+    previous release."""
+
+    release, runner = _engine(tmp_path, hyperpod="parked")
+    deploy = _bind(release, runner, monkeypatch)
+    _fail_verification(release, runner, deploy, monkeypatch)
+    runner.interrupt.add(interrupted)
+
+    with pytest.raises(ROLLOUT.ReleaseError, match="automatic rollback also failed"):
+        release.upgrade(diff=DIFF)
+    assert deploy.phases[-1] == "rollback-failed", deploy.phases
+    assert not runner.interrupt, "the interruption happened"
+    assert [
+        value for name, value in deploy.calls if name == "rollback-controller-pins"
+    ] == [{}], "the controller stage ran with no Agent pin to stage"
+
+    resumed = ROLLOUT.RegionalRelease(release.config, runner)  # type: ignore[arg-type]
+    again = _bind(resumed, runner, monkeypatch, store=deploy.store)
+    before = len(runner.scripts)
+
+    run_resume(resumed)
+
+    assert (again.phases[0], again.phases[-1]) == (resumed_from, "rolled-back"), (
+        again.phases
+    )
+    assert "rollback-verified" in again.phases
+    assert [
+        value for name, value in again.calls if name == "rollback-controller-pins"
+    ] == staged_on_resume
+    scripts = runner.scripts[before:]
+    assert {env["GPU_FAULT_KUBECTL_CONTEXT"] for env in scripts} == rolled_on_resume
+    for context in rolled_on_resume:
+        assert [
+            (
+                env.get("GPU_FAULT_RECONCILER_PREFLIGHT_ONLY", ""),
+                env[PARKED.ZERO_NODE_CLUSTER_ENV],
+                env["GPU_FAULT_INSTALLER_TEMPLATE_CONFIG_MAP"],
+            )
+            for env in scripts
+            if env["GPU_FAULT_KUBECTL_CONTEXT"] == context
+        ] == [("true", "true", PREVIOUS_TEMPLATE), ("", "true", PREVIOUS_TEMPLATE)]
+    entries = resumed.state["zero_node_clusters"]
+    assert {cluster: entries[cluster]["phase"] for cluster in entries} == {
+        EKS: "rollback",
+        HYPERPOD: "rollback",
+    }
+    assert again.snapshot_openers == [], "a rollback opens no report snapshot"

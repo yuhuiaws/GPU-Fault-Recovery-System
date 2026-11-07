@@ -29,6 +29,7 @@ from typing import Any
 import pytest
 
 from gpu_fault.container_env_snapshot import pod_container_env
+from gpu_fault_release import regional_parked_cluster as PARKED
 from gpu_fault_release import regional_release_diff as DIFF
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_progress as PROGRESS
@@ -706,6 +707,48 @@ def test_a_tier_the_controller_stage_restarted_is_rolled_once(
     assert _seconds(timing, "cpu_restore") == APPLY_SECONDS
     assert timing["t_safe_seconds"] == 2 * APPLY_SECONDS + ONE_ROLL
     assert timing["t_safe_seconds"] < 2 * ONE_ROLL, "less than the old two rolls"
+    _assert_no_pod_keeps_a_candidate_start_up_input(site)
+
+
+def test_an_agent_rollback_with_no_node_on_any_cluster_stages_no_agent_pin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The release started with no node on its one GPU cluster, so no Agent
+    reported an identity: the controller stage patches no ``-config-core``
+    and the CPU restore puts the previous one back, which leaves no Pod on a
+    candidate start-up input. The CPU restore restarts the tiers the
+    controller stage restarted onto the candidate's ``-config-core``: the
+    second roll is the price of having no Agent pin to stage first."""
+
+    site = Site()
+    _agent(site)
+    rollback = Rollback(monkeypatch, site, "agent")
+    rollback.previous["agent_identities"] = {
+        "gpu-a": PARKED.zero_node_identity(
+            {"parked": True, "provider": "hyperpod", "reason": "parked", "groups": []}
+        )
+    }
+    patched: list[dict[str, str]] = []
+    patch = RESTART.RollbackRestartPlan.patch_controller_config
+
+    def recorded(plan: RESTART.RollbackRestartPlan, config: dict[str, str]) -> None:
+        patched.append(dict(config))
+        patch(plan, config)
+
+    monkeypatch.setattr(
+        RESTART.RollbackRestartPlan, "patch_controller_config", recorded
+    )
+
+    timing = rollback.run()
+
+    assert patched == [{}], "no Agent pin is staged"
+    assert "config-core-changed" not in _cpu_restart(timing, "controller_stage")[
+        "restarted"
+    ].get("worker", [])
+    assert _cpu_restart(timing, "cpu_restore")["restarted"] == {
+        role: ["config-maps-changed"] for role in EVERY_TIER
+    }
+    assert rollback.rolled == [EVERY_TIER, EVERY_TIER]
     _assert_no_pod_keeps_a_candidate_start_up_input(site)
 
 

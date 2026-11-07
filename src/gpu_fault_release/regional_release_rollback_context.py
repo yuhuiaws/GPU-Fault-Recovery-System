@@ -135,13 +135,52 @@ def previous_cluster_runtime_profiles(
     return candidate
 
 
+def _started_without_any_node(release: Any, identities: dict[str, Any]) -> bool:
+    """Whether the snapshot records every cluster of the release, each with
+    the explicit entry of a cluster the release started without a node on
+    (parked or unavailable): then no Agent ran anywhere."""
+
+    clusters = {str(target.cluster_id) for target in release.config.clusters}
+    return (
+        bool(identities)
+        and clusters <= {str(cluster_id) for cluster_id in identities}
+        and all(
+            parked_cluster.is_zero_node_identity(identity)
+            and identity[parked_cluster.ZERO_NODES_IDENTITY_KEY].get("state")
+            in (parked_cluster.PARKED, parked_cluster.UNAVAILABLE)
+            for identity in identities.values()
+        )
+    )
+
+
 def rollback_controller_config_for(
     release: Any, previous: dict[str, Any], site_runtime_profile_version: str
 ) -> dict[str, str]:
-    # Only clusters that had live Agents carry the pins; a cluster the release
-    # started without a node on recorded none (``regional_parked_cluster``).
+    """The previous Agent identity pins the rolled-back controller is staged
+    with; none (``{}``) when the release started without a node on every
+    cluster.
+
+    Only clusters that had live Agents carry the pins; a cluster the release
+    started without a node on recorded none (``regional_parked_cluster``). When
+    every cluster recorded none, no Agent ran to report an identity: there is
+    no pin to stage (``RollbackRestartPlan.patch_controller_config`` patches
+    nothing), and the CPU restore puts the previous release's own
+    ``-config-core`` back (``cpu_role_config_maps``). Anything less refuses as
+    before (``rollback_controller_config``): a snapshot with no entry, or one
+    whose live Agent set is empty while a cluster has no zero-node entry.
+    """
+
+    identities = previous.get("agent_identities") or {}
+    if _started_without_any_node(release, identities):
+        narrate_step(
+            "rollback-agent-pins",
+            source="previous-config-core",
+            reason="no-cluster-had-a-node",
+            clusters=",".join(sorted(str(cluster_id) for cluster_id in identities)),
+        )
+        return {}
     return rollback_controller_config(
-        parked_cluster.live_identities(previous.get("agent_identities") or {}),
+        parked_cluster.live_identities(identities),
         site_runtime_profile_version=site_runtime_profile_version,
         cluster_runtime_profiles=previous_cluster_runtime_profiles(release, previous),
     )
