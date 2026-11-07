@@ -119,7 +119,7 @@ schema-typed `RegionalSite`:
 
 | Administrative action | Behaviour |
 |---|---|
-| `deploy` | Includes a read-only preflight (local inputs, tools, AWS, EKS/HyperPod/IAM, CPU capacity, Aurora, LBC, ACM, AMP/SNS, the archive bucket, workflow and token rotation safety and more); the first run takes bootstrap, an existing site takes upgrade; rerunning resumes; `--rollback` rolls back one step (taking no other option but `--allow-inflight-installs`); `--approve-profile-plan <sha> --reference <ref>` binds a change-ticket reference to the pending Profile plan; further options: `--config` (first deploy only), `--registration-cluster`, `--accept-schema-change[-without-snapshot]`, `--supersede-failed-transaction`, `--wait-for-email-confirmation` and `--grafana-workspace-id`/`--grafana-viewer` |
+| `deploy` | Includes a read-only preflight (local inputs, tools, AWS, EKS/HyperPod/IAM, CPU capacity, Aurora, LBC, ACM, AMP/SNS, the archive bucket, workflow and token rotation safety and more); the first run takes bootstrap, an existing site takes upgrade; rerunning resumes; `--rollback` rolls back one step (taking no other option but `--allow-inflight-installs`); `--approve-profile-plan <sha> --reference <ref>` binds a change-ticket reference to the pending Profile plan; further options: `--config` (first deploy only), `--registration-cluster`, `--accept-schema-change[-without-snapshot]`, `--supersede-failed-transaction`, `--wait-for-email-confirmation`, `--grafana-workspace-id`/`--grafana-viewer`, and, while the public transparency log is unavailable, `--allow-unlogged-signature --reason <why>` for that one deploy (see [Administrator Operations §4.11](administrator-operations.md#411-signing-a-release-while-the-public-sigstore-services-are-down)) |
 | `status` | Structured health report, non-zero exit code on anomalies; `--full` appends read-only verification of CPU/GPU, Profile, TLS, Agent/Collector, NLB, Aurora and alerts (the former standalone verify) |
 | `uninstall` | Uninstalls the solution according to the Aurora AWS registry (refused while the last registry sync is not recorded as a success, unless `--accept-unsynchronized-registry`); the GPU side is always kept, the CPU side is decided by parameters |
 
@@ -1283,6 +1283,18 @@ directory and deletes it after the build. Each image is first looked up in the r
 module digests of the components the image carries. Only when the platform and all labels match exactly is the existing OCI digest
 reused; otherwise it builds/pushes and reads back to verify. The BuildKit remote cache only uses a separate mutable cache repository to
 speed up layers; it is not a trusted artefact.
+
+Every `cosign sign-blob` goes through `scripts/cosign_sign_blob.py`: by default it signs with the site key and writes the public
+Sigstore transparency log. When the log, the TUF repository or the timestamp authority fails transiently (5xx, 429, a timeout, a
+connection error) it signs three times in all, 30 s and then 90 s apart; when the last attempt fails too it writes no bundle, leaves
+a refusal note beside the bundle path and exits 75, and the deploy reports that the release is not signed, nothing was rolled out
+and the live release is unchanged, naming the exit `--allow-unlogged-signature --reason "<why>"`. Only when cosign's live TUF fetch
+fails do signing and verification try once more with the site-pinned Sigstore trust root under `<state-dir>/release-signing/`.
+`make release-build UNLOGGED_SIGNATURE=1` (passed by a deploy that carries the switch; the reason reaches the attestation builder in
+the environment, never on make's command line) declares the unlogged signing in the attestation and signs with the key only. The
+rules, the records, the status finding and `backfill-transparency-log` are in [Administrator Operations
+§4.11](administrator-operations.md#411-signing-a-release-while-the-public-sigstore-services-are-down); the trust model and the
+residual risk in [Security and Parameters Reference §4](security-and-parameters-reference.md#4-release-and-runtime-profile).
 
 GitHub Release does not repeat the complete local gate above. The main CI `static`, `unit` (which aggregates the `coverage` and `postgres`
 matrix shards), `shuffle` (the full suite in shuffled order, 4 shards) and `artifact` jobs complete equivalent checks, and the aggregation

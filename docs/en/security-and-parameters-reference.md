@@ -325,6 +325,34 @@ cluster registry records must not be reused to bypass these gates.
   signed schema v4 release manifest; the Manifest must also cover the rendered resource digests, the renderer,
   `uv.lock`, the Node template, the image digest of every role and the node offline dependency inventory. Old schema v3
   shared-image releases continue to be read and rolled back, but no new independent image identity may be guessed for them.
+- Release signatures and the transparency log. The site key signs the release attestation (which binds the manifest, the
+  delivery, the CI gate or impact plan and the SBOM digests), the deploy-host archive, the CI candidate receipt and the
+  successful source deploy record. By default each signature is uploaded to the public Sigstore transparency log and every
+  verifier requires the entry, so a signature made with a stolen key must also be published to be accepted. Only the deploy
+  host verifies these signatures: nodes, the installer, the Reconciler and the control plane check the SHA-256 pins the
+  release engine hands them through the cluster API. Transient Sigstore failures are retried a bounded number of times, then
+  the deploy stops before anything rolls. `gpu-fault-admin deploy --allow-unlogged-signature --reason "..."` signs that one
+  deploy with the site key only: every signed payload declares `"signing": {"transparency_log": "unlogged", "reason": ...,
+  "declared_at": ...}` inside its signed bytes, and a verifier accepts a bundle without a log entry only with that declaration
+  and an approval a key holder alone cannot produce -- the switch on the running command, or, for the release the site
+  already runs, the cluster's release state (written by the release engine with the operator's cluster credentials) naming
+  that release and delivery digest as committed and live. A bundle without a log entry and without the declaration, a
+  tampered declaration (the signature breaks) and a keyless signature without its entry are refused; the signature is then
+  checked offline with the site public key. `status` reports the unlogged release, and 72 hours after `declared_at` fails the
+  `release_signature` check until `gpu-fault-admin backfill-transparency-log` uploads the same signature to the log.
+- The pinned Sigstore trust root. Every default cosign verification and signing first reads the Sigstore TUF repository.
+  After each online run the deploy host keeps, under `<state-dir>/release-signing/`, the trust root and signing
+  configuration that cosign's TUF client verified (SHA-256 checked against the cached TUF targets metadata, never a lower TUF
+  metadata version, the previous pin kept). It is used only when the live TUF fetch fails, for that command alone, and is
+  recorded in the release record; a pin whose files do not match their recorded SHA-256 is no pin. `status` warns when it is
+  older than 30 days; it never fails a check.
+- Residual risk of the unlogged mode and the pin, stated plainly: until the backfill an unlogged signature leaves no public
+  audit trail, so a forged release signed with a stolen key in that window would not be visible in the public log either --
+  it is accepted only by a command that carries the operator's switch, or as the release the operator's own credentials
+  already rolled; whoever holds the signing key **and** the operator's deploy-host or cluster credentials can do what the
+  switch does, as they could deploy without it; `declared_at` is the signer's own clock, not a trusted timestamp; the pin is
+  only as fresh as its last online run, so a key revocation or trust-root change published through TUF after it is not seen
+  until TUF answers again.
 - The runtime image must have its locked dependencies pre-installed by CI. Production Pods and the Schema Job must not run
   `pip install` at startup; the deploy host verifies the attestation signature and digest. In schema v4 the CPU and Executor each use an independent
   OCI image and `/opt/gpu-fault/control-plane`, `/opt/gpu-fault/executor`, containing only their own
@@ -738,6 +766,8 @@ If any of the following fails, active must not be entered:
 
 - the production attestation is neither bound to a signature-verified main CI gate nor comes from the trusted local full gates
   equivalent to `make check` plus the PostgreSQL stress;
+- the running release is signed without a transparency-log entry and was not backfilled within 72 hours (`status` fails
+  `release_signature`);
 - `make release-preflight` or the CAP-005 PostgreSQL 16 stress suite
   (8x40, JUnit zero skip) did not pass;
 - the Runtime Profile has warnings;

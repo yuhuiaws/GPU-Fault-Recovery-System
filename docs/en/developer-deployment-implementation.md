@@ -2100,8 +2100,20 @@ its result through; only for that 409 while signing with a key does it read the 
 `hashedrekord` 0.0.1 whose canonical body has the UUID as its RFC 6962 leaf hash, whose artifact digest is the file's SHA-256 and
 whose public key is the signing key's (`cosign public-key`); it then writes the Sigstore bundle v0.3 with sigstore-go's field
 mapping and atomically replaces the target only after `cosign verify-blob --key` accepted it. Any failed condition keeps
-cosign's failure. The rebuilt bundle lacks the RFC 3161 timestamp cosign obtained before the upload; key verification uses the
-entry's signed integratedTime. Keyless signing is not recovered.
+cosign's failure. The rebuilt bundle lacks the RFC 3161 timestamp cosign obtained before the upload; a key verification needs no
+trusted timestamp, and no verifier of the release tooling reads the entry's integratedTime. Keyless signing is not recovered.
+
+The wrapper also signs again after a transient Sigstore failure (5xx, 429, a timeout or a connection error of the transparency
+log, TUF or the timestamp authority), `SIGN_ATTEMPTS` (3) times in all with `SIGN_RETRY_SECONDS` (30 s, 90 s) between, then refuses
+with exit status 75, writes no bundle and notes the refusal beside the bundle path (`signing_transparency.refusal_marker`; make
+reports only the status, and the caller uses the note to say that nothing was changed); any other failure passes through as before.
+`--unlogged` implements `gpu-fault-admin deploy --allow-unlogged-signature --reason`: the payload must already declare
+`"signing": {"transparency_log": "unlogged", ...}` inside the signed bytes (a JSON payload's own field, the deploy-host archive's
+manifest) and a key must be given; cosign then signs with `--use-signing-config=false --tlog-upload=false` and contacts no Sigstore
+service. The shared rules (the declaration, reading a bundle, classifying transient failures, the pinned Sigstore trust root) live
+in `scripts/signing_transparency.py` (standard library only: the deploy-host setup imports it with the system Python before any
+venv exists); the admin CLI uses the same constants from `gpu_fault_release.regional_release_signing` (a `GPU_FAULT_*` literal
+under `src/gpu_fault` would enter `env-inventory.json`, which every component wheel ships), and a test pins the two equal.
 
 The image-set descriptor schema v3 must record the control-plane/executor wheel SHAs and module digests separately,
 plus the node offline dependency inventory SHA; each image records its full image input and its SHA.

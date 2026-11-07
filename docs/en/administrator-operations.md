@@ -20,6 +20,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Approve a pending Profile plan | The same `deploy --state-dir ... --approve-profile-plan <plan_sha256> --reference ...`; there is no separate approval verb | [Runtime Profile Change Approval](administrator-profile-change-approval.md) |
 | The registration cluster left the site and deploy refuses with `registration cluster ... is not among the managed GPU clusters` | Run the refusal's `deploy --state-dir ... --registration-cluster <remaining cluster of that provider> --reference ...` (moves the anchor, then continues the same deploy) | §5.0.4 |
 | Release across schema versions | `deploy --state-dir ... --accept-schema-change` (takes an Aurora snapshot first; `--accept-schema-change-without-snapshot` skips the snapshot) | §4.7 |
+| Deploy while the public Sigstore transparency log is down (the deploy stops with `the Sigstore services did not accept the signature ... after 3 attempts`) | `deploy --state-dir ... --allow-unlogged-signature --reason "<why>"` signs with the site key only; once the log answers, `gpu-fault-admin backfill-transparency-log --state-dir ...` logs the same signatures | [§4.11](#411-signing-a-release-while-the-public-sigstore-services-are-down) |
 | Join a GPU cluster | `deploy --state-dir ... --gpu-cluster-arn <all managed ARNs> --gpu-cluster-arn <new ARN>` (the given set must be the managed set or a superset of it; the extra ARNs are the joins; giving fewer is refused with `site manages GPU clusters the command omits ... use remove-cluster`; when there are code changes release first, then join), or the join-only `gpu-fault-admin join-cluster --state-dir ... --gpu-cluster-arn <new ARN>` (does not trigger a site release; already managed ARNs return `ALREADY_MANAGED`) | REG-8.1.5, §5 |
 | Remove a GPU cluster | `gpu-fault-admin remove-cluster --state-dir ... --gpu-cluster-arn <ARN> --confirm REMOVE_GPU_CLUSTER` | REG-8.1.6, REG-12, §5 |
 | Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`, for the CPU control-plane cluster's groups too, where one window takes the whole control plane down for minutes) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only (the CPU control-plane cluster's ARN selects every group of it; `--rolling --rollback-alarm <alarm>` keeps the schedule and makes it roll one instance at a time, rolled back on CloudWatch alarms -- printed as ordered steps, because the service deletes and re-creates a schedule rather than changing it) and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
@@ -1432,6 +1433,88 @@ Once fixed, rerun the same `deploy`/`config` command unchanged: the same uncommi
 and commits when they pass; a release that was rolled back opens a new transaction from the current live baseline (see "Rollback" in
 §4). Design and trade-offs:
 [Detailed Design v2 §2.12](detailed-design-v2.md#212-unobservable-is-not-unhealthy-credential-plugin-retries-imds-defaults-and-the-observation-budget).
+
+### 4.11 Signing a Release While the Public Sigstore Services Are Down
+
+Every signature the release tooling makes -- the release attestation, the deploy-host archive, the CI candidate receipt and the
+record of a successful source deploy -- is made with the site key and, by default, uploaded to the public Sigstore transparency log;
+every verifier requires that log entry. That default does not change.
+
+**When the log refuses.** A transient Sigstore failure (the transparency log answering 5xx or 429, a timeout, a refused or reset
+connection, the TUF repository or the timestamp authority not answering) is retried: three signings in all, 30 s and then 90 s
+apart. When the last one fails too, the deploy stops with `the Sigstore services did not accept the signature of ... after 3
+attempts`; for the release attestation it adds `The release is not signed, so nothing was rolled out and the live release is
+unchanged`. Any other signing failure (a wrong key password, a 4xx) stops as before, without retries. Rerun later, or:
+
+```bash
+gpu-fault-admin deploy --state-dir /secure/gpu-fault \
+  --allow-unlogged-signature --reason "transparency log answers 5xx; change CHG-1234"
+```
+
+**What the switch does.** It is for this one deploy: it is never a site default, the rerun line a stopped deploy prints repeats it,
+and an exported variable cannot turn it on (every hop of the deploy drops an inherited value and passes its own on the command
+line). `--reason` is required: one line of printable text, at most 300 characters. `--rollback` takes neither flag; a rollback
+signs and verifies nothing.
+
+- The release is signed with the site key only, without a transparency-log entry; cosign contacts no Sigstore service for it.
+- Every payload the deploy signs carries the declaration `"signing": {"transparency_log": "unlogged", "reason": ...,
+  "declared_at": ...}` inside the signed bytes (the deploy-host archive carries it in its manifest). Editing it breaks the
+  signature.
+- The deploy's own verifiers accept a bundle without a log entry only with that declaration **and** the switch on the running
+  command, and check the signature offline with the site public key. A bundle without a log entry and without the declaration is
+  refused with or without the switch; a keyless signature is never accepted without its log entry.
+
+**Where it shows.**
+
+- The deploy prints `release-deploy: release <id> is signed without a transparency-log entry (declared <time>: <reason>); run
+  gpu-fault-admin backfill-transparency-log ...` and `staging-deploy: this deploy signed WITHOUT a transparency-log entry ...`.
+- `<state-dir>/release-deploy/<release_id>/state.json` records `signing`: `transparency_log` (`logged` or `unlogged`), `reason`,
+  `declared_at`, `approval`, `attestation_sha256` and `trusted_root` (`tuf`, `pinned`, or `none` for a key-only check without a
+  log entry); a copy of the attestation and its bundle is kept beside it.
+  `source-deploy-success.json` records the deploy's `signing` and the release's `release_signing`.
+- `gpu-fault-admin status` adds `finding: release <id> is signed without a transparency-log entry ...` and the JSON field
+  `release_signing` with `status: ADVISORY`. 72 hours after `declared_at` it becomes the failing check `release_signature`
+  (`healthy: NO`, exit status 1) until the backfill. That check never stops a deploy: the deploy reads the engine's own verdict, so
+  the next deploy -- one way out of it -- is not blocked by it.
+
+**While the release runs.** `config`, a deploy-host-only deploy and the other commands that verify the release the site already
+runs accept its attestation without a log entry only when the cluster's own release record (the release state the release engine
+writes with your cluster credentials) names this release and its delivery digest as the committed live release; a holder of the
+signing key alone cannot write that record. Anything else needs the switch again: a deploy that would reuse the unlogged release
+artefacts of the same commit builds and signs them again, a cached unlogged deploy-host archive or CI receipt is rebuilt or ignored
+and signed normally, and the next deploy refuses the unlogged success record of this one until the backfill (or until it carries
+the switch itself).
+
+**Backfill once the log answers.**
+
+```bash
+/secure/gpu-fault/deployer-venv/bin/gpu-fault-admin backfill-transparency-log --state-dir /secure/gpu-fault
+```
+
+It uploads every signature the site key made without a log entry -- the same signature, nothing is signed again, only the public
+key is read -- and rewrites its bundle with the log entry once a verification that requires the entry accepts it. It prints a JSON
+summary (`backfilled`, `already_logged`, `skipped`, `failed`; exit status 1 when anything failed) and can be run any number of
+times. The status finding or failing check clears.
+
+**The pinned Sigstore trust root.** Every default cosign verification and signing first reads the Sigstore TUF repository. After
+each online run the deploy host copies the TUF-verified trust root and signing configuration out of cosign's own TUF cache into
+`<state-dir>/release-signing/` (`sigstore-trusted-root.json`, `sigstore-signing-config.json`, and `sigstore-trust-pin.json` with
+their SHA-256, the TUF timestamp and the TUF metadata versions). A file is taken only when its SHA-256 matches the cached TUF targets
+metadata; a lower TUF metadata version never replaces the pin (a `not re-pinned` line says why); the previous pin is kept as
+`*.prev`; a failed re-pin never fails the command that succeeded. Only when cosign's live TUF fetch fails is the same command run
+once more against the pin: a logged bundle carries its inclusion proof and signed entry timestamp, so it verifies offline, and a
+logged signing uses the pinned list of the same transparency log and timestamp authority. Any other failure (a signature, the log,
+the timestamp authority) never uses the pin. The command that used it prints the pin's age; the release record and
+`source-deploy-success.json` record `trusted_root: "pinned"`, the pin's SHA-256 values, its TUF timestamp and its age at use, and
+flag a pin older than 30 days. `status` shows the `sigstore_trust_pin` field and warns (`WARN sigstore trust pin`, never a
+failing check) once the pin is older than 30 days. Without a pin, or with a pin whose files no longer match their recorded
+SHA-256, a TUF outage fails exactly as before.
+
+**Residual risk** (details in [Security and Parameters Reference §4](security-and-parameters-reference.md#4-release-and-runtime-profile)):
+until the backfill an unlogged signature leaves no public audit trail; whoever holds the signing key **and** the operator's
+deploy-host or cluster credentials can do what the switch does, as they could deploy without it; `declared_at` is the signer's own
+clock; the pin is only as fresh as its last online run, so a key revocation published through TUF after the pin is not seen until
+TUF answers again.
 
 ## 5. Joining and Removing GPU Clusters
 

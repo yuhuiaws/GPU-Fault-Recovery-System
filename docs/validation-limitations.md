@@ -651,6 +651,37 @@ entry of the public log: the rebuilt bundle passed `cosign verify-blob --key` an
 live signing that hits the 409 cannot be provoked on demand; the first such event in a release build or deploy is its live
 evidence.
 
+## Release signing without a transparency-log entry, and the pinned Sigstore trust root
+
+`gpu-fault-admin deploy --allow-unlogged-signature --reason ...`, the bounded retry of transient Sigstore failures, the
+verifiers' acceptance rules, `backfill-transparency-log` and the site-pinned Sigstore trust root are covered hermetically by
+`tests/test_signing_transparency.py` and `tests/test_unlogged_release_signing.py`: fake `cosign` binaries and a fake
+transparency log on localhost exercise the retry and the refusal that names the switch, the unlogged signing command, the
+declaration rules (missing, malformed, tampered), each verifier's acceptance and refusal (the release attestation with the
+operator's switch or the cluster's record of the live release, the deploy-host archive, the CI candidate receipt, the
+successful source deploy record), the hops that carry the consent as arguments and drop an exported value, the records, the
+deploy summary lines, the status finding and its failing check after 72 hours (which the deploy reads as healthy), the backfill
+(a fresh upload, an entry that already exists, a signature the site key did not make), the pin refresh (SHA-256 against the TUF
+targets metadata, no lower TUF version, the previous pin kept) and the fallback, which only the three TUF-fetch forms trigger.
+None of these tests signs, uploads or reaches a network.
+
+The cosign behaviour the switch and the pin rely on was checked once offline with cosign v3.1.2, inside a network namespace
+without any interface, an empty home directory and throwaway keys: `cosign sign-blob --key --use-signing-config=false
+--tlog-upload=false` signs without any network request and writes a bundle without log entries; `cosign verify-blob --key
+--insecure-ignore-tlog=true` verifies that bundle without any network request and refuses a changed blob or another key;
+`--tlog-upload=false` alone is refused while `--use-signing-config` keeps its default; every default `cosign verify-blob` needs
+the live TUF repository (it failed offline even with a recently refreshed cache); `cosign verify-blob --trusted-root` with a copy
+of the TUF-verified trust root verified a real logged release bundle offline and refused it once the pinned root listed no
+transparency log; a logged `cosign sign-blob --signing-config --trusted-root` with the pinned copies made no TUF request (its first
+network request went to the timestamp authority).
+
+Not verified live: a deploy during a real transparency-log or TUF outage; a backfill against the public transparency log (the
+uploaded `hashedrekord` 0.0.1 entry and the bundle rebuilt from the answer use the mapping the 409 recovery already uses, tested
+against a fake log only); the pin's source, cosign v3's default TUF cache under the home directory (a cosign that keeps its
+cache elsewhere never refreshes the pin: a pin left from before is used with its age shown, and without one the command fails as
+before when TUF does not answer); a later cosign without the
+deprecated `--tlog-upload` flag (the switch then fails closed, the wrapper's command is pinned by a test).
+
 ## Optional HMA ingestion retirement
 
 The custom Kubernetes HMA watcher and CloudWatch/Lambda/SQS pipeline, their four
