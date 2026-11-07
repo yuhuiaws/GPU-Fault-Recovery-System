@@ -2434,6 +2434,24 @@ When every attempt was overtaken it reads `node annotation cleanup of <node> did
 | Aurora/site/release commit | Synchronises state incrementally, removes the local member and token, refreshes the failure-domain mapping | Serial commit, recording `SITE_COMMIT_STARTED` before writing the site |
 | Final re-verification | Proves the removal target is absent and the clusters to be kept are still healthy | Read-only checks may run in parallel; any failure writes no `COMPLETED` |
 
+**The node keys a removal deletes, and the keys of departed nodes.** Discovery binds the cluster's node-key ownership
+(`DISCOVERED.node_key_ownership`: both Secret UIDs and the digest of each selected node's key, never key material), and the
+CPU `gpu-fault-node-action-keys` entries deleted at `CONTROL_REGISTRY_REMOVED` are exactly the selected nodes'. The
+Executor's node-key sync never deletes a key, so a cluster that lost nodes since its last deploy (spot reclaim, scale-in,
+replacement) still holds their keys in its GPU Secret. Such a key is accepted only when its node is proven departed, on the
+evidence `workflow-reconcile` and the departed-node cleanup use: the node is absent from the cluster's unfiltered node list,
+and its provider no longer has it (HyperPod: the instance its name carries is not in `list-cluster-nodes`; eks-managed: EC2
+reports the instance id the fleet recorded for it `terminated` or not at all). Each such key is recorded in
+`node_key_ownership.departed_node_keys` (its digest, the digest of the CPU entry of the same name or `null`, the evidence and
+when it was read) and one line names them, for example `remove-cluster-departed-node-keys <time> cluster=<id> kept=2
+cpu_entries_kept=1 nodes=<node>,<node>`; their GPU keys go with the namespace, their CPU entries are kept, never deleted.
+Anything less refuses before any mutation with `the GPU node-key Secret holds keys of nodes not proven departed: <node>:
+<blocker>; ...`: a node still in Kubernetes under any label, a Kubernetes, HyperPod, EC2 or control-plane read that fails or
+answers ambiguously, a name without a HyperPod instance id, no EC2 instance id recorded for the node, an instance the
+provider still has. Fix the cause (or wait for the instance to terminate) and rerun. A resume re-checks the recorded digests
+and proves nothing anew: a departed key whose digest changed, or a new key, stops the removal (`node-key Secret incarnation
+or ownership changed`); one that has gone since is no change. A cluster without nodes binds no key and deletes none (§5.0.6).
+
 **What the departed-node cleanup shows during a removal: nothing new.** From the `DRAINING` step until the
 registration is purged the cleanup does not judge the cluster (§10.1.1): no `departed node` line in `status`, no
 `[GPU node departed: operator action needed]` notification and no refusal counted for its nodes, although every Agent
@@ -3976,7 +3994,8 @@ proven target set: the cluster's selector selects no node (the same proof as abo
 retired (`REVOKED`) or proven departed by its provider, and no node carries anything of ours. The cleanup journal records it
 (`zero_node_clusters.<cluster>`: state, reason, groups, the retired and the departed records), the run output prints
 `<cluster>: GPU cluster without nodes (<state>): no node selected; <reason>; no node cleanup target (...)` and the node
-cleanup reads `SKIPPED` with that reason; the node-key Secrets go with the namespaces as for any cluster. A record whose
+cleanup reads `SKIPPED` with that reason; the node-key Secrets go with the namespaces as for any cluster, and
+`remove-cluster` binds and deletes no CPU node-key entry (no node is selected; §5 "The node keys a removal deletes"). A record whose
 instance the provider still has (`an active fleet node is missing: ...`) or a node list that cannot be read still refuses
 (`node cleanup has no proven fleet targets`). `rotate-token` of such a cluster skips and records its node roll (§6.1) and
 completes; the next deploy is not blocked by it. The custody check of `preflight`, `deploy -f` and `join-cluster` skips a

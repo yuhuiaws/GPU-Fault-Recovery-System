@@ -44,7 +44,11 @@ is proven through the real join state machine with fake cluster and provider
 reads and the real rollback, while the release engine's own join is covered by
 its zero-node node-runtime path, never by a live join. `uninstall`,
 `remove-cluster` and `join-cluster` of a cluster without nodes stay unit- and
-engine-tested only.
+engine-tested only. So is `remove-cluster` of a cluster whose GPU node-key
+Secret still holds keys of departed nodes: the departure proof (the unfiltered
+node list, HyperPod `list-cluster-nodes`, EC2 and the fleet's recorded instance
+ids) runs against fake reads through the real removal state machine, never
+against a live cluster.
 
 ## Xid linkage and Drain P2P recovery
 

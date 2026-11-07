@@ -1218,6 +1218,7 @@ def _discover_removal(
         namespace_present=namespace_uid is not None,
         allow_missing=_done(state, "KUBERNETES_REMOVED"),
         removed=_done(state, "CONTROL_REGISTRY_REMOVED"),
+        target=target,
     )
     return snapshot, saved or evidence
 
