@@ -192,7 +192,11 @@ def test_resume_convergence_failure_discards_stale_observations_without_running_
     assert backend.snapshots == []
     saved = json.loads(recorder.path.read_text(encoding="utf-8"))
     assert saved["verdict"] == "FAIL"
-    assert saved["stages"] == {
-        "noop_passed": {"stage": "noop", "passed_at": "unit-before"}
+    # The stale observations went; the site shape the resume's guard checked
+    # before converging anything is the one new record.
+    assert set(saved["stages"]) == {"noop_passed", "site_shape"}, saved["stages"]
+    assert saved["stages"]["noop_passed"] == {
+        "stage": "noop",
+        "passed_at": "unit-before",
     }
     assert "convergence" not in saved, "failed convergence was recorded as completed"

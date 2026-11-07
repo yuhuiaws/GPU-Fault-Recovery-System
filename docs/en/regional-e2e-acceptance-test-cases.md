@@ -3271,7 +3271,7 @@ state is not a successful cleanup either.
   when the five `--*-config` arguments are omitted, `run_boot020_release_rolling.py` derives from `--admin-state-dir` the live source snapshot
   (the repository under `site.yaml spec.repositoryRoot` whose `dist/current-release.json` carries the `source-deploy-success.json` live release),
   the Region, the runtime image repository and the Profile version; it reuses `<admin-state-dir>/boot020-releases/` (or `--release-candidates-dir`)
-  when the configs exist and the NOOP one names that snapshot's manifest, otherwise it runs `build` -> `configs` -> `check` below with
+  when the configs exist, the NOOP one names that snapshot's manifest and the FULL one suffixes every cluster's own Profile, otherwise it runs `build` -> `configs` -> `check` below with
   `--replicas-delta` (default -1); `--plan` never builds and records `release_candidates.action=build-at-execute`.
   Passing the five paths explicitly is the manual route, prepared as follows:
   the current live is `NOOP` against `noop.json`; after applying it, `control-plane.json`
@@ -3285,7 +3285,10 @@ state is not a successful cleanup either.
   `configs` materialises the site configs and chains them -- noop points at the snapshot manifest, control-plane adjusts
   the admin-config `control_worker_replicas` by the capacity-validated `--replicas-delta` and recomputes the digest,
   data-plane/agent/full
-  switch in turn to the B/C/D manifests, and full additionally suffixes the Runtime Profile version; `check` uses
+  switch in turn to the B/C/D manifests, and full additionally suffixes the site Runtime Profile version and every
+  cluster's own Runtime Profile version, each with its Agent config digest recomputed (with only the site profile
+  changed, the Agents of a HyperPod cluster that runs its own profile stay unchanged in FULL; with the cluster that
+  follows the site profile parked at zero nodes, the FULL profile change would reach no Agent at all); `check` uses
   the rollout's own classifier to verify each config against live). rollout resolves wheel paths under
   `dist/<release_id>/` at the repository root where the deploy module lives, and the tool symlinks the candidate artifact directory there;
   do not hand-edit the manifests, they carry signature proofs; after the run use
@@ -3300,6 +3303,16 @@ state is not a successful cleanup either.
   may exceed the existing budget; pick a change the current site can absorb, for example a valid `6 -> 5`; the budget must not be raised nor
   public validation bypassed to make the fixture pass. The wheel/bundle diffs of B/C/D must be exactly
   executor, node_runtime+node_bundle, and the union of both respectively; the Control Plane wheel must not change.
+  A site with a GPU cluster parked at zero nodes (for example a plain EKS cluster whose node group has `desiredSize`
+  0) declares it with `--zero-node-cluster <cluster_id>` (repeatable). Before anything changes, and again on every
+  resume, the runner reads each cluster's nodes and provider proof (`regional_parked_cluster.without_nodes`, read
+  fresh: a proof an earlier release recorded never stands in for a provider read that failed) and continues only when
+  exactly those clusters have no node and are `parked` and at least one cluster has nodes; otherwise it refuses and
+  says why (an undeclared zero-node cluster, a declared one with nodes, `unavailable`, an unreadable proof, no cluster
+  with nodes, a declared id the site does not have). The shape is recorded as the stage `site_shape`; a later attempt
+  that finds another shape (a replaced node, a cluster scaled back up) is refused and needs a new `--run-dir`.
+  `--zero-node-cluster` is bound into the plan's argument digest and enters the evidence `inputs`
+  (`acceptance_contract` 6).
 - Fixed entry point: review the plan first, then execute explicitly:
 
   ```bash
@@ -3381,6 +3394,27 @@ state is not a successful cleanup either.
     rollout waits at most 5 minutes, while the Node Installer and node Agent keep using the longer window;
   - `FULL` converges in the order schema, CPU, GPU, Agent;
   - the automatic rollback restores the previous artifact, Pin and Profile; the resume does not repeat completed actions.
+  - Per-cluster verdicts (`boot020_site_topology`, before each stage's pass marker). A cluster with nodes must show the
+    full node behaviour: the rollback plan names the stage's components for it (Executor-only without `agent`,
+    Agent-only with `agent`, FULL with `agent` and `executor`); the Agent-only and FULL rollback Fleet waves cover each
+    of its nodes exactly once, every wave completed with safety start, safety end, Reconciler applied, Agents converged
+    and done in non-decreasing order; CPU-only and Executor-only leave its Agent identities unchanged, Agent-only and
+    FULL change the node runtime artifact and installer bundle, FULL also to that cluster's FULL Profile version and
+    Agent config digest; after `restore` the Agent identities and every GPU cluster capture are exactly those of
+    `noop_before`; it never gains a zero-node record. A cluster without nodes must show the parked path: the explicit
+    entry `{node_ids: [], zero_nodes: {state: parked, ...}}` in every full snapshot; the rollback components the
+    clusters with nodes got, and no wave; per deploy that does GPU work the engine's zero-node record
+    (`state.zero_node_clusters`: this transaction's release id, `upgrade` forward and `rollback` when compensating, the
+    skipped node work -- `node-preflight-batch` for a Reconciler-only roll, all five steps for a node runtime roll --
+    and a Reconciler identity equal to the capture after it); in Agent-only and FULL its Reconciler takes the new
+    bundle; a deploy without GPU work (NOOP, CPU-only, the Executor attempt interrupted at `cpu-staged`) records no node
+    work of its own (a new transaction starts from an empty state, a NOOP carries the record it found). Every deploy
+    result carries the records before and after it (`zero_node_clusters_before` / `zero_node_clusters`).
+  - The first FULL deploy registers its suffixed Runtime Profile versions for good (`POST /v1/runtime-profiles` is
+    create-only, a registered version is immutable, a later BOOT-020 with the same policy registers them again
+    idempotently): the stage `full_runtime_profile_versions` names every cluster's FULL and site profile and the new
+    versions; the completed evidence repeats them at its top level as `registered_runtime_profile_versions`, beside
+    `site_shape` and `zero_node_clusters`.
   - When the FULL candidate is applied again after the automatic rollback, the Node Installer Reconciler must not treat the same-named
     completed Job left by the first candidate as this round's success. If a node's current installer identity
     does not match the candidate, the old Job must be deleted, recreated, and the Agent heartbeat must truly converge;

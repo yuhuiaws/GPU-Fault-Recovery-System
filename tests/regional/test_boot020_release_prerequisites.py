@@ -131,6 +131,27 @@ def test_candidates_are_current_only_when_bound_to_the_live_snapshot(tmp_path):
     )
 
 
+def test_a_full_config_that_leaves_a_clusters_own_profile_is_rebuilt(tmp_path):
+    # Written before every cluster's own Runtime Profile was suffixed: its FULL
+    # stage would change no Agent of that cluster.
+    state = _state_dir(tmp_path)
+    live = prerequisites.live_snapshot_repository(state)
+    out = tmp_path / "boot020-releases"
+    _write_candidates(out, live)
+    full = out / prerequisites.CONFIG_FILES["full"]
+    document = json.loads(full.read_text())
+    document["clusters"] = [
+        {"cluster_id": "hp", "runtime_profile": {"version": "hyperpod-v1"}}
+    ]
+    full.write_text(json.dumps(document))
+    assert prerequisites.candidates_bound_to(out, live) is False, (
+        "a FULL config without the cluster's suffixed profile was reused"
+    )
+    document["clusters"][0]["runtime_profile"]["version"] = "hyperpod-v1-boot020"
+    full.write_text(json.dumps(document))
+    assert prerequisites.candidates_bound_to(out, live) is True
+
+
 def test_ensure_reuses_bound_candidates_without_building(tmp_path):
     state = _state_dir(tmp_path)
     live = prerequisites.live_snapshot_repository(state)

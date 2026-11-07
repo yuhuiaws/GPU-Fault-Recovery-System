@@ -127,7 +127,11 @@ evidence under a caller-supplied `--run-dir`, and remain `manual` in the case
 catalog because they attach/remove clusters or roll real releases.
 BOOT-020 consumes distinct CPU-only, Executor-only, Agent-only and FULL
 configs, and records component rollback scope plus `T_safe`, `T_full` and
-interrupted-resume RTO evidence.
+interrupted-resume RTO evidence. Every stage is judged per GPU cluster
+(`boot020_site_topology.py`): a cluster with nodes must show its Fleet waves
+and Agent identity changes, a cluster declared with `--zero-node-cluster`
+(parked at zero nodes for the whole run, recorded as the stage `site_shape`)
+the engine's explicit zero-node entries and records.
 
 Continuing an interrupted BOOT-020 run is a two-command sequence. The plan and
 the execute of one attempt must be the same command line, `--resume` and
@@ -147,7 +151,8 @@ run_boot020_release_rolling.py <the same arguments> \
 The evidence `inputs` are the run's identity and are equal on every attempt
 whether the candidates were built or reused: `admin_state_dir`,
 `admin_reference`, the five config paths with their `config_sha256`, the GPU
-kubeconfig path, and `release_candidates` as
+kubeconfig path, the clusters declared without nodes (`zero_node_clusters`,
+contract 6), and `release_candidates` as
 `boot020_release_prerequisites.candidate_identity` computes it (source
 explicit/derived, `candidates_dir`, snapshot repository, live and snapshot
 release ids, the release id each config's manifest names, the B/C/D release

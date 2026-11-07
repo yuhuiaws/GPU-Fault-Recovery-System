@@ -22,9 +22,18 @@ from scripts.e2e.regional.run_boot020_release_rolling import (
     resume_target,
     run_release_rolling,
 )
+from tests.regional._boot020_site_shape import (
+    agent_identity,
+    cluster_timing,
+    node_shape,
+    profile_versions,
+    waves,
+)
 
 PREVIOUS_EXECUTOR_PIN = "a" * 64
 CANDIDATE_EXECUTOR_PIN = "b" * 64
+# The fake's one GPU cluster has nodes; BOOT-020 judges it per cluster.
+NODES = ["cluster-a-node-1", "cluster-a-node-2"]
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -42,6 +51,7 @@ class FakeReleaseRollingBackend:
                     "bundle": "bundle-v1",
                 }
             },
+            "agent_identities": {"cluster-a": agent_identity(NODES)},
         }
         self.cpu_generations = {
             "gpu-fault-api-ha": 1,
@@ -157,7 +167,11 @@ class FakeReleaseRollingBackend:
         return {
             "safe": not self.unsafe_nodes,
             "clusters": {"cluster-a": list(self.unsafe_nodes)},
+            "shape": {"cluster-a": node_shape(NODES)},
         }
+
+    def profile_versions(self, scenario: str) -> dict:
+        return profile_versions(["cluster-a"])
 
     def resume_rollback(self, scenario: str) -> dict:
         self.calls.append(("resume_rollback", scenario))
@@ -266,14 +280,30 @@ class FakeReleaseRollingBackend:
                     "phase": "rolled-back",
                     "injected_failure": fault_phase,
                     "rollback_plan": plans[scenario],
-                    "rollback_timing": {"t_safe_seconds": 30.0, "t_full_seconds": 45.0},
+                    "rollback_timing": {
+                        "t_safe_seconds": 30.0,
+                        "t_full_seconds": 45.0,
+                        "clusters": {
+                            cluster_id: cluster_timing(
+                                components,
+                                waves(NODES) if scenario in {"agent", "full"} else None,
+                            )
+                            for cluster_id, components in plans[scenario][
+                                "clusters"
+                            ].items()
+                        },
+                    },
                     "pins": self._pins("rolled-back"),
+                    "zero_node_clusters": {},
+                    "zero_node_clusters_before": {},
                     "operation_duration_seconds": 45.0,
                 }
             return {
                 "phase": "failed",
                 "injected_failure": fault_phase,
                 "pins": self._pins("staged"),
+                "zero_node_clusters": {},
+                "zero_node_clusters_before": {},
                 "operation_duration_seconds": 1.0,
             }
         if scenario == "control_plane":
@@ -304,6 +334,7 @@ class FakeReleaseRollingBackend:
         elif scenario == "agent":
             self.live["clusters"]["cluster-a"]["reconciler_wheel"] = "node-v2"
             self.live["clusters"]["cluster-a"]["bundle"] = "bundle-v2"
+            self.live["agent_identities"]["cluster-a"] = agent_identity(NODES, "agent")
             self.gpu_generations["cluster-a"]["gpu-fault-completion-watcher"] = 2
         elif scenario == "full":
             self.live = {
@@ -316,6 +347,7 @@ class FakeReleaseRollingBackend:
                         "bundle": "bundle-v2",
                     }
                 },
+                "agent_identities": {"cluster-a": agent_identity(NODES, "full")},
             }
             self.cpu_generations = dict.fromkeys(self.cpu_generations, 3)
             self.gpu_generations = {
@@ -339,6 +371,8 @@ class FakeReleaseRollingBackend:
             ),
             "injected_failure": None,
             "pins": self._pins("finalized"),
+            "zero_node_clusters": {},
+            "zero_node_clusters_before": {},
             "operation_duration_seconds": 10.0 if resume else 20.0,
         }
 

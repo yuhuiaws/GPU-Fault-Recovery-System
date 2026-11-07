@@ -67,11 +67,13 @@ def _write_candidate_configs(
     *,
     diagnostic_s3_uri: str | None,
     runner: Callable[[], Any] | None = None,
+    clusters: list[dict[str, Any]] | None = None,
 ) -> tuple[CandidateBuild, Namespace, Path, dict[str, Any]]:
     """Build B/C/D, then run ``configs`` against a site with or without a
     declared ``spec.diagnosticS3Uri``; returns the build, the arguments, the
     repository the dist links went to and the base release config. ``runner``
-    replaces the CommandRunner ``configs`` computes the FULL digest with."""
+    replaces the CommandRunner ``configs`` computes the FULL digest with;
+    ``clusters`` are the site's cluster entries."""
 
     fixture = CandidateBuild(tmp_path, monkeypatch)
     candidates.build_candidates(fixture.arguments)
@@ -93,6 +95,8 @@ def _write_candidate_configs(
     if diagnostic_s3_uri is not None:
         # admin.site writes the key only when the site declares one.
         base["diagnostic_s3_uri"] = diagnostic_s3_uri
+    if clusters is not None:
+        base["clusters"] = clusters
     monkeypatch.setattr(
         site,
         "load_site",
@@ -158,6 +162,53 @@ def test_candidate_config_workflow_writes_private_chained_inputs_and_cleans_link
     assert candidates.clean_release_dist(arguments) == 0
     assert list((repository / "dist").iterdir()) == []
     assert candidates.clean_release_dist(arguments) == 0
+
+
+def test_full_candidate_suffixes_and_pins_every_clusters_own_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A HyperPod cluster with its own Runtime Profile runs neither the site
+    version nor its digest: FULL suffixes its version too and pins the digest
+    computed for it, or the FULL stage changes none of its Agents (live
+    2026-10-30) -- and none at all while the cluster following the site
+    profile is parked at zero nodes."""
+
+    asked: list[str] = []
+
+    def digest(_runner: Any, **kwargs: Any) -> str:
+        asked.append(kwargs["runtime_profile_version"])
+        return hashlib.sha256(kwargs["runtime_profile_version"].encode()).hexdigest()
+
+    monkeypatch.setattr(bootstrap_common, "compute_agent_config_digest", digest)
+    hp_profile = {
+        "source": "/profiles/hyperpod-v1.yaml",
+        "template_source": "/profiles/hyperpod-v1.yaml",
+        "version": "hyperpod-v1",
+        "agent_config_digest": "1" * 64,
+    }
+    _fixture, arguments, _repository, _base = _write_candidate_configs(
+        tmp_path,
+        monkeypatch,
+        diagnostic_s3_uri=None,
+        clusters=[
+            {"cluster_id": "hp", "runtime_profile": hp_profile},
+            {"cluster_id": "eks", "provider": "eks-managed"},
+        ],
+    )
+
+    documents = {
+        name: json.loads((arguments.out_dir / f"{name}.json").read_text())
+        for name in candidates.CONFIG_NAMES
+    }
+    full_hp = documents["full"]["clusters"][0]["runtime_profile"]
+    assert full_hp == {
+        **hp_profile,
+        "version": "hyperpod-v1-candidate",
+        "agent_config_digest": hashlib.sha256(b"hyperpod-v1-candidate").hexdigest(),
+    }, full_hp
+    assert documents["agent"]["clusters"][0]["runtime_profile"] == hp_profile
+    assert "runtime_profile" not in documents["full"]["clusters"][1]
+    assert asked == ["unit-profile-candidate", "hyperpod-v1-candidate"], asked
 
 
 def test_full_candidate_pins_the_digest_the_s3_configured_agents_report(

@@ -25,6 +25,7 @@ from gpu_fault.admin.config import AdminConfig  # noqa: E402
 from scripts.e2e.regional import boot020_interrupted_release as interrupted  # noqa: E402
 from scripts.e2e.regional import boot020_live_capture as captures  # noqa: E402
 from scripts.e2e.regional import boot020_restore_stage as restore_stage  # noqa: E402
+from scripts.e2e.regional import boot020_site_topology as topology  # noqa: E402
 from scripts.e2e.regional import boot020_release_prerequisites as prerequisites  # noqa: E402
 from scripts.e2e.regional.boot020_admin_config import (  # noqa: E402
     public_config_roundtrip,
@@ -120,6 +121,7 @@ class ReleaseRollingBackend(Protocol):
     def classify(self, scenario: str) -> dict[str, Any]: ...
     def resume_rollback(self, scenario: str) -> dict[str, Any]: ...
     def node_safety(self, scenario: str) -> dict[str, Any]: ...
+    def profile_versions(self, scenario: str) -> dict[str, Any]: ...
     def release_state(self) -> dict[str, Any]: ...
     def candidate_releases(self) -> dict[str, dict[str, str]]: ...
     def resume_upgrade(self, scenario: str) -> dict[str, Any]: ...
@@ -744,6 +746,8 @@ def _stage_full(
         lambda: backend.classify("full"),
     )
     _assert_kind("full", full_diff)
+    # The suffixed versions the first FULL deploy registers for good.
+    recorder.stage(topology.PROFILE_STAGE, lambda: backend.profile_versions("full"))
     full_before = chain.before(backend, recorder, "full", full_diff)
     full_failed = recorder.stage(
         "full_injected_failure_and_rollback",
@@ -814,6 +818,7 @@ def complete_evidence(recorder: EvidenceRecorder) -> dict[str, Any]:
             "release_id": release_id,
             "cluster_ids": sorted(clusters),
             "cluster_id": next(iter(clusters)) if len(clusters) == 1 else None,
+            **topology.evidence_summary(recorder.document["stages"]),
             "verdict": "PASS",
         }
     )
@@ -838,6 +843,7 @@ def assert_gpu_nodes_safe(
             "GPU node state blocks the data-plane stages; release or repair the "
             f"nodes before running BOOT-020: {json.dumps(safety.get('clusters'), sort_keys=True)}"
         )
+    topology.guard_site_shape(recorder, safety)
     return safety
 
 
@@ -894,6 +900,7 @@ def run_release_rolling(
             )
         for stage in STAGES[start:]:
             STAGE_RUNNERS[stage](backend, recorder, chain)
+            topology.check_stage(recorder, stage, require=_require)
             recorder.stage(
                 _passed_marker(stage),
                 lambda: {"stage": stage, "passed_at": utc_now()},
@@ -961,6 +968,10 @@ class LiveReleaseRollingBackend:
     release_state = interrupted.live_release_state
     candidate_releases = interrupted.live_candidate_releases
     resume_upgrade = interrupted.live_resume_upgrade
+    # The engine's node safety gate with the site shape, and the FULL
+    # candidate's Runtime Profile versions (boot020_site_topology).
+    node_safety = topology.live_node_safety
+    profile_versions = topology.live_profile_versions
 
     def __init__(self, configs: dict[str, Path]) -> None:
         self.configs = configs
@@ -991,46 +1002,6 @@ class LiveReleaseRollingBackend:
             **diff.as_dict(),
             "execution_plan": self.diff_module.build_execution_plan(diff).as_dict(),
             "cpu_roles": list(self.diff_module.control_plane_role_targets(diff)),
-        }
-
-    def node_safety(self, scenario: str) -> dict[str, Any]:
-        """Every GPU cluster's nodes through the engine's own safety gate.
-
-        ``validate_target_node_state`` is what the data-plane wave runs right
-        before mutating nodes (quarantine/health taints, cordons that are not a
-        parked warm spare, unready or deleting nodes, active installers); it
-        raises ``ReleaseError`` with the blockers, which are recorded here.
-        """
-        from gpu_fault_release import regional_release_node_preflight as preflight
-        from gpu_fault_release.regional_release_config import ReleaseError
-        from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
-
-        release = self._release(scenario)
-        clusters: dict[str, Any] = {}
-        for target in release.config.clusters:
-            names = tuple(
-                sorted(
-                    str((item.get("metadata") or {}).get("name") or "")
-                    for item in gpu_node_items(release, target, fresh=True)
-                )
-            )
-            try:
-                preflight.validate_target_node_state(release, target, names)
-            except ReleaseError as exc:
-                text = str(exc)
-                blockers: Any = text
-                if ": [" in text:
-                    try:
-                        blockers = json.loads(text[text.index(": [") + 2 :])
-                    except ValueError:
-                        blockers = text
-                clusters[target.cluster_id] = blockers
-            else:
-                clusters[target.cluster_id] = []
-        return {
-            "safe": not any(clusters.values()),
-            "clusters": clusters,
-            "checked_at": utc_now(),
         }
 
     def resume_rollback(self, scenario: str) -> dict[str, Any]:
@@ -1174,6 +1145,8 @@ class LiveReleaseRollingBackend:
         commit: bool = False,
     ) -> dict[str, Any]:
         release = self._release(scenario, auto_rollback=auto_rollback)
+        # The node work skipped on clusters without nodes, as this deploy finds it.
+        records = topology.zero_node_records(self._release(scenario)._load_state())
         active_diff = self._diff(diff)
         original_save = release._save_state
         injected = False
@@ -1205,6 +1178,8 @@ class LiveReleaseRollingBackend:
                 "rollback_plan": state.get("rollback_plan"),
                 "rollback_timing": state.get("rollback_timing"),
                 "pins": self._pin_window(release, state),
+                topology.RECORDS: topology.zero_node_records(state),
+                topology.RECORDS_BEFORE: records,
                 "operation_duration_seconds": time.monotonic() - started,
             }
         state = release._load_state()
@@ -1229,6 +1204,8 @@ class LiveReleaseRollingBackend:
             "rollback_plan": state.get("rollback_plan"),
             "rollback_timing": state.get("rollback_timing"),
             "pins": self._pin_window(release, state),
+            topology.RECORDS: topology.zero_node_records(state),
+            topology.RECORDS_BEFORE: records,
             "operation_duration_seconds": time.monotonic() - started,
         }
 
@@ -1256,6 +1233,16 @@ def parser() -> argparse.ArgumentParser:
         help="control_worker_replicas change of the CONTROL_PLANE_ONLY candidate",
     )
     value.add_argument("--gpu-kubeconfig", type=Path)
+    value.add_argument(
+        "--zero-node-cluster",
+        action="append",
+        default=[],
+        metavar="CLUSTER_ID",
+        help=(
+            "a GPU cluster parked at zero nodes for the whole run (repeatable); the "
+            "run refuses unless exactly these clusters have no node and are parked"
+        ),
+    )
     value.add_argument("--predecessor-evidence", default="")
     value.add_argument("--admin-state-dir", required=True, type=Path)
     value.add_argument("--admin-reference", required=True)
@@ -1359,9 +1346,13 @@ def main() -> int:
         "predecessor": predecessor,
         "start_stage": "auto (--resume)" if arguments.resume else arguments.start_stage,
         "resume": arguments.resume,
+        "zero_node_clusters": sorted(set(arguments.zero_node_cluster)),
         "admin_state_dir": str(state_dir),
         "admin_reference": arguments.admin_reference,
         "stages": [
+            "refuse unless exactly the --zero-node-cluster clusters have no node and "
+            "are parked; judge every stage per cluster (waves and Agent identities "
+            "where there are nodes, the engine's zero-node records where there are none)",
             "apply, repeat and restore AdminConfig through the public locked CLI",
             "verify NOOP makes no live artifact change",
             "assert CPU-only rollback T_safe and T_full",
@@ -1433,6 +1424,12 @@ def main() -> int:
             "classification_stage": "restore_next_classification",
         },
     )
+    try:
+        # Site shape and node safety, before the public roundtrip changes anything.
+        assert_gpu_nodes_safe(backend, recorder)
+    except BaseException as exc:
+        recorder.fail(exc)
+        raise
     recorder.stage(
         "public_admin_config_roundtrip",
         lambda: public_config_roundtrip(

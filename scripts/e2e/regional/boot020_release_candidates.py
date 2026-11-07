@@ -18,7 +18,9 @@ on 2026-09-07 was actually done against the production site:
     at the deployed snapshot's manifest; ``control-plane`` raises
     ``capacity.control_worker_replicas`` by one with the admin-config digests
     recomputed; ``data-plane`` swaps in candidate B; ``agent`` candidate C;
-    ``full`` candidate D plus a Runtime Profile version suffix. The rollout
+    ``full`` candidate D plus a Runtime Profile version suffix -- on the site
+    profile and on every cluster's own one, each with its Agent config digest
+    recomputed, so the change reaches the Agents of every cluster. The rollout
     resolves manifest wheel paths (``dist/<release_id>/...``) relative to the
     repository root of the deploy module, so each candidate's ``dist``
     directory is linked there as well.
@@ -69,6 +71,8 @@ DRIVER_KEYS = {
 }
 DEFAULT_EXECUTOR_MODULE = "src/gpu_fault/cluster_executor/metrics.py"
 DEFAULT_NODE_MODULE = "src/gpu_fault/node_agent/common.py"
+#: What the FULL candidate appends to every Runtime Profile version it changes.
+PROFILE_SUFFIX = "-boot020"
 
 
 def validate_candidate_modules(
@@ -388,14 +392,39 @@ def with_manifest(config: dict[str, Any], manifest: str) -> dict[str, Any]:
     return value
 
 
+def cluster_profile_versions(config: dict[str, Any]) -> dict[str, str]:
+    """Cluster id -> version of every cluster that declares its own Runtime
+    Profile (``clusters[].runtime_profile``); the others follow the site's."""
+
+    return {
+        str(cluster.get("cluster_id")): str(cluster["runtime_profile"]["version"])
+        for cluster in config.get("clusters") or ()
+        if isinstance(cluster, dict)
+        and isinstance(cluster.get("runtime_profile"), dict)
+        and cluster["runtime_profile"].get("version")
+    }
+
+
+def unsuffixed_cluster_profiles(full: dict[str, Any], suffix: str) -> list[str]:
+    """The clusters whose own Runtime Profile ``full`` leaves unchanged: a FULL
+    config written before every cluster's profile was suffixed."""
+
+    return sorted(
+        cluster_id
+        for cluster_id, version in cluster_profile_versions(full).items()
+        if not version.endswith(suffix)
+    )
+
+
 def chain_configs(
     base: dict[str, Any],
     *,
     live_manifest: str,
     candidate_manifests: dict[str, str],
     replicas_delta: int = 1,
-    profile_suffix: str = "-boot020",
+    profile_suffix: str = PROFILE_SUFFIX,
     full_agent_config_digest: str | None = None,
+    full_cluster_agent_config_digests: dict[str, str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """The five configs, each one step past the previous.
 
@@ -411,6 +440,14 @@ def chain_configs(
     every node's Agent environment) enter the digest too (live 2026-10-29: the
     pin computed without the destination never matched the EKS Agent's report,
     and the FULL wave ended in partial-convergence). Tests may pass any string.
+
+    A cluster with its own Runtime Profile (``clusters[].runtime_profile``)
+    runs neither the site version nor its digest, so FULL suffixes its version
+    too and pins ``full_cluster_agent_config_digests[<suffixed version>]``:
+    with only the site profile changed, FULL changed no Agent of such a cluster
+    (live 2026-10-30: the HyperPod Agents kept their profile and digest), and
+    with the cluster that follows the site profile parked at zero nodes it
+    would reach no Agent at all. A mapping that lacks a version refuses.
     """
 
     noop = with_manifest(base, live_manifest)
@@ -423,6 +460,20 @@ def chain_configs(
     )
     if full_agent_config_digest:
         full["release"]["agent_config_digest"] = full_agent_config_digest
+    for cluster in full.get("clusters") or ():
+        profile = cluster.get("runtime_profile") if isinstance(cluster, dict) else None
+        if not isinstance(profile, dict) or not profile.get("version"):
+            continue
+        profile["version"] = str(profile["version"]) + profile_suffix
+        if full_cluster_agent_config_digests is None:
+            continue
+        digest = full_cluster_agent_config_digests.get(profile["version"])
+        if not digest:
+            raise ValueError(
+                f"no Agent config digest for {cluster.get('cluster_id')}'s Runtime "
+                f"Profile {profile['version']}"
+            )
+        profile["agent_config_digest"] = digest
     return {
         "noop": noop,
         "control-plane": control,
@@ -509,20 +560,33 @@ def write_configs(arguments: argparse.Namespace) -> None:
     from gpu_fault.admin.site_s3 import node_agent_environment
 
     full_version = str(base["runtime_profile"]["version"]) + arguments.profile_suffix
-    # As scripts/release_deploy.py pins it: with what the nodes run with.
-    full_agent_config_digest = compute_agent_config_digest(
-        CommandRunner(),
-        repository_root=Path(candidates["D"]["manifest"]).parent.parent,
-        runtime_profile_version=full_version,
-        node_agent_environment=node_agent_environment(base.get("diagnostic_s3_uri")),
-    )
+    digests: dict[str, str] = {}
+
+    def pin(version: str) -> str:
+        # As scripts/release_deploy.py (and, per cluster, the join profile)
+        # pins it: with what the nodes run with.
+        if version not in digests:
+            digests[version] = compute_agent_config_digest(
+                CommandRunner(),
+                repository_root=Path(candidates["D"]["manifest"]).parent.parent,
+                runtime_profile_version=version,
+                node_agent_environment=node_agent_environment(
+                    base.get("diagnostic_s3_uri")
+                ),
+            )
+        return digests[version]
+
     configs = chain_configs(
         base,
         live_manifest=str(live_manifest),
         candidate_manifests={name: candidates[name]["manifest"] for name in CANDIDATES},
         replicas_delta=arguments.replicas_delta,
         profile_suffix=arguments.profile_suffix,
-        full_agent_config_digest=full_agent_config_digest,
+        full_agent_config_digest=pin(full_version),
+        full_cluster_agent_config_digests={
+            version + arguments.profile_suffix: pin(version + arguments.profile_suffix)
+            for version in sorted(set(cluster_profile_versions(base).values()))
+        },
     )
     out = arguments.out_dir.resolve()
     out.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -585,7 +649,7 @@ def parser() -> argparse.ArgumentParser:
     configs.add_argument("--work-dir", type=Path, required=True)
     configs.add_argument("--out-dir", type=Path, required=True)
     configs.add_argument("--replicas-delta", type=int, default=1)
-    configs.add_argument("--profile-suffix", default="-boot020")
+    configs.add_argument("--profile-suffix", default=PROFILE_SUFFIX)
 
     check = commands.add_parser("check", help="classify every config against live")
     check.add_argument("--out-dir", type=Path, required=True)

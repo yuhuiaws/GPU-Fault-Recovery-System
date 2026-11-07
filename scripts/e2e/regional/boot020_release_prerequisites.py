@@ -202,7 +202,10 @@ def candidates_bound_to(
     The five configs must exist and the NOOP one must name this snapshot's
     manifest. With ``site`` (``site_inputs``) given, the metadata written at
     build time must also record exactly those digests: a directory without the
-    record (built before it existed) or with other digests is rebuilt.
+    record (built before it existed) or with other digests is rebuilt. So is a
+    FULL config that leaves a cluster's own Runtime Profile unchanged: it was
+    written before ``configs`` suffixed every cluster's profile, and its FULL
+    stage would change no Agent of that cluster.
     """
 
     paths = candidate_paths(out_dir)
@@ -210,11 +213,16 @@ def candidates_bound_to(
         return False
     try:
         noop = json.loads(paths["noop"].read_text(encoding="utf-8"))
+        full = json.loads(paths["full"].read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
     manifest = str((noop.get("release") or {}).get("manifest") or "")
     expected = str((snapshot_repo / "dist" / "current-release.json").resolve())
     if not manifest or str(Path(manifest).resolve()) != expected:
+        return False
+    if not isinstance(full, dict) or candidates.unsuffixed_cluster_profiles(
+        full, candidates.PROFILE_SUFFIX
+    ):
         return False
     return site is None or recorded_site_inputs(out_dir) == site
 
@@ -274,7 +282,7 @@ def ensure_release_candidates(
             work_dir=work,
             out_dir=out_dir,
             replicas_delta=replicas_delta,
-            profile_suffix="-boot020",
+            profile_suffix=candidates.PROFILE_SUFFIX,
         )
     )
     # The metadata carries the site inputs this build read; written before the

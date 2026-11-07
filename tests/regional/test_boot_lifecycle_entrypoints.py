@@ -53,6 +53,9 @@ def entrypoint(
         monkeypatch.setattr(
             runner, "public_config_roundtrip", lambda *_a, **_k: {"restored": True}
         )
+        # The node safety and site-shape guard the entrypoint runs before the
+        # roundtrip reads the live site; the stage runner is stubbed below.
+        monkeypatch.setattr(runner, "assert_gpu_nodes_safe", lambda *_a: None)
         # The fresh-run precondition's live read: the site's own release.
         monkeypatch.setattr(
             interrupted,

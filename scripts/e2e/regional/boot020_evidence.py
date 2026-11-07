@@ -24,8 +24,10 @@ from scripts.e2e.regional.boot020_deployment_reads import AcceptanceCheckError
 from scripts.e2e.regional.live_driver_guard import authorize_execution
 
 # Bumped whenever the shape of the evidence ``inputs`` changes: an older
-# document then fails the resume on this key first, which says why.
-ACCEPTANCE_CONTRACT = 5
+# document then fails the resume on this key first, which says why. 6: the
+# inputs name the GPU clusters declared without nodes (--zero-node-cluster),
+# and every stage is judged per cluster (boot020_site_topology).
+ACCEPTANCE_CONTRACT = 6
 # The only supported way to continue a run whose candidates already exist.
 # Both commands must carry the same ``--attempt`` and ``--resume`` (the plan
 # binds every non-approval argument into ``arguments_sha256``), and must name
@@ -69,6 +71,11 @@ def evidence_inputs(
             state_dir, configs, candidates
         ),
         "gpu_kubeconfig": str(gpu_kubeconfig),
+        # The site shape the run is approved for: the clusters parked at zero
+        # nodes for its whole length (boot020_site_topology.guard_site_shape).
+        "zero_node_clusters": sorted(
+            {str(value) for value in getattr(arguments, "zero_node_cluster", ()) or ()}
+        ),
     }
 
 

@@ -19,10 +19,18 @@ import pytest
 from gpu_fault_release.regional_release_rollback_restart import ROLE_DEPLOYMENTS
 from scripts.e2e.regional import run_boot020_release_rolling as boot020
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
+from tests.regional._boot020_site_shape import (
+    agent_identity,
+    cluster_timing,
+    node_shape,
+    profile_versions,
+    waves,
+)
 
 EXECUTOR = boot020.EXECUTOR_DEPLOYMENT
 PREVIOUS = "a" * 64
 CANDIDATE = "b" * 64
+NODES = ["cluster-a-node-1", "cluster-a-node-2", "cluster-a-node-3"]
 
 
 class FakeBackend:
@@ -40,6 +48,7 @@ class FakeBackend:
                     "bundle": "bundle-v1",
                 }
             },
+            "agent_identities": {"cluster-a": agent_identity(NODES)},
         }
         self.cpu_generations = {
             "gpu-fault-api-ha": 1,
@@ -140,7 +149,14 @@ class FakeBackend:
         }
 
     def node_safety(self, scenario: str) -> dict[str, Any]:
-        return {"safe": True, "clusters": {"cluster-a": []}}
+        return {
+            "safe": True,
+            "clusters": {"cluster-a": []},
+            "shape": {"cluster-a": node_shape(NODES)},
+        }
+
+    def profile_versions(self, scenario: str) -> dict[str, Any]:
+        return profile_versions(["cluster-a"])
 
     def resume_rollback(self, scenario: str) -> dict[str, Any]:
         return {"resumed": False, "phase": "complete"}
@@ -195,8 +211,20 @@ class FakeBackend:
                 "needs_controller": True,
             },
         }
+        plan = self.plan_overrides.get(scenario, plans.get(scenario, {}))
+        records = {"zero_node_clusters": {}, "zero_node_clusters_before": {}}
         if fault_phase and auto_rollback:
-            timing: dict[str, Any] = {"t_safe_seconds": 30.0, "t_full_seconds": 45.0}
+            timing: dict[str, Any] = {
+                "t_safe_seconds": 30.0,
+                "t_full_seconds": 45.0,
+                "clusters": {
+                    cluster_id: cluster_timing(
+                        components,
+                        waves(NODES) if scenario in {"agent", "full"} else None,
+                    )
+                    for cluster_id, components in (plan.get("clusters") or {}).items()
+                },
+            }
             if scenario == "control_plane":
                 for role in self.rollback_restarts:
                     name = ROLE_DEPLOYMENTS[role]
@@ -211,8 +239,9 @@ class FakeBackend:
                 {
                     "phase": "rolled-back",
                     "injected_failure": fault_phase,
-                    "rollback_plan": self.plan_overrides.get(scenario, plans[scenario]),
+                    "rollback_plan": plan,
                     "rollback_timing": timing,
+                    **records,
                     "operation_duration_seconds": 45.0,
                 },
                 "rolled-back",
@@ -222,6 +251,7 @@ class FakeBackend:
                 {
                     "phase": "failed",
                     "injected_failure": fault_phase,
+                    **records,
                     "operation_duration_seconds": 1.0,
                 },
                 "staged",
@@ -258,10 +288,12 @@ class FakeBackend:
                 }
         elif scenario == "agent":
             self.live["clusters"]["cluster-a"]["reconciler_wheel"] = "node-v2"
+            self.live["agent_identities"]["cluster-a"] = agent_identity(NODES, "agent")
             self.gpu_generations["cluster-a"]["gpu-fault-completion-watcher"] = 3
         elif scenario == "full":
             self.live["cpu_wheel"] = "cpu-v3"
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v3"
+            self.live["agent_identities"]["cluster-a"] = agent_identity(NODES, "full")
         elif scenario == "noop" and "full" in self.completed:
             # The restore: the site is back on its own release.
             self.restored = True
@@ -274,6 +306,7 @@ class FakeBackend:
                 or scenario != "noop"
                 or not self.restored,
                 "injected_failure": None,
+                **records,
                 "operation_duration_seconds": 10.0,
             },
             "finalized",

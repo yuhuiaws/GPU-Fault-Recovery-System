@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from gpu_fault.admin.config import AdminConfig
 from scripts.e2e.regional.boot020_release_candidates import (
+    PROFILE_SUFFIX,
     candidate_edits,
     chain_configs,
     edits_digest,
@@ -14,6 +17,7 @@ from scripts.e2e.regional.boot020_release_candidates import (
     parser,
     reusable_candidate,
     unlink_release_dist,
+    unsuffixed_cluster_profiles,
 )
 
 
@@ -73,6 +77,47 @@ def test_chain_changes_one_dimension_per_step() -> None:
     # The Agent digest follows the profile version; earlier configs keep the live one.
     assert chain["full"]["release"]["agent_config_digest"] == "f" * 64
     assert "agent_config_digest" not in chain["agent"]["release"]
+
+
+def test_full_suffixes_every_clusters_own_profile_with_its_pin() -> None:
+    manifests = {name: f"/wt-{name}/dist/m.json" for name in ("B", "C", "D")}
+    base = _base()
+    base["clusters"] = [
+        {
+            "cluster_id": "hp",
+            "runtime_profile": {
+                "version": "hyperpod-v1",
+                "agent_config_digest": "1" * 64,
+            },
+        },
+        {"cluster_id": "eks", "provider": "eks-managed"},
+    ]
+
+    chain = chain_configs(
+        base,
+        live_manifest="/live/m.json",
+        candidate_manifests=manifests,
+        replicas_delta=-1,
+        full_agent_config_digest="f" * 64,
+        full_cluster_agent_config_digests={"hyperpod-v1-boot020": "2" * 64},
+    )
+
+    assert chain["full"]["clusters"][0]["runtime_profile"] == {
+        "version": "hyperpod-v1-boot020",
+        "agent_config_digest": "2" * 64,
+    }
+    assert "runtime_profile" not in chain["full"]["clusters"][1], "eks follows the site"
+    assert chain["agent"]["clusters"] == base["clusters"], "only FULL changes it"
+    assert unsuffixed_cluster_profiles(chain["full"], PROFILE_SUFFIX) == []
+    assert unsuffixed_cluster_profiles(chain["agent"], PROFILE_SUFFIX) == ["hp"]
+    with pytest.raises(ValueError, match="no Agent config digest for hp"):
+        chain_configs(
+            base,
+            live_manifest="/live/m.json",
+            candidate_manifests=manifests,
+            full_agent_config_digest="f" * 64,
+            full_cluster_agent_config_digests={},
+        )
 
 
 def test_candidate_edits_touch_only_the_intended_modules() -> None:
