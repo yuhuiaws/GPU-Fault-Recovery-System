@@ -39,6 +39,12 @@ its real node roll with fake reads. The custody check of `preflight`,
 `deploy -f` and `join-cluster` skips a custody-registered cluster without
 nodes; that is proven offline only (custody is not configured on the live
 site), and custody itself still needs a node to authorize keys for.
+`join-cluster` joins a cluster without nodes with its node work recorded; that
+is proven through the real join state machine with fake cluster and provider
+reads and the real rollback, while the release engine's own join is covered by
+its zero-node node-runtime path, never by a live join. `uninstall`,
+`remove-cluster` and `join-cluster` of a cluster without nodes stay unit- and
+engine-tested only.
 
 ## Xid linkage and Drain P2P recovery
 

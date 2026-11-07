@@ -3980,7 +3980,16 @@ cleanup reads `SKIPPED` with that reason; the node-key Secrets go with the names
 instance the provider still has (`an active fleet node is missing: ...`) or a node list that cannot be read still refuses
 (`node cleanup has no proven fleet targets`). `rotate-token` of such a cluster skips and records its node roll (§6.1) and
 completes; the next deploy is not blocked by it. The custody check of `preflight`, `deploy -f` and `join-cluster` skips a
-custody-registered cluster without nodes (§6.2). **Alerts:** nothing pages for a fleet without nodes whose product Deployments
+custody-registered cluster without nodes (§6.2). `join-cluster` of a cluster without nodes joins it with its node work
+skipped and recorded: the node inventory is the same proof (`zero_nodes` in `LOCAL_INPUTS_READY` and
+`NODE_NAMES_VERIFIED`, a `zero-node-gpu-cluster ... step=join` line), no node key is provisioned and the GPU
+`gpu-fault-node-action-keys` Secret the Executor mounts is created empty (an existing one is kept; the CPU Secret is not
+touched; the Executor's node-key sync fills it as nodes arrive), the release's join skips the node work as a deploy does,
+and the collector-readiness step waits for nothing while the cluster still has no node (`zero_node_not_awaited`). Two
+refusals stay, before anything is created on the cluster: a cluster whose groups declare no GPU instance type the installer
+knows, and a cluster registered for node-key custody. A node that joins while the join runs is not deferred (only an upgrade
+defers newcomers): the join's node roll installs it in a wave and the Executor's node-key sync keys it within a minute; one
+that joins afterwards is installed by the steady-state Reconciler. **Alerts:** nothing pages for a fleet without nodes whose product Deployments
 still run on its other nodes -- the collector-silence, stale-Agent and topology alerts count ACTIVE Agents only;
 `GpuFaultDataplaneCollectorMissing` fires for the cluster only when no node is left to run its watcher, which is a real fault.
 An unavailable cluster is therefore seen in `status`, the deploy log and the deploy record, not through an alert.

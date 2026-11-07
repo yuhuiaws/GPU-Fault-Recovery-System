@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from gpu_fault.admin import cluster_join as join
+from gpu_fault.admin import cluster_join_zero_nodes as zero_nodes
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     ClusterIdentity,
@@ -139,6 +140,9 @@ def prepare_local_inputs(
         cluster_id=cluster_id,
         namespaces=request.allowed_namespaces,
     )
+    # A cluster without nodes that cannot be joined that way is refused before
+    # anything is created on it (``cluster_join_zero_nodes``).
+    zero_nodes.refuse_unjoinable(request, runner, target, cluster_id, gpu_kubeconfig)
     namespace_uid = join.probe_join_namespace(
         runner,
         site=request.site,
@@ -176,9 +180,8 @@ def prepare_local_inputs(
         secure_dir=secure,
     )
     ca_file = join._shared_ca_file(request.site)
-    node_uids: dict[str, str] = {}
-    nodes = join._list_nodes(
-        runner, kubeconfig=gpu_kubeconfig, target=target, identities=node_uids
+    nodes, node_uids, zero = zero_nodes.node_inventory(
+        request, runner, target, cluster_id, gpu_kubeconfig
     )
     clear_stale_installer_annotations(
         request.site,
@@ -202,6 +205,7 @@ def prepare_local_inputs(
             "ca_file": str(ca_file),
             "nodes": nodes,
             "node_uids": node_uids,
+            **({zero_nodes.ZERO_NODES_KEY: zero} if zero is not None else {}),
         },
     )
 

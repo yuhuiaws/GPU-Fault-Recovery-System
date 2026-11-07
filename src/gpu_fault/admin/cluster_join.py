@@ -81,6 +81,7 @@ from gpu_fault.admin.cluster_join_types import (
     JoinExecution as JoinExecution,
     JoinInputs as JoinInputs,
 )
+from gpu_fault.admin import cluster_join_zero_nodes as zero_nodes
 from gpu_fault.admin.cluster_readiness import wait_collector_readiness
 from gpu_fault.admin.cluster_removal import (
     _clear_installer_annotations as _clear_installer_annotations,
@@ -592,7 +593,7 @@ def _parallel_prerequisites(
         if (
             proof.get("cluster_id") != cluster_id
             or not isinstance(nodes, list)
-            or not nodes
+            or not (nodes or zero_nodes.recorded(proof))
             or not isinstance(node_uids, dict)
             or set(node_uids) != set(nodes)
         ):
@@ -604,6 +605,10 @@ def _parallel_prerequisites(
             with record_lock:
                 _complete(state_path, state, "NODE_KEYS_STARTED")
 
+        if not nodes:
+            return zero_nodes.empty_node_key_secret(
+                runner, request.site, target, cluster_id, gpu_kubeconfig, proof, started
+            )
         custody_arguments: dict[str, Any] = {}
         if custody is not None:
             custody_arguments["custody_context"] = replace(
@@ -1140,16 +1145,8 @@ def _deploy_cluster(
         _run_rollout(execution.candidate, "join-cluster", cluster_id=cluster_id)
         _complete(state_path, state, "JOINED")
     if not _done(state, "COLLECTORS_READY"):
-        readiness = wait_collector_readiness(execution.candidate, cluster_id)
-        _complete(
-            state_path,
-            state,
-            "COLLECTORS_READY",
-            {
-                "nodes": len(readiness.get("nodes") or []),
-                "ready": readiness.get("ready"),
-            },
-        )
+        evidence = zero_nodes.collector_readiness(execution, wait_collector_readiness)
+        _complete(state_path, state, "COLLECTORS_READY", evidence)
 
 
 def _verify_join_candidate(

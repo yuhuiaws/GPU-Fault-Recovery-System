@@ -14,6 +14,8 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
 )
+from gpu_fault.admin.cluster_join_zero_nodes import ZERO_NODES_KEY
+from gpu_fault.admin.cluster_join_zero_nodes import recorded as zero_node_join
 from gpu_fault.admin.cluster_join_state import (
     complete_step,
     reclaimed_cluster_token,
@@ -275,7 +277,7 @@ def verify_join_node_names(
     raw_nodes = inputs.local.get("nodes")
     if (
         not isinstance(raw_nodes, list)
-        or not raw_nodes
+        or not (raw_nodes or zero_node_join(inputs.local))
         or any(not isinstance(node, str) or not node for node in raw_nodes)
         or len(raw_nodes) != len(set(raw_nodes))
     ):
@@ -377,6 +379,11 @@ def verify_join_node_names(
             "observed_at": claims.observed_at,
             "expected_key_sha256": digests,
             "adopted_node_keys": adopted,
+            **(
+                {ZERO_NODES_KEY: inputs.local[ZERO_NODES_KEY]}
+                if zero_node_join(inputs.local)
+                else {}
+            ),
         },
     )
 
