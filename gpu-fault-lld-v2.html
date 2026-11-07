@@ -12432,7 +12432,28 @@ Agent 运行过，controller stage 暂存上一版自己的 pin，取自捕获�
 preflight
 被拒绝（<code>zero_node_gpu_clusters</code>）：节点组未声明安装器 认识的
 GPU 实例类型的集群上滚动 Reconciler 的发布。每个 GPU
-集群都没有节点本身不拒绝任何发布。证明只读取
+集群都没有节点本身不拒绝任何发布。判定规则是一个纯模块
+<code>src/gpu_fault/zero_node_capacity.py</code>：它只判定交给它的
+provider 文档（<code>capacity_proof</code>；判定 HyperPod
+覆盖所用的节点组事实也在 这里），发布引擎的
+<code>regional_parked_cluster</code> 与
+<code>admin/bootstrap_ownership</code>
+以再导出的方式保留原有名称，不会出现可能漂移的第二份 副本。每个 GPU
+集群的 executor
+是它的第二个读取方（<code>cluster_executor/zero_node_probe.py</code>，每
+60 秒一次的 <code>ClaimLoop</code> 例行任务）： 统计选中的节点数，只有
+API 列出零个节点时才以自己的授权读取 provider（HyperPod
+<code>DescribeCluster</code>；EKS
+<code>ListNodegroups</code>/<code>DescribeNodegroup</code>；Karpenter
+NodePool 的 get/list），并导出
+<code>gpu_fault_cluster_executor_selected_nodes</code>、
+<code>..._zero_node_parked</code>、<code>..._zero_node_unavailable</code>
+与 <code>..._last_zero_node_check_timestamp</code>；同一 provider
+状态下两个读取方得出
+同一证明（<code>tests/regional/test_zero_node_capacity_parity.py</code>）。<code>GpuFaultGpuClusterUnavailable</code>（critical，<code>for: 30m</code>）按
+executor 副本取 <code>max</code> 读取不可用
+gauge——只要一个副本无法证明停放就足够——并以 <code>label_replace</code>
+把集群写成 <code>cluster_id</code>；停放的集群从不告警。证明只读取
 <code>regional_contexts</code>
 已经读取的内容；离场节点清理本身不参考它。证明从不开启读快照（<code>regional_release_state.read_snapshot</code>）：
 快照的缓存保存在所有线程共享的发布对象上，而发布步骤（候选
