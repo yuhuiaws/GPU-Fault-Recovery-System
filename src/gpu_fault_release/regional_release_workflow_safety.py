@@ -12,12 +12,14 @@ from gpu_fault_release.regional_verify_scope import gating_count, listed
 
 
 # The one blocker class the operator can clear without a node: a record of a
-# node HyperPod replaced (BLOCKED never-changed, or PENDING never dispatched)
-# is closed by the audited administrator reconcile, never by a row edit.
+# node its provider replaced or removed (BLOCKED never-changed, or PENDING never
+# dispatched) is closed by the audited administrator reconcile, never by a row
+# edit.
 DEPARTED_NODE_REMEDY = (
-    "; a blocker whose node left Kubernetes and HyperPod (spot replacement) is "
-    "closed with gpu-fault-admin workflow-reconcile --state-dir <state-dir> "
-    "--dry-run, then --reference <change>; see administrator operations 10.2"
+    "; a blocker whose node left Kubernetes and its provider (the HyperPod node "
+    "list or EC2; a spot replacement, a scale-in) is closed with gpu-fault-admin "
+    "workflow-reconcile --state-dir <state-dir> --dry-run, then --reference "
+    "<change>; see administrator operations 10.2"
 )
 
 

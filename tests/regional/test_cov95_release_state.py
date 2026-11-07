@@ -654,7 +654,9 @@ def test_previous_capture_joins_cluster_reads_and_binds_agent_node_set(
     identities = previous_snapshot(release)["agent_identities"]
     if fault == "node-set":
         identities["gpu-a"]["node_ids"] = ["other"]
-    monkeypatch.setattr(state, "capture_agent_identities", lambda _release: identities)
+    monkeypatch.setattr(
+        state, "capture_agent_identities", lambda _release, **_kwargs: identities
+    )
     # The diagnosis re-reads lease facts through the same probe; faked alike.
     monkeypatch.setattr(agent_set, "agent_lease_facts", lambda _release: {})
     barrier = threading.Barrier(2)

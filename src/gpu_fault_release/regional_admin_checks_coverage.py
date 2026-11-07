@@ -20,6 +20,12 @@ The same ledger is what ``status`` prints as its departed-node finding
 (``departed_node_lines``): every departed node the cleanup knows, cleaned or
 pending, with the blocker and the manual command where one is needed.
 
+When the departed nodes were all of a cluster's -- its GPU node groups scaled
+to zero -- the cluster selects no node and has no counted Agent. Proven parked
+by its provider (``regional_parked_cluster``), that is complete coverage and
+nothing else is asked of the cluster's fleet; otherwise the ``no registered
+Node Agents`` refusal says why it is not parked.
+
 Every Agent also reports its node's host DCGM engine (``nvidia-dcgm``) in each
 heartbeat, so the probe's Agent records carry it live; ``status --full`` shows
 it per cluster as ``dcgm_hostengine_live`` (``annotate_dcgm_hostengine_live``)
@@ -54,6 +60,7 @@ from gpu_fault.dcgm_versions import (
     dcgm_version_relation,
     hostengine_version,
 )
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release.regional_release_verify_churn import (
     churn_excused,
     departure_unproven,
@@ -68,8 +75,9 @@ from gpu_fault_release.regional_release_node_scope import check_node_scope_agree
 from gpu_fault_release.regional_release_profile_model import runtime_profile_version_for
 
 RETIRE_DEPARTED_AGENTS_HINT = (
-    "these Agents have no Kubernetes Node; if HyperPod no longer lists their "
-    "instances, retire them with gpu-fault-admin workflow-reconcile --state-dir "
+    "these Agents have no Kubernetes Node; if their provider no longer lists "
+    "their instances (the HyperPod node list, or EC2 for an eks-managed "
+    "cluster), retire them with gpu-fault-admin workflow-reconcile --state-dir "
     "<state-dir> --retire-departed-agents --dry-run, then without --dry-run and "
     "with --reference"
 )
@@ -268,13 +276,19 @@ def node_scope_report(
 
 
 def annotate_kubernetes_nodes(
-    report: dict[str, Any], node_ids_by_cluster: dict[str, list[str]]
+    report: dict[str, Any],
+    node_ids_by_cluster: dict[str, list[str]],
+    *,
+    release: Any = None,
 ) -> None:
     """Record every Kubernetes Node name the report's clusters have, in place.
 
     ``expected_node_ids`` is the Ready subset the probe was asked about; the
     coverage refusal needs the whole list to tell an Agent whose node is gone
-    from one whose node is merely NotReady.
+    from one whose node is merely NotReady. With ``release``, a cluster without
+    any node also gets its parked proof (``regional_parked_cluster``): parked,
+    its coverage is zero Agents for zero nodes; otherwise the refusal says why
+    it is not parked.
     """
 
     clusters = report.get("clusters")
@@ -284,6 +298,8 @@ def annotate_kubernetes_nodes(
         cluster = clusters.get(cluster_id)
         if isinstance(cluster, dict):
             cluster["kubernetes_node_ids"] = sorted(node_ids)
+    if release is not None:
+        parked_cluster.annotate_parked(report, release, node_ids_by_cluster)
 
 
 #: The engine states that count as running, and the enablement that starts it
@@ -459,7 +475,8 @@ def check_agent_coverage(
     report also names what the release's own node churn excuses
     (``regional_release_verify_churn``): those nodes' Agents are not counted,
     and the refusal names each Agent without a Ready Node whose departure the
-    verify could not prove, with the reason.
+    verify could not prove, with the reason. A parked cluster (no node, no
+    counted Agent, ``regional_parked_cluster.is_parked``) returns none.
     """
 
     excused = churn_excused(cluster)
@@ -469,7 +486,15 @@ def check_agent_coverage(
         if str(item.get("node_id")) not in excused
     ]
     if not agents:
-        raise ReleaseError(f"{cluster_id} has no registered Node Agents")
+        if parked_cluster.is_parked(cluster):
+            # Zero Ready nodes, zero Agents: a parked cluster is fully covered.
+            return []
+        raise ReleaseError(
+            parked_cluster.zero_nodes_failure(
+                f"{cluster_id} has no registered Node Agents",
+                cluster.get(parked_cluster.PARKED_KEY),
+            )
+        )
     expected_nodes = {str(item) for item in cluster.get("expected_node_ids") or []}
     agent_nodes = {str(item.get("node_id")) for item in agents}
     if agent_nodes != expected_nodes:
@@ -512,6 +537,10 @@ def judge_cluster_fleet(release: Any, cluster_id: str, cluster: dict[str, Any]) 
     ``regional_verify_scope.judge_clusters``)."""
 
     agents = check_agent_coverage(cluster_id, cluster)
+    if not agents:
+        # Parked (``check_agent_coverage``): no Agent runs a Runtime Profile and
+        # there is no node to ask fleet readiness about.
+        return
     expected_profile = runtime_profile_version_for(release.config, cluster_id)
     if any(item.get("runtime_profile_version") != expected_profile for item in agents):
         raise ReleaseError(f"{cluster_id} Agent Runtime Profile drift")

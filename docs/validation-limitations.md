@@ -10,6 +10,19 @@ storage probes and production recovery remain separate acceptance work.
 The broader thermal/RMA and application-fault policy recommendations are not
 claimed as completed by this batch.
 
+## GPU clusters parked at zero nodes
+
+A cluster whose node selector selects no node is reported parked only when its
+provider declares zero capacity. The eks-managed proof (every covered managed
+node group `ACTIVE` at `scalingConfig.desiredSize` 0, no Karpenter NodePool
+able to launch a selected node) is built from the live node group and NodePool
+shapes. The HyperPod proof (every covered instance group `InService` at
+`TargetCount` and `CurrentCount` 0) is derived from the `DescribeCluster`
+fields; a HyperPod cluster scaled to zero has not been exercised live. While a
+cluster is parked, releases with GPU components are refused rather than rolled
+around it, and `uninstall`, `remove-cluster` and `rotate-token` still need a
+node on that cluster.
+
 ## Xid linkage and Drain P2P recovery
 
 Xid 154 linkage versions are reporting metadata, not applicability gates for

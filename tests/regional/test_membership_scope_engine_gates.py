@@ -168,7 +168,11 @@ def by_name(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
     "lost,finding",
     [
         ("degraded", f"{DEGRADED} is not ACTIVE (DEGRADED)"),
-        ("no-nodes", f"{OTHER} has no Kubernetes nodes"),
+        (
+            "no-nodes",
+            f"{OTHER} has no Kubernetes nodes; not parked: node group gpu-ng "
+            "reports no scalingConfig.desiredSize",
+        ),
     ],
 )
 def test_another_clusters_lost_node_is_a_finding_of_the_join_preflight(

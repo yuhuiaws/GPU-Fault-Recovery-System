@@ -512,7 +512,9 @@ def test_previous_snapshot_records_the_live_per_cluster_profiles(
         state, "capture_previous_monitoring", lambda *_args, **_kwargs: ({}, OLD_IMAGE)
     )
     identities = previous_snapshot(release)["agent_identities"]
-    monkeypatch.setattr(state, "capture_agent_identities", lambda _release: identities)
+    monkeypatch.setattr(
+        state, "capture_agent_identities", lambda _release, **_kwargs: identities
+    )
     monkeypatch.setattr(agent_set, "agent_lease_facts", lambda _release: {})
     barrier = threading.Barrier(2)
 

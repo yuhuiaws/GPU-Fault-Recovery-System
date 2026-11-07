@@ -317,7 +317,8 @@ def _add_workflow_reconcile_command(commands: Any) -> None:
         help=(
             "close BLOCKED workflow records a later workflow already restored, "
             "and PENDING records never dispatched whose node left Kubernetes and "
-            "HyperPod (plans and applies in one run; --dry-run only prints the plan); "
+            "its provider, the HyperPod node list or EC2 (plans and applies in one "
+            "run; --dry-run only prints the plan); "
             "with --retire-departed-agents revoke the fleet Agent record of such a node; "
             "with --close-incident / --close-escalated close ESCALATED incidents, "
             "with --close-quarantined close QUARANTINED incidents whose node "

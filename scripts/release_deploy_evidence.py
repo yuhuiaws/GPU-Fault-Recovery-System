@@ -99,13 +99,18 @@ def update_phase(prepared: PreparedRelease, phase: str, **values: Any) -> None:
 
 
 def verification_metadata(path: Path, report: dict[str, Any]) -> dict[str, Any]:
-    return {
+    metadata = {
         "status": "PASSED",
         "path": str(path),
         "sha256": sha256_file(path),
         "verified_at": utc_now(),
         "summary": report.get("summary"),
     }
+    # The GPU clusters the verify found parked at zero nodes: passing, so the
+    # deploy record names them rather than leaving them to the report file.
+    if "parked_gpu_clusters" in report:
+        metadata["parked_gpu_clusters"] = list(report.get("parked_gpu_clusters") or [])
+    return metadata
 
 
 def validate_verification_report(report: dict[str, Any]) -> None:

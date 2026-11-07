@@ -25,6 +25,7 @@ from gpu_fault_release.regional_release_nlb_rules import (
 )
 from gpu_fault_release.regional_admin_checks_coverage import node_scope_report
 from gpu_fault_release.regional_admin_checks_coverage import selected_nodes
+from gpu_fault_release import regional_parked_cluster as parked
 from gpu_fault_release import regional_admin_checks_readiness as readiness
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
@@ -111,6 +112,7 @@ def _report(mode: str, release: Any, checks: list[dict[str, Any]]) -> dict[str, 
         "healthy": counts["FAIL"] == 0,
         "summary": counts,
         "checks": checks,
+        parked.PARKED_CLUSTERS_KEY: parked.parked_cluster_ids(checks),
     }
 
 
@@ -224,7 +226,7 @@ def _check_aws_identity(release: Any) -> CheckValue:
 def _check_contexts(release: Any) -> CheckValue:
     facts = release._ensure_contexts()
     return CheckValue(
-        "CPU/GPU contexts, HyperPod ownership and executor IAM are valid",
+        "CPU/GPU contexts, provider bindings and executor IAM are valid",
         facts or {"clusters": [item.cluster_id for item in release.config.clusters]},
     )
 
@@ -1150,7 +1152,7 @@ def _control_api_report(release: Any, *, verify: bool = False) -> dict[str, Any]
     )
     if not isinstance(result, dict):
         raise ReleaseError("control API report returned non-object evidence")
-    agent_coverage.annotate_kubernetes_nodes(result, kubernetes_nodes)
+    agent_coverage.annotate_kubernetes_nodes(result, kubernetes_nodes, release=release)
     agent_coverage.annotate_dcgm_hostengine_live(result, release)
     if verify:
         release_churn.annotate_release_churn(result, release, joining)
@@ -1283,8 +1285,7 @@ def _check_gpu_cluster(
     selector, nodes = selected_nodes(release, target)
     details["node_scope"] = node_scope_report(release, target, selector, nodes)
     expected_nodes = _ready_nodes(nodes)
-    if not expected_nodes:
-        raise ReleaseError(f"{target.cluster_id} has no Ready HyperPod nodes")
+    details.update(parked.zero_ready_nodes(release, target, nodes, expected_nodes))
     joining = release_churn.verify_joining(
         release, target.cluster_id, expected_nodes, verify=mode == "verify"
     )
@@ -1335,9 +1336,8 @@ def _check_gpu_cluster(
     if tls.get("status") != "ok":
         raise ReleaseError(f"{target.cluster_id} TLS probe did not return ok")
     details["nodes"] = sorted(item["metadata"]["name"] for item in expected_nodes)
-    details["executor_readiness"] = readiness
-    details["tls"] = tls
-    value = CheckValue(f"{target.cluster_id} data plane is healthy", details)
+    details.update(executor_readiness=readiness, tls=tls)
+    value = CheckValue(parked.data_plane_summary(target.cluster_id, details), details)
     return release_churn.with_joining(value, target.cluster_id, joining)
 
 

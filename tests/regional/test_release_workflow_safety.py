@@ -340,7 +340,9 @@ def test_a_blocker_names_the_departed_node_remedy() -> None:
     assert "gpu-fault-admin workflow-reconcile --state-dir <state-dir> --dry-run" in (
         message
     )
-    assert "left Kubernetes and HyperPod" in message
+    assert "left Kubernetes and its provider (the HyperPod node list or EC2" in (
+        message
+    ), "the remedy names both providers' departure proofs"
 
 
 def test_both_probes_read_the_products_operator_confirmation_shape() -> None:

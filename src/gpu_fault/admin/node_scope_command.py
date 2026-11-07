@@ -474,8 +474,13 @@ def assess_cluster(
             reasons.append(
                 "nodes of a labelled group do not carry the label yet: "
                 + ", ".join(unlabelled)
-                + " (HyperPod applies KubernetesConfig labels through its own "
-                "reconciliation; label the nodes or wait, then retry)"
+                + (
+                    " (EKS applies a managed node group's labels to its nodes on "
+                    "its own; label the nodes or wait, then retry)"
+                    if provider is ClusterProvider.EKS_MANAGED
+                    else " (HyperPod applies KubernetesConfig labels through its "
+                    "own reconciliation; label the nodes or wait, then retry)"
+                )
             )
         departing = sorted(set(would_leave) - set(unlabelled))
         if departing:

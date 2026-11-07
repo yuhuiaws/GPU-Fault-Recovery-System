@@ -12,6 +12,7 @@ from gpu_fault.admin.automatic_node_updates import (
     control_plane_lines,
 )
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
     CheckValue,
@@ -910,6 +911,13 @@ def _deploy_preflight_report(release: Any) -> dict[str, Any]:
     report = build_preflight_report(
         release, repair_plan=plan, bootstrap=bootstrap, include_workflow=not repair
     )
+    # A release that snapshots and rolls every cluster's Agents cannot run over
+    # a cluster parked at zero nodes: refused here, before any repair or write.
+    checks = report.get("checks")
+    if isinstance(checks, list):
+        refusal = parked_cluster.release_refusal(checks, plan)
+        if refusal is not None:
+            report = _report("preflight", release, [*checks, refusal])
     if not repair or not report["healthy"]:
         return report
     previous_override = None
@@ -1134,6 +1142,9 @@ def _status_result(
     result["healthy"] = health["healthy"]
     result["health"] = health
     result["health_scope"] = scope
+    result[parked_cluster.PARKED_CLUSTERS_KEY] = list(
+        health.get(parked_cluster.PARKED_CLUSTERS_KEY) or []
+    )
     return result
 
 
@@ -1202,6 +1213,7 @@ def status_header_lines(report: dict[str, Any], *, json_destination: str) -> lis
         f"next deploy: {next_kind}",
         *partial,
         "failing checks: " + (", ".join(failing) if failing else "none"),
+        *parked_cluster.status_lines(health),
         *replica_failure_lines(health),
         *_control_api_findings(health),
         *automatic_update_lines(health),

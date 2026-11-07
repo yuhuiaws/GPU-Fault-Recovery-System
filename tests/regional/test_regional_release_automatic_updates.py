@@ -405,6 +405,9 @@ def test_the_widened_hyperpod_query_still_binds_and_carries_the_group_fields() -
             "InstanceGroupName",
             "InstanceType",
             "CurrentCount",
+            # The parked-cluster proof reads them off the same call.
+            "TargetCount",
+            "Status",
             "KubernetesConfig",
             "ScheduledUpdateConfig",
             "AutoPatchConfig",

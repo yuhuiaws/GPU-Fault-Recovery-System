@@ -24,6 +24,7 @@ from gpu_fault.failure_domains import (
 )
 from gpu_fault.cluster_scope import is_eks_managed, node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_agent_convergence import (
     agent_heartbeats_converged as agent_heartbeats_converged,
@@ -648,10 +649,14 @@ def live_agent_node_names(
 
 
 def capture_active_agent_node_sets(release: RegionalRelease) -> dict[str, AgentNodeSet]:
+    """Every cluster's live Agents, the set a CPU roll's heartbeat barrier
+    waits for; a cluster without one refuses, unless it selects no node and is
+    proven parked (``regional_parked_cluster``): its set is empty."""
+
     if release.runner.dry_run:
         return {}
     value = _read_active_agent_node_sets(release)
-    expected = {target.cluster_id for target in release.config.clusters}
+    targets = {target.cluster_id: target for target in release.config.clusters}
     result: dict[str, AgentNodeSet] = {
         str(cluster_id): {
             "node_ids": sorted({str(node_id) for node_id in node_ids if str(node_id)})
@@ -659,16 +664,26 @@ def capture_active_agent_node_sets(release: RegionalRelease) -> dict[str, AgentN
         for cluster_id, node_ids in value.items()
         if isinstance(node_ids, list)
     }
-    missing = sorted(
-        cluster_id
-        for cluster_id in expected
-        if cluster_id not in result or not result[cluster_id]["node_ids"]
-    )
+    missing = []
+    for cluster_id in sorted(targets):
+        if cluster_id in result and result[cluster_id]["node_ids"]:
+            continue
+        proof = parked_cluster.parked_without_nodes(release, targets[cluster_id])
+        if proof is None:
+            missing.append(cluster_id)
+            continue
+        narrate_step(
+            "parked-gpu-cluster",
+            cluster=cluster_id,
+            check="active_agent_node_sets",
+            reason=json.dumps(str(proof.get("reason"))),
+        )
+        result[cluster_id] = {"node_ids": []}
     if missing:
         raise ReleaseError(
             "active Agent node inventory is missing clusters: " + ", ".join(missing)
         )
-    return {cluster_id: result[cluster_id] for cluster_id in sorted(expected)}
+    return {cluster_id: result[cluster_id] for cluster_id in sorted(targets)}
 
 
 def rollout_wave_safety_snapshot(

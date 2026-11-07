@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import ipaddress
 import json
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
 
@@ -13,7 +14,6 @@ from gpu_fault.admin.automatic_node_updates import (
     ASG_QUERY,
     CONTROL_PLANE,
     FIELD as AUTOMATIC_NODE_UPDATES,
-    KARPENTER_NODEPOOLS,
     control_plane_updates,
     eks_node_group_updates,
     guarded,
@@ -31,6 +31,10 @@ from gpu_fault.eks_node_repair import (
 )
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
+from gpu_fault_release import regional_parked_cluster as parked_cluster
+from gpu_fault_release.regional_parked_cluster import (
+    HYPERPOD_CONTEXT_QUERY as HYPERPOD_CONTEXT_QUERY,
+)
 from gpu_fault_release.regional_observability_rollback import (
     AMP_FAILED_STATUSES,
     AMP_SETTLING_STATUSES,
@@ -376,18 +380,6 @@ def _validate_hyperpod_cluster(
     return [item for item in groups or () if isinstance(item, dict)]
 
 
-#: The context describe of a HyperPod cluster: its binding, and per instance
-#: group what the automatic-update advisory needs (one read serves both; the
-#: CPU cluster's advisory also counts the instances one window re-images).
-HYPERPOD_CONTEXT_QUERY = (
-    "{EksClusterArn:Orchestrator.Eks.ClusterArn,NodeRecovery:NodeRecovery,"
-    "InstanceGroups:InstanceGroups[].{InstanceGroupName:InstanceGroupName,"
-    "InstanceType:InstanceType,CurrentCount:CurrentCount,"
-    "KubernetesConfig:KubernetesConfig,ScheduledUpdateConfig:ScheduledUpdateConfig,"
-    "AutoPatchConfig:AutoPatchConfig}}"
-)
-
-
 def hyperpod_automatic_updates(
     groups: list[dict[str, Any]], target: ClusterTarget
 ) -> dict[str, Any]:
@@ -434,18 +426,6 @@ def eks_automatic_updates(
             region=False,
         )
 
-    def read_nodepools() -> dict[str, Any] | None:
-        code, output, error = release.runner.probe_output(
-            release._gpu(target, "get", KARPENTER_NODEPOOLS, "-o", "json"),
-            timeout_seconds=60,
-        )
-        if code == 0:
-            value = json.loads(output) if output.strip() else {}
-            return value if isinstance(value, dict) else {}
-        if "doesn't have a resource type" in error:
-            return None
-        raise ReleaseError(error.strip() or f"kubectl exited {code}")
-
     return {
         "node_groups": eks_node_group_updates(
             described,
@@ -453,7 +433,8 @@ def eks_automatic_updates(
             read_asgs=read_asgs,
         ),
         "karpenter": karpenter_updates(
-            read_nodepools, site_id=release.config.site_name
+            lambda: parked_cluster.read_karpenter_nodepools(release, target),
+            site_id=release.config.site_name,
         ),
     }
 
@@ -531,7 +512,15 @@ def _validate_agent_endpoint_cidrs(
     cluster_id: str,
     node_selector: str,
     configured_cidrs: tuple[str, ...],
-) -> None:
+    parked: Callable[[], dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Every selected node's InternalIP lies in the Agent endpoint CIDRs.
+
+    A cluster whose selector selects no node fails, unless ``parked`` proves it
+    parked (``regional_parked_cluster``): then the proof is returned and there
+    is no node to cover; the failure says why the cluster is not parked.
+    """
+
     try:
         networks = tuple(
             ipaddress.ip_network(value, strict=False) for value in configured_cidrs
@@ -554,7 +543,14 @@ def _validate_agent_endpoint_cidrs(
     )
     nodes = json.loads(raw).get("items") or []
     if not nodes:
-        raise ReleaseError(f"{cluster_id} has no Kubernetes nodes")
+        proof = parked() if parked is not None else None
+        if proof is None or proof.get("parked") is not True:
+            raise ReleaseError(
+                parked_cluster.zero_nodes_failure(
+                    f"{cluster_id} has no Kubernetes nodes", proof
+                )
+            )
+        return proof
     uncovered: list[str] = []
     for node in nodes:
         addresses = [
@@ -572,6 +568,7 @@ def _validate_agent_endpoint_cidrs(
             f"{cluster_id} Agent endpoint CIDRs do not cover nodes: "
             + ", ".join(sorted(uncovered))
         )
+    return None
 
 
 def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
@@ -579,7 +576,8 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
     (the cluster ids and, per eks-managed cluster, its node groups' facts; per
     GPU cluster and for the CPU control-plane cluster, ``control_plane``, the
     ``automatic_node_updates`` advisory block; ``eks_support``, every site EKS
-    cluster's version and its support end date)."""
+    cluster's version and its support end date; per GPU cluster parked at zero
+    nodes, ``parked``, the proof read from the same provider documents)."""
 
     config = release.config
     runner = release.runner
@@ -651,13 +649,18 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
                 require_node_recovery_none=True,
             )
         runner.run(gpu_command(target, "get", "--raw=/readyz"), capture=True)
-        _validate_agent_endpoint_cidrs(
+        proof = _validate_agent_endpoint_cidrs(
             runner,
             gpu_command(target),
             cluster_id=target.cluster_id,
             node_selector=node_selector(target),
             configured_cidrs=target.agent_endpoint_allowed_cidrs,
+            parked=lambda: parked_cluster.provider_proof(
+                release, target, described=described, groups=groups
+            ),
         )
+        if proof is not None:
+            providers[target.cluster_id][parked_cluster.PARKED_KEY] = proof
         release._validate_executor_iam_role(target)
         preflight_retired_collectors(release, target)
         # Advisory only (automatic_node_updates): recorded beside the facts it

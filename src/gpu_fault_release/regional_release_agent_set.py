@@ -12,6 +12,12 @@ just took, its replacement not installed yet -- is that cluster's finding,
 logged as a ``not-gating`` line, never a refusal (which, before activation,
 rolled a join back). The joining cluster's set still gates, and every deploy
 (whose rollback snapshot the identities are) judges every cluster as before.
+
+A cluster parked at zero GPU nodes (``regional_parked_cluster``) has no Agent
+and no node: its empty set matches. ``sync-state`` -- the last step of every
+automatic rollback -- accepts it and leaves it out of the identities it does
+not keep; a release's snapshot, which a rollback restores from, refuses it by
+name and says how to bring the cluster back or remove it.
 """
 
 from __future__ import annotations
@@ -19,12 +25,14 @@ from __future__ import annotations
 import json
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 from gpu_fault.cluster_scope import is_eks_managed
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release import regional_release_state as state
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
+from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
 from gpu_fault_release.regional_verify_scope import gates, narrate_not_gating
@@ -106,14 +114,19 @@ def _lease_facts(release: Any, cluster_id: str) -> dict[str, dict[str, Any]]:
 
 
 def agent_identities(
-    release: Any, records: list[dict[str, Any]]
+    release: Any,
+    records: list[dict[str, Any]],
+    *,
+    parked: Callable[[Any], bool] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Each cluster's one Agent identity (``AGENT_IDENTITY_FIELDS``) and its
     node ids, from the ``active_agent_identities`` probe's ``records``.
 
     A cluster without an ACTIVE, lease-valid Agent, or whose Agents differ,
     refuses -- unless it is another cluster of a scoped ``sync-state``: then
-    the problem is logged and the cluster left out.
+    the problem is logged and the cluster left out -- or a gating cluster
+    without any Agent that ``parked`` accepts (it may refuse by itself): then
+    the cluster is left out.
     """
 
     result: dict[str, dict[str, Any]] = {}
@@ -125,6 +138,13 @@ def agent_identities(
             tuple(item.get(field) for field in AGENT_IDENTITY_FIELDS)
             for item in selected
         }
+        if (
+            not selected
+            and parked is not None
+            and gates(release, target.cluster_id)
+            and parked(target)
+        ):
+            continue
         if len(identities) != 1:
             problem = (
                 "active Agent identities differ"
@@ -168,7 +188,9 @@ def _other_clusters(
             )
 
 
-def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str, Any]]:
+def capture_agent_identities_matching_nodes(
+    release: Any, *, accept_parked: bool = False
+) -> dict[str, dict[str, Any]]:
     """Every cluster's ACTIVE Agents must be exactly its GPU nodes.
 
     Fail-closed: a release must not start over a node without a live Agent or
@@ -177,6 +199,10 @@ def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str,
     deploy refused with a bare "does not match" while every HyperPod Agent was
     ACTIVE and ready minutes later), and the refusal names the nodes and the
     Agent records behind the difference.
+
+    A gating cluster without any Agent whose selector selects no node and that
+    is proven parked (``regional_parked_cluster.parked_without_nodes``) is left
+    out with ``accept_parked`` (``sync-state``), and refused by name without.
     """
 
     capture_identities = getattr(release, "_capture_agent_identities", None)
@@ -185,18 +211,36 @@ def capture_agent_identities_matching_nodes(release: Any) -> dict[str, dict[str,
         item for item in release.config.clusters if gates(release, item.cluster_id)
     ]
     others = [item for item in release.config.clusters if item not in gating]
+    parked: dict[str, dict[str, Any]] = {}
+
+    def accepted_parked(target: Any) -> bool:
+        proof = parked_cluster.parked_without_nodes(release, target)
+        if proof is None:
+            return False
+        if not accept_parked:
+            raise ReleaseError(parked_cluster.capture_refusal(target.cluster_id, proof))
+        if target.cluster_id not in parked:
+            narrate_step(
+                "parked-gpu-cluster",
+                cluster=target.cluster_id,
+                check=CHECK,
+                reason=json.dumps(str(proof.get("reason"))),
+            )
+        parked[target.cluster_id] = proof
+        return True
+
     problem = ""
     for attempt in range(2):
         identities = (
             capture_identities()
             if capture_identities is not None
-            else state.capture_agent_identities(release)
+            else state.capture_agent_identities(release, parked=accepted_parked)
         )
         problem = ""
         for target, expected_nodes in state._map_clusters(
             release,
             lambda target: set(release._target_node_names(target)),
-            targets=gating,
+            targets=[item for item in gating if item.cluster_id not in parked],
             failure="active Agent set capture",
         ):
             captured_nodes = set(identities[target.cluster_id]["node_ids"])

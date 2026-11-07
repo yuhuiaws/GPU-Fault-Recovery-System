@@ -87,6 +87,21 @@ class ReleaseExecutionPlan:
 
 
 PLAN_ORDER = tuple(ReleaseComponent)
+#: The components whose release snapshots every GPU cluster before it changes
+#: anything -- its Deployments and the Agent identities a rollback restores
+#: (``regional_release_state``) -- and so needs every cluster's Agents.
+GPU_SNAPSHOT_COMPONENTS = frozenset(
+    {
+        ReleaseComponent.ENDPOINT,
+        ReleaseComponent.CONNECTION,
+        ReleaseComponent.DCGM,
+        ReleaseComponent.EXECUTOR,
+        ReleaseComponent.WATCHER,
+        ReleaseComponent.COLLECTOR,
+        ReleaseComponent.RECONCILER,
+        ReleaseComponent.AGENT,
+    }
+)
 AURORA_PREREQUISITE_REPAIR_KEY = "aurora_prerequisite_repair"
 ADMIN_CONFIG_CHANGE_FIELDS = frozenset(
     {

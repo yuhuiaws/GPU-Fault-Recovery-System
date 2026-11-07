@@ -25,6 +25,11 @@ Whatever the verdict, the judged snapshot is kept -- per node and collector
 kind: ``ready``, ``age_seconds`` and the threshold the control plane applied,
 with how long the check waited and how many polls it made -- so a FAIL names
 the stale node and collector instead of only the cluster.
+
+A cluster parked at zero GPU nodes (``regional_parked_cluster``) has no ACTIVE
+Agent, so the control plane never calls it ready; nothing there will report,
+so it is neither waited for nor failed, and the evidence names it under
+``parked_not_awaited``.
 """
 
 from __future__ import annotations
@@ -34,6 +39,7 @@ import time
 from typing import Any, Callable
 
 from gpu_fault.admin.deadlines import DeploymentDeadlineExceeded, remaining_timeout
+from gpu_fault_release import regional_parked_cluster as parked_cluster
 from gpu_fault_release.regional_release_verify_churn import churn_departed
 from gpu_fault_release.regional_release_config import CheckFailure, ReleaseError
 from gpu_fault_release.regional_release_probes import probe_source
@@ -123,13 +129,15 @@ def judge_collector_readiness(
     # A cluster-scoped verify (join-cluster / remove-cluster) neither waits for
     # nor fails on another cluster's collectors: they are its findings.
     others = not_gating_ids(release, snapshots)
+    # Nor on a parked cluster's: it has no Agent that could ever report.
+    parked = parked_cluster.not_awaited(clusters, snapshots)
     thresholds = _thresholds(report)
     budget = _capped_grace(grace_seconds)
     started = monotonic()
     remaining = budget
     polls = 0
     probe_errors: list[str] = []
-    pending = _not_ready(snapshots, excused, others)
+    pending = _not_ready(snapshots, excused, others | parked)
     while pending and remaining > 0:
         pause = min(poll_seconds, remaining)
         sleep(pause)
@@ -150,7 +158,7 @@ def judge_collector_readiness(
                 if cluster_id in fresh["clusters"]:
                     snapshots[cluster_id] = fresh["clusters"][cluster_id]
             thresholds = _thresholds(fresh) or thresholds
-            pending = _not_ready(snapshots, excused, others)
+            pending = _not_ready(snapshots, excused, others | parked)
         # The probe's own duration counts against the grace as well.
         remaining = min(remaining, budget - (monotonic() - started))
     evidence = {
@@ -175,8 +183,12 @@ def judge_collector_readiness(
         evidence["departed_not_awaited"] = {
             cluster_id: sorted(nodes) for cluster_id, nodes in excused.items()
         }
+    if parked:
+        evidence[parked_cluster.NOT_AWAITED_KEY] = sorted(parked)
     not_gating: dict[str, list[str]] = {}
-    for cluster_id in _not_ready({key: snapshots[key] for key in others}, excused):
+    for cluster_id in _not_ready(
+        {key: snapshots[key] for key in others - parked}, excused
+    ):
         not_gating[cluster_id] = _stale(cluster_id, snapshots[cluster_id], thresholds)
         for line in not_gating[cluster_id]:
             record_not_gating(report, cluster_id, f"collector readiness: {line}")

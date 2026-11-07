@@ -49,6 +49,7 @@ from gpu_fault_release.regional_release_dcgm import (
     dcgm_hostengines_digest,
 )
 from gpu_fault_release.regional_release_diff import (
+    GPU_SNAPSHOT_COMPONENTS,
     ReleaseComponent,
     ReleaseExecutionPlan,
 )
@@ -315,16 +316,7 @@ def read_snapshot(release: Any):
 
 
 def _plan_captures_gpu(plan: ReleaseExecutionPlan | None) -> bool:
-    return plan is None or plan.has(
-        ReleaseComponent.ENDPOINT,
-        ReleaseComponent.CONNECTION,
-        ReleaseComponent.DCGM,
-        ReleaseComponent.EXECUTOR,
-        ReleaseComponent.WATCHER,
-        ReleaseComponent.COLLECTOR,
-        ReleaseComponent.RECONCILER,
-        ReleaseComponent.AGENT,
-    )
+    return plan is None or plan.has(*GPU_SNAPSHOT_COMPONENTS)
 
 
 def prime_deployment_snapshot(
@@ -708,14 +700,17 @@ def cpu_role_config_maps(
     return snapshots
 
 
-def capture_agent_identities(release: Any) -> dict[str, dict[str, Any]]:
+def capture_agent_identities(
+    release: Any, *, parked: Callable[[Any], bool] | None = None
+) -> dict[str, dict[str, Any]]:
     raw = exec_cpu_ingress_probe(
         release,
         script=probe_source("active_agent_identities"),
         failure="previous Agent identity capture",
     )
-    # One identity per cluster (``regional_release_agent_set.agent_identities``).
-    return agent_set.agent_identities(release, json.loads(raw))
+    # One identity per cluster (``regional_release_agent_set.agent_identities``);
+    # ``parked`` decides a cluster without Agents (``regional_parked_cluster``).
+    return agent_set.agent_identities(release, json.loads(raw), parked=parked)
 
 
 def capture_gpu_cluster_snapshot(
@@ -931,7 +926,12 @@ def _capture_previous(
     )
     agent_identities: dict[str, dict[str, Any]] = {}
     if capture_gpu and release.config.clusters:
-        agent_identities = agent_set.capture_agent_identities_matching_nodes(release)
+        # Without a plan this is sync-state's proof of the live site, which it
+        # does not keep (``previous=None``): a parked cluster's empty Agent set
+        # matches its empty node set there. A release's snapshot refuses one.
+        agent_identities = agent_set.capture_agent_identities_matching_nodes(
+            release, accept_parked=plan is None
+        )
     role_deployments = cpu_role_deployments(release) if capture_cpu else {}
     role_config_maps = (
         cpu_role_config_maps(release, role_deployments) if capture_cpu else {}
