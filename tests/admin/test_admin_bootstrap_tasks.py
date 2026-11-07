@@ -21,6 +21,7 @@ from gpu_fault.admin import (
     bootstrap_load_balancer,
     bootstrap_services,
     bootstrap_tasks,
+    bootstrap_zero_nodes,
     notification_bootstrap,
 )
 from gpu_fault.admin.bootstrap_common import (
@@ -35,6 +36,11 @@ from gpu_fault.admin.bootstrap_common import (
 from gpu_fault.admin.bootstrap_task_inputs import task_input_spec
 from gpu_fault.admin.notifications import NotificationRouting
 from tests.admin._bootstrap_support import _cluster
+from tests.admin._zero_node_bootstrap_support import (
+    ZeroNodeSite,
+    eks_cluster,
+    hyperpod_cluster,
+)
 
 
 class Recorder:
@@ -199,6 +205,8 @@ def _stub_platform_services(
             runner, **keywords
         ),
     )
+    # The clusters have nodes: no zero-node read (bootstrap_zero_nodes).
+    monkeypatch.setattr(bootstrap_zero_nodes, "zero_node_keys", lambda *_a, **_k: None)
     return refresh
 
 
@@ -654,6 +662,8 @@ def test_monitoring_and_node_keys_start_while_aurora_and_the_nlb_are_still_runni
 
     monkeypatch.setattr(bootstrap_services, "install_monitoring", install_monitoring)
     monkeypatch.setattr(bootstrap_services, "provision_node_action_keys", node_keys)
+    # The clusters have nodes: no zero-node read (bootstrap_zero_nodes).
+    monkeypatch.setattr(bootstrap_zero_nodes, "zero_node_keys", lambda *_a, **_k: None)
     state = _state(tmp_path)
 
     results = bootstrap_tasks.run_bootstrap_tasks(
@@ -801,6 +811,8 @@ def test_runtime_iam_preparation_does_not_wait_for_the_release_build(
         }
 
     monkeypatch.setattr(bootstrap_services, "provision_node_action_keys", node_keys)
+    # The clusters have nodes: no zero-node read (bootstrap_zero_nodes).
+    monkeypatch.setattr(bootstrap_zero_nodes, "zero_node_keys", lambda *_a, **_k: None)
     monitoring = Recorder("install_monitoring", log)
     refresh = Recorder("install_aurora_refresh", log)
 
@@ -892,6 +904,8 @@ def test_release_binding_does_not_invalidate_prepared_runtime_iam(
         }
 
     monkeypatch.setattr(bootstrap_services, "provision_node_action_keys", node_keys)
+    # The clusters have nodes: no zero-node read (bootstrap_zero_nodes).
+    monkeypatch.setattr(bootstrap_zero_nodes, "zero_node_keys", lambda *_a, **_k: None)
     _platform_graph(tmp_path, state, log, release=release).run(state=state)
 
     assert bound.is_set(), "the candidate inputs were not bound"
@@ -1040,3 +1054,136 @@ def test_access_failure_stops_not_yet_started_resource_work(
     assert report["status"] == "failed"
     assert report["duration_seconds"] >= 0
     assert report["runner_commands"] == {"total": 0, "aws": 0, "kubectl": 0}
+
+
+# --- a GPU cluster without nodes through the whole deploy bootstrap -----------------
+
+ZERO_NODE_PLATFORM_TASKS = {
+    "release",
+    "grafana_install",
+    "monitoring_install",
+    "aurora_ready",
+    "aurora_refresh",
+    "node_keys:gpu-a",
+    "node_keys:gpu-eks",
+}
+
+
+def _zero_node_state(tmp_path: Path) -> BootstrapState:
+    state = BootstrapState(tmp_path / "bootstrap-state.json", site_id="site-a")
+    state.bind_inputs(
+        "test-inputs",
+        dict.fromkeys(
+            FOUNDATION_TASKS | ZERO_NODE_PLATFORM_TASKS | {"pod_identity_agent"},
+            "fixture",
+        ),
+    )
+    return state
+
+
+def _zero_node_bootstrap(
+    tmp_path: Path,
+    state: BootstrapState,
+    site: ZeroNodeSite,
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
+    """Both real graphs, run as the deploy runs them. Every service is stubbed
+    except the node keys: their task, ``provision_node_action_keys`` and the
+    zero-node proof are the real ones, and they talk to ``site``."""
+
+    log: list[tuple[str, bool, bool]] = []
+    _stub_foundation_services(monkeypatch, log)
+    monkeypatch.setattr(
+        bootstrap_services, "install_monitoring", Recorder("install_monitoring", log)
+    )
+    monkeypatch.setattr(
+        bootstrap_services,
+        "install_aurora_refresh",
+        Recorder("install_aurora_refresh", log),
+    )
+    platform = bootstrap_tasks.platform_task_graph(
+        runner=site,
+        state=state,
+        repository_root=tmp_path,
+        cpu=_cluster(),
+        gpu_clusters=[hyperpod_cluster("gpu-a"), eks_cluster("gpu-eks")],
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        gpu_kubeconfig=tmp_path / "gpu.kubeconfig",
+        namespace="gpu-fault-system",
+        site_id="site-a",
+        alert_email=None,
+        release=lambda: {
+            "manifest": str(tmp_path / "manifest.json"),
+            "images": {"adot": "adot:1", "runtime": "runtime:1"},
+        },
+        fleet_master_file=tmp_path / "master",
+        ensure_aurora_ready=Recorder("aurora_ready", log),
+    )
+    return bootstrap_tasks.run_bootstrap_tasks(
+        state=state,
+        foundation=_foundation_graph(tmp_path, state, log),
+        platform=platform,
+    )
+
+
+@pytest.mark.parametrize(
+    "desired,expected",
+    [(0, "parked"), (2, "unavailable")],
+    ids=["parked", "unavailable"],
+)
+def test_a_deploy_bootstrap_over_a_gpu_cluster_without_nodes_completes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    desired: int,
+    expected: str,
+) -> None:
+    """The live failure end to end: ``node_keys:gpu-eks`` ran the node-key
+    helper for an eks-managed cluster with no node, the helper refused the
+    empty inventory and the deploy stopped before any roll. Through the real
+    graph, the cluster without nodes now provisions no key -- parked or
+    unavailable -- and the cluster with a node is keyed as before, on the first
+    deploy and when the next one re-proves both read-only."""
+
+    site = ZeroNodeSite(desired=desired)
+
+    results = _zero_node_bootstrap(
+        tmp_path, _zero_node_state(tmp_path), site, monkeypatch
+    )
+
+    assert results["node_keys:gpu-a"] == {"cluster_id": "gpu-a"}
+    assert results["node_keys:gpu-eks"]["zero_nodes"]["state"] == expected
+    assert site.helper_runs() == ["gpu-a"], "only the cluster with a node is keyed"
+    assert not any("secret" in command for command in site.commands_for("gpu-eks")), (
+        "the key Secret of the cluster without nodes is left untouched"
+    )
+    err = capsys.readouterr().err
+    assert (
+        f"cluster=gpu-eks state={expected} step=node_keys "
+        'recorded="no node, no key to provision"'
+    ) in err, err
+
+    site.commands.clear()
+    rerun = BootstrapState(tmp_path / "bootstrap-state.json", site_id="site-a")
+    results = _zero_node_bootstrap(tmp_path, rerun, site, monkeypatch)
+
+    report = rerun.value["task_reports"]["node_keys:gpu-eks"]
+    assert (report["mode"], report["status"]) == ("probe", "succeeded"), report
+    assert results["node_keys:gpu-eks"]["zero_nodes"]["state"] == expected
+    assert site.helper_runs() == ["gpu-a"], "the keyless gpu-a probe asked ensure"
+    assert len(site.mutating()) == 1, "the helper run is the only write"
+
+
+def test_a_deploy_bootstrap_still_refuses_a_node_list_it_cannot_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No proof without a node list: the helper runs and refuses, as before."""
+
+    site = ZeroNodeSite(
+        unreadable=True,
+        helper_error={"gpu-eks": "HyperPod node inventory could not be read"},
+    )
+
+    with pytest.raises(BootstrapError, match="node inventory could not be read"):
+        _zero_node_bootstrap(tmp_path, _zero_node_state(tmp_path), site, monkeypatch)
+    assert sorted(site.helper_runs()) == ["gpu-a", "gpu-eks"]

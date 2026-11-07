@@ -148,6 +148,8 @@ def zero_node_environment(tmp_path: Path) -> dict[str, str]:
             import sys
             if sys.argv[1:3] == ["-m", "gpu_fault_release.regional_node_batch"]:
                 raise SystemExit("a zero-node cluster must never run the node batch")
+            if any(item.endswith("provision_node_action_keys.py") for item in sys.argv):
+                raise SystemExit("a zero-node cluster must never provision node keys")
             os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
             """
         ),
@@ -229,6 +231,30 @@ def test_a_zero_node_cluster_gets_its_steady_reconciler_and_template(
         "the Reconciler carries the release's node runtime for every joiner"
     )
     assert "*" in json.dumps(reconciler), "the steady state allows every node"
+
+
+def test_a_zero_node_cluster_provisions_no_node_key_with_a_fleet_master(
+    zero_node_environment: dict[str, str], tmp_path: Path
+) -> None:
+    """With ``GPU_FAULT_FLEET_MASTER_FILE`` the script runs the node-key helper
+    for the nodes it selects; with none selected it never does -- the helper
+    would refuse the empty inventory -- and only requires the key Secret the
+    steady-state Reconciler mounts to exist."""
+
+    master = tmp_path / "fleet-master"
+    master.write_text("fixture-only\n", encoding="utf-8")
+    master.chmod(0o600)
+
+    result = _run({**zero_node_environment, "GPU_FAULT_FLEET_MASTER_FILE": str(master)})
+
+    assert result.returncode == 0, result.stderr
+    assert "must never provision node keys" not in result.stderr
+    calls = [
+        json.loads(line) for line in (tmp_path / "calls.jsonl").read_text().splitlines()
+    ]
+    assert any(
+        "secret" in call and "gpu-fault-node-action-keys" in call for call in calls
+    ), "the existing key Secret is required, not written"
 
 
 def test_a_zero_node_preflight_proves_the_template_without_a_node_batch(

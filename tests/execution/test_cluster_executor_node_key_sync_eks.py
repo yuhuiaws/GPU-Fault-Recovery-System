@@ -176,6 +176,35 @@ def test_a_replacement_the_control_plane_does_not_know_is_attested_and_keyed() -
     assert core.list_selectors == [SELECTOR]
 
 
+def test_the_first_node_back_in_a_cluster_that_had_none_is_keyed_without_a_deploy() -> (
+    None
+):
+    """A cluster scaled to zero keeps its key Secret: the deploy's bootstrap
+    provisions nothing for a cluster without nodes
+    (``gpu_fault.admin.bootstrap_zero_nodes``) and deletes nothing. With no
+    node the sync asks for nothing; the first node of the group that comes
+    back is attested and keyed by this sync alone, the departed node's key
+    untouched."""
+
+    core, evidence = _world([], [_instance("i-0b000021", NEW, "10.0.36.21")])
+    client = AttestingClient()
+    sync = _sync(client, core, evidence)
+
+    assert sync.run() == [], "no node: nothing requested, nothing written"
+    assert client.requests == [] and core.patches == []
+
+    returning = _node(NEW, "i-0b000021", "10.0.36.21")
+    core.nodes[NEW] = returning
+
+    assert sync.run() == [NEW]
+    assert core.patches == [
+        {"metadata": {"resourceVersion": "41"}, "data": {NEW: _b64(KEY_NEW)}}
+    ]
+    assert core.secret["data"][DEPARTED] == _b64(KEY_OLD), (
+        "the departed node's key is neither rewritten nor deleted"
+    )
+
+
 def test_a_node_outside_the_site_scope_is_never_asked_for() -> None:
     unlabelled = _node(SIBLING, "i-0b000022", "10.0.40.17", labels={})
     core, evidence = _world(

@@ -28,8 +28,10 @@ on a node that joined live. A cluster whose GPU capacity no managed node group
 or instance group declares (Karpenter only) has no node to render from, so a
 release that rolls the Reconciler is refused while it has no node. No alert
 pages for a cluster that has lost every node once its Agents are retired:
-`status` shows it. `uninstall`, `remove-cluster` and `rotate-token` still need
-a node on that cluster.
+`status` shows it. The deploy's bootstrap provisions no node key for a cluster
+without nodes; that path is proven offline through the real bootstrap task
+graph with fake runners. `uninstall`, `remove-cluster` and `rotate-token` still
+need a node on that cluster, and so does configured node-key custody.
 
 ## Xid linkage and Drain P2P recovery
 

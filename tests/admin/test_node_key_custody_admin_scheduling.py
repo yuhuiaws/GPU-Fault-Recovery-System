@@ -6,7 +6,12 @@ from dataclasses import replace
 
 import pytest
 
-from gpu_fault.admin import bootstrap_common, bootstrap_services, bootstrap_tasks
+from gpu_fault.admin import (
+    bootstrap_common,
+    bootstrap_services,
+    bootstrap_tasks,
+    bootstrap_zero_nodes,
+)
 from gpu_fault.admin.bootstrap_checkpoint import bind_bootstrap_inputs
 from gpu_fault.admin.bootstrap_common import BootstrapRequest, BootstrapState
 from gpu_fault.admin.node_key_custody_admin import (
@@ -94,6 +99,8 @@ def test_configured_key_tasks_wait_for_release_and_run_serially_without_blocking
         return {"cluster_id": kwargs["cluster_id"]}
 
     monkeypatch.setattr(bootstrap_services, "provision_node_action_keys", keys)
+    # The clusters have nodes: no zero-node read (bootstrap_zero_nodes).
+    monkeypatch.setattr(bootstrap_zero_nodes, "zero_node_keys", lambda *_a, **_k: None)
     graph = bootstrap_tasks.platform_task_graph(
         runner=world,
         state=state,

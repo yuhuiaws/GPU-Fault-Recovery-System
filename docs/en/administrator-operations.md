@@ -3847,6 +3847,11 @@ the Agent-endpoint CIDR coverage has no node to cover.
 
 - its cluster-level components (executor, watcher, collector, DCGM exporter, data-plane ADOT, node installer reconciler) roll
   and are verified as on any cluster;
+- the deploy's bootstrap provisions no Node Action key there and keeps every key the cluster holds -- its `node_keys:<id>`
+  task says so: `zero-node-gpu-cluster <time> cluster=<id> state=parked step=node_keys recorded="no node, no key to
+  provision" reason="..."` -- and a node that joins later is keyed by the executor's node-key sync (§6), which adds the
+  missing names to the existing key Secret. A node list the bootstrap cannot read proves nothing: the task then runs and
+  refuses as before;
 - its node work is skipped and recorded: the Agent snapshot records an explicit entry with no identity and no node, and there
   is no node preflight batch, fleet rollout, Agent wave or Agent wait. The release log says so in one line per step, for
   example `zero-node-gpu-cluster <time> cluster=<id> state=parked phase=upgrade

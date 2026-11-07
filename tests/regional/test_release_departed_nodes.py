@@ -250,11 +250,72 @@ def test_a_not_ready_node_is_still_expected(monkeypatch: pytest.MonkeyPatch) -> 
     assert release.runner.calls == [], "nor looked up at the provider"
 
 
-def test_a_snapshot_whose_every_node_departed_verifies_nothing(
-    monkeypatch: pytest.MonkeyPatch,
+def with_instance_groups(handler: Any, *, target: int) -> Any:
+    """``handler`` plus the HyperPod ``describe-cluster`` of the parked proof:
+    the cluster's spot group at ``target`` instances, none of them present."""
+
+    def handle(arguments: list[str], kwargs: dict[str, Any]) -> str:
+        if arguments[:3] == ["aws", "sagemaker", "describe-cluster"]:
+            return json.dumps(
+                {
+                    "InstanceGroups": [
+                        {
+                            "InstanceGroupName": "gpu-spot-group",
+                            "InstanceType": "ml.p5en.48xlarge",
+                            "CurrentCount": 0,
+                            "TargetCount": target,
+                            "Status": "InService",
+                        }
+                    ]
+                }
+            )
+        return handler(arguments, kwargs)
+
+    return handle
+
+
+def test_a_snapshot_whose_every_node_departed_leaves_no_agent_to_verify(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """Every recorded node proven departed and the cluster selects none now --
+    it lost all of its nodes mid-release: like a cluster that started without
+    nodes (``regional_parked_cluster``), the rollback has no Agent to verify,
+    and says so instead of failing."""
+
     release, previous, target, _requests = hyperpod_fixture(
         monkeypatch, present=(), recorded=(GONE,), listed=()
+    )
+    release.runner.handler = with_instance_groups(aws_handler(listed=()), target=4)
+
+    validation.validate_agent_rollback_target(release, previous, target)
+
+    assert release.heartbeat_checks == [], "no Agent heartbeat is asked"
+    line = next(
+        item
+        for item in capsys.readouterr().err.splitlines()
+        if item.startswith("zero-node-gpu-cluster ")
+    )
+    for field in (
+        "cluster=gpu-a",
+        "state=unavailable",
+        "step=rollback_agent_identity",
+        'recorded="every recorded node departed; no Agent to verify"',
+    ):
+        assert field in line, line
+
+
+def test_every_recorded_node_departed_beside_a_joiner_still_verifies_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A node that joined since is not a cluster without nodes: the empty
+    recorded set still refuses."""
+
+    joiner = "hyperpod-i-000000000000b1"
+    release, previous, target, _requests = hyperpod_fixture(
+        monkeypatch,
+        present=(joiner,),
+        recorded=(GONE,),
+        listed=(joiner.removeprefix("hyperpod-"),),
     )
 
     with pytest.raises(ReleaseError, match="every recorded node departed"):

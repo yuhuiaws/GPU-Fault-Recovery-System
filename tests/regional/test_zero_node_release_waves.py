@@ -441,6 +441,48 @@ def test_a_resume_after_an_interrupted_wave_asks_nothing_of_the_parked_cluster(
         assert asked == {"gpu-a"}
 
 
+class LostNodesRelease(ResourceRelease):
+    """``gpu-eks`` lists no node now: its fleet node names refuse, as
+    ``target_node_names`` answers an empty node set."""
+
+    def _target_node_names(self, target: Any) -> tuple[str, ...]:
+        if target.cluster_id == "gpu-eks":
+            raise ReleaseError("gpu-eks has no GPU nodes for fleet rollout")
+        return self.node_names
+
+
+def test_a_resume_after_a_cluster_lost_every_node_mid_release_asks_nothing_of_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The snapshot recorded ``gpu-eks``'s node; it left and the cluster
+    selects none now. Its departure proven, the resume treats the cluster as
+    one without nodes -- its Reconciler checked, no Agent asked -- instead of
+    refusing on the empty node list."""
+
+    release = LostNodesRelease(("gpu-a", "gpu-eks"))
+    release.documents[("gpu-eks", "nodes", "")] = {"items": []}
+    previous = previous_snapshot(release)
+    recorded = tuple(previous["agent_identities"]["gpu-eks"]["node_ids"])
+    assert recorded, "the snapshot recorded the node that left"
+    proofs: list[tuple[str, tuple[str, ...]]] = []
+
+    def departed(_release: Any, target: Any, node_names: Any, **kwargs: Any) -> Any:
+        proofs.append((target.cluster_id, tuple(kwargs["present_node_names"])))
+        return frozenset(node_names)
+
+    monkeypatch.setattr(RESUME, "departed_node_ids", departed)
+
+    RESUME.validate_resume_checkpoint(
+        release,
+        loaded=_checkpoint(release, {"gpu-a": "CONVERGED", "gpu-eks": "CONVERGED"}),
+        previous=previous,
+        plan=ReleaseExecutionPlan(nodes=(ReleaseComponent.AGENT,)),
+    )
+
+    assert proofs == [("gpu-eks", ())], "the departure is proven, not presumed"
+    assert {item["cluster_id"] for item in release.heartbeat_checks} == {"gpu-a"}
+
+
 # --- a FULL release over the parked cluster, then its rollback ----------------------
 
 FULL_GPU = (

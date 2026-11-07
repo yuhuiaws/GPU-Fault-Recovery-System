@@ -23,7 +23,7 @@ import yaml
 
 from gpu_fault.admin import bootstrap as admin_bootstrap
 from gpu_fault.admin import bootstrap_services as admin_bootstrap_services
-from gpu_fault.admin import bootstrap_tasks
+from gpu_fault.admin import bootstrap_tasks, bootstrap_zero_nodes
 from gpu_fault.admin import cli as admin_cli
 from gpu_fault.admin import notification_bootstrap as admin_notification_bootstrap
 from gpu_fault.admin.bootstrap_checkpoint import bind_bootstrap_inputs
@@ -87,6 +87,8 @@ def test_platform_tasks_start_grafana_without_waiting_for_the_release(
     monkeypatch.setattr(
         admin_bootstrap_services, "provision_node_action_keys", lambda *_a, **_k: {}
     )
+    # The clusters have nodes: no zero-node read (bootstrap_zero_nodes).
+    monkeypatch.setattr(bootstrap_zero_nodes, "zero_node_keys", lambda *_a, **_k: None)
 
     # The platform graph reads its foundation inputs from the state at task
     # start, so the two it depends on are recorded as an earlier run would have.

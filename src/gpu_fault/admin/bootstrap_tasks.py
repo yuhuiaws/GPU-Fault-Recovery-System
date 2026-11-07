@@ -222,6 +222,7 @@ def platform_task_graph(
     only on detected drift. The release task always joins the current build.
     """
 
+    from gpu_fault.admin import bootstrap_zero_nodes
     from gpu_fault.admin.bootstrap_services import (
         ensure_grafana_dashboards,
         install_aurora_refresh,
@@ -302,7 +303,16 @@ def platform_task_graph(
             def node_key_task(
                 cluster: ClusterIdentity = cluster,
                 cluster_id: str = cluster_id,
-            ) -> dict[str, str]:
+            ) -> dict[str, Any]:
+                # No node, proven in this run: no key to provision (keys kept).
+                skipped = bootstrap_zero_nodes.zero_node_keys(
+                    task_runner,
+                    gpu_kubeconfig=gpu_kubeconfig,
+                    cluster=cluster,
+                    cluster_id=cluster_id,
+                )
+                if skipped is not None:
+                    return skipped
                 custody_arguments: dict[str, Any] = {}
                 if custody is not None:
                     from gpu_fault.admin.bootstrap_common import (

@@ -231,6 +231,20 @@ def _require_ready_deployment(
     return deployment
 
 
+def _live_node_names(release: Any, target: Any) -> tuple[str, ...]:
+    """The cluster's nodes now: the fleet's node names, which refuse an empty
+    set -- then none when the selector selects no node
+    (``regional_parked_cluster.zero_nodes_now``), for the departure proof to
+    judge the recorded ones; any other refusal stands."""
+
+    try:
+        return tuple(release._target_node_names(target))
+    except ReleaseError:
+        if parked_cluster.zero_nodes_now(release, target) is None:
+            raise
+        return ()
+
+
 def _validate_candidate_components(
     release: Any,
     target: Any,
@@ -535,9 +549,7 @@ def validate_resume_checkpoint(
         )
         if not node_names and not zero_nodes:
             raise ReleaseError(f"{target.cluster_id} resume previous node set is empty")
-        live_names = (
-            node_names if zero_nodes else tuple(release._target_node_names(target))
-        )
+        live_names = node_names if zero_nodes else _live_node_names(release, target)
         if set(live_names) < set(node_names):
             # Recorded nodes the cluster lost mid-release: only a proven
             # departure narrows the set; anything else is drift.
@@ -552,6 +564,9 @@ def validate_resume_checkpoint(
             node_names = tuple(name for name in node_names if name not in departed)
         if set(live_names) != set(node_names):
             raise ReleaseError(f"{target.cluster_id} resume node set drifted")
+        # Every recorded node proven departed and none selected now: the
+        # cluster's node work is the zero-node path's from here on.
+        zero_nodes = zero_nodes or not live_names
         if target.cluster_id in completed:
             _validate_candidate_components(
                 release,

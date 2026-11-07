@@ -1180,6 +1180,24 @@ def validate_agent_rollback_target(
     )
     expected = tuple(sorted(name for name in node_names if name not in departed))
     if not expected:
+        # Every recorded node departed (proven above) and the cluster selects
+        # none now: a cluster without nodes, whatever it had when the release
+        # started -- there is no Agent to verify, as for one that started
+        # without a node. A node that joined since keeps the refusal.
+        proof = (
+            None
+            if kubernetes_node_names(items)
+            else parked_cluster.zero_nodes_now(release, target)
+        )
+        if proof is not None:
+            parked_cluster.narrate(
+                target.cluster_id,
+                state=parked_cluster.state_of(proof),
+                step="rollback_agent_identity",
+                recorded="every recorded node departed; no Agent to verify",
+                reason=str(proof.get("reason")),
+            )
+            return
         raise ReleaseError(
             f"{target.cluster_id} rollback Agent node set is empty: every recorded "
             "node departed"
