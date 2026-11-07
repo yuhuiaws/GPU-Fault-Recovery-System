@@ -30,19 +30,47 @@ rung. The ticket's reason names the problem: ``RESTART_NODE not submitted,
 isolation not observed: spec.unschedulable is not true``. No REPLACE_NODE, no
 reboot, no warm spare.
 
-The window between the successor's QUARANTINE and its RESTART_NODE's isolation
-read is small -- a few tens of milliseconds to a couple of seconds, bounded by
-the GPU-cluster executor's claim of the reboot remote command (P13 attempt 2,
-2026-11-06: QUARANTINE and RESTART_NODE were recorded about 0.03 s apart and the
-provider submission followed the dispatch by about 10 s). So this is a race, and
-the two misses are INCONCLUSIVE, never FAIL:
+Timing (established from the R23 P13 records and the product code, not a
+guess). RESTART_NODE on a regional HyperPod/EKS cluster is a remote command
+(``regional.RegionalRemoteWorkflowAdapter``): the control plane mints it right
+after QUARANTINE (P13 attempt 2: 26 ms after QUARANTINE's step completed) and
+the GPU-cluster executor claims it over a NOTIFY-woken 20 s long-poll
+(``app/remote_command_wakeups.py``; ``cluster_executor`` default
+``claim_wait_seconds=20``), so the claim is sub-second in a healthy system and
+only degrades to the ~2 s poll if the wakeup listener is down. ``_observe
+_isolation`` is the adapter's first action on that claim
+(``lifecycle.execute`` -> ``require_mutation_ownership`` ->
+``_observe_isolation``, before the DescribeCluster preflight that accounts for
+the ~10 s to the provider submission). So the window from QUARANTINE SUCCEEDED
+to the isolation read is **sub-second**, and QUARANTINE itself does not mutate
+the node (its MARK_UNSCHEDULABLE already set the cordon, taint and annotation;
+P13: QUARANTINE's node resource version is unchanged before/after) and does not
+verify the cordon after its patch (``node_operations._isolate`` re-reads for the
+baseline but never fails on the cordon), so a cordon-only lift can never fail
+QUARANTINE -- a lift that lands before QUARANTINE is simply re-cordoned.
 
-* the lift landed before QUARANTINE succeeded and QUARANTINE's own verification
-  failed -- the pre-existing containment path, not 82f7b77;
-* RESTART_NODE submitted (and the node rebooted) before the lift -- the reboot
-  is the ``post_repair_failure`` exit, graded clean across the boot by the
-  same reboot-aware cleanup (``EfaDriverFixture.release`` -> the boot id and the
-  product's post-boot inventory).
+Because the window is sub-second, a store-poll trigger (one read is a kubectl
+exec, ~1-3 s) cannot win and would reboot the node every run. The trigger is
+therefore a fast node-read HOLD (``hold_cordon_lifted``): once the node carries
+a *successor* incident's ownership annotation (the reboot-after incident, which
+takes the node over from the source EFA incident at its MARK_UNSCHEDULABLE) and
+is cordoned, it lifts the cordon and keeps re-lifting (bounded by
+``LIFT_CAP``, cordon-only) while that same successor owns the cordoned node, so
+the cordon is down whenever the reboot rung's ``_observe_isolation`` reads it.
+It stops the moment a *different* successor re-isolates the node (the
+support-after of the refused reboot -- the window was met) or the node reboots
+(boot id change -- the lift lost the race). This relaxes the brief's literal
+"one-shot" to a bounded cordon-only hold, the only way to beat a sub-second
+window from outside the cluster; the quarantine taint, the incident annotation
+and the fencing token are never touched. Expected hit rate is moderate, not
+certain: a miss is a clean reboot (the ``post_repair_failure`` exit, graded
+across the boot by ``EfaDriverFixture.release``), never a FAIL. Both race
+misses stay INCONCLUSIVE:
+
+* a different successor never appears and the node reboots -- RESTART_NODE's
+  observe read a cordoned node before the hold could lift it;
+* QUARANTINE itself FAILED (a patch-retry exhaustion under the hold) -- the
+  pre-existing containment path, not 82f7b77.
 
 The variant is generation-gated: without 82f7b77 in the running control plane it
 is NOT_RUN (``require_isolation_refusal_generation``, a read-only probe in an
@@ -57,10 +85,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from scripts.e2e.regional.general_live_common import (
-    activity,
-    wait_for_incident,
-)
+from gpu_fault.adapters.common import ANNOTATION_INCIDENT
+
+from scripts.e2e.regional.general_live_common import wait_for_incident
 from scripts.e2e.regional.general_live_efa_driver import (
     DETECTION_BUDGET,
     EFA_DRIVER_UNBIND,
@@ -145,12 +172,18 @@ print(json.dumps(result, sort_keys=True, default=str))
 
 #: The trap window reused from ``post_repair_failure``.
 TRAP_WINDOW = DETECTION_BUDGET + 180
-#: How fast the cordon-lift watch polls the store for the reboot successor's
-#: QUARANTINE. The control-plane QUARANTINE -> RESTART_NODE gap is ~0.03 s and
-#: the provider submission follows the dispatch by ~10 s (P13 attempt 2), far
-#: below one store read, so the watch runs as fast as the read answers; a miss
-#: is a race, graded INCONCLUSIVE.
-LIFT_POLL_SECONDS = 0.25
+#: The cordon-hold reads the node directly (no store in the hot path), as fast
+#: as a ``kubectl get node`` answers; the sub-second QUARANTINE -> observe window
+#: (see the module docstring) is far below one store read, so the store is never
+#: on the trigger path. A ``get node`` is ~0.3 s, so the effective cadence is
+#: well under a second.
+NODE_POLL_SECONDS = 0.2
+#: How many cordon lifts the hold will issue for one run. The reboot-after
+#: successor's own QUARANTINE re-cordons a lift that landed before it, so the
+#: hold must be able to lift again; the cap bounds any pathological loop (a
+#: support-after re-isolation the hold has not yet recognised) to a handful of
+#: cordon-only patches.
+LIFT_CAP = 5
 
 
 def require_isolation_refusal_generation(ctx: VariantContext) -> dict[str, Any]:
@@ -178,17 +211,18 @@ def require_isolation_refusal_generation(ctx: VariantContext) -> dict[str, Any]:
 
 
 def lift_cordon(ctx: VariantContext, record: dict[str, Any]) -> dict[str, Any]:
-    """One-shot: set ``spec.unschedulable=false`` on the case node.
+    """Set ``spec.unschedulable=false`` on the case node (one cordon lift).
 
     A JSON merge patch that names only ``spec.unschedulable`` -- the quarantine
     taint, the ``gpu-fault.io/`` ownership annotations and the fencing token are
     not in the patch and are left exactly as the product wrote them (the
-    equivalent of ``kubectl uncordon``). Recorded once; ``record['lifted']``
-    guards the one shot.
+    equivalent of ``kubectl uncordon``). Each call appends to ``record['lifts']``
+    (the hold may re-lift after the successor's QUARANTINE re-cordons); it reads
+    nothing (the hold already holds the node reading that triggered it), so a
+    re-lift costs one patch, not a node round-trip.
     """
 
     node = ctx.settings.node
-    before = ctx.regional.node_snapshot(node)
     ctx.regional.kubectl(
         "gpu",
         "patch",
@@ -199,106 +233,76 @@ def lift_cordon(ctx: VariantContext, record: dict[str, Any]) -> dict[str, Any]:
         json.dumps({"spec": {"unschedulable": False}}),
         timeout=60,
     )
-    after = ctx.regional.node_snapshot(node)
     lift = {
         "node": node,
         "lifted_at": utc_now().isoformat(),
         "patch": {"spec": {"unschedulable": False}},
-        "before": _cordon_view(before),
-        "after": _cordon_view(after),
     }
-    record["lifted"] = True
-    record["lift"] = lift
-    ctx.evidence.write("efa-driver-cordon-lift", lift)
+    record.setdefault("lifts", []).append(lift)
     return lift
 
 
-def _cordon_view(node: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "unschedulable": bool(node.get("unschedulable")),
-        "taint_keys": sorted(
-            str(item.get("key"))
-            for item in node.get("taints") or []
-            if str(item.get("key") or "").startswith("gpu-fault.io/")
-        ),
-        "ownership_annotations": sorted((node.get("ownership_annotations") or {})),
-    }
-
-
-def reboot_after_quarantine_state(observed: dict[str, Any], source_id: str) -> str:
-    """Where the reboot-after successor is, for the cordon-lift watch.
-
-    ``pending`` (no successor yet, or its QUARANTINE has not SUCCEEDED),
-    ``quarantine_failed`` (its MARK_UNSCHEDULABLE / QUARANTINE FAILED -- the
-    early race), ``window`` (QUARANTINE SUCCEEDED and RESTART_NODE has not
-    submitted -- lift now), ``refused`` (RESTART_NODE already FAILED: the
-    window was met), or ``rebooted`` (RESTART_NODE SUCCEEDED or submitted a
-    provider action -- the late race).
-    """
-
-    successors = reboot_successors(observed, source_id) if source_id else []
-    if not successors:
-        return "pending"
-    reboot = successors[0]
-    steps = reboot.get("step_executions") or []
-    quarantine_done = any(
-        item.get("operation") == QUARANTINE and item.get("status") == "SUCCEEDED"
-        for item in steps
-    )
-    if not quarantine_done:
-        if any(
-            item.get("operation") in (QUARANTINE, MARK_UNSCHEDULABLE)
-            and item.get("status") == "FAILED"
-            for item in steps
-        ):
-            return "quarantine_failed"
-        return "pending"
-    restarts = [item for item in steps if item.get("operation") == RESTART_NODE]
-    if not restarts:
-        return "window"
-    restart = restarts[-1]
-    details = restart.get("details") or {}
-    if restart.get("status") == "SUCCEEDED" or details.get("submitted_nodes"):
-        return "rebooted"
-    if restart.get("status") == "FAILED":
-        return "refused"
-    return "window"
-
-
-def _await_quarantine_and_lift(
-    ctx: VariantContext, since: Any, source_id: str, *, window: float
+def hold_cordon_lifted(
+    ctx: VariantContext,
+    *,
+    source_incident_id: str,
+    baseline_boot: str,
+    window: float,
 ) -> dict[str, Any]:
-    """Watch the store and lift the cordon once in the window.
+    """Hold the case node's cordon lifted across the reboot-after successor's
+    isolation steps so its RESTART_NODE's ``_observe_isolation`` reads it
+    uncordoned.
 
-    Fires ``lift_cordon`` the first time the reboot-after successor shows
-    QUARANTINE SUCCEEDED with RESTART_NODE not yet submitted, and returns as
-    soon as the window closes one way or another (lifted, refused, rebooted,
-    quarantine_failed). The lift is one-shot (``record['lifted']``); the reads
-    start from the fixture's own ``since`` so the successor stays visible.
+    Reads only the node (no store in the hot path). The reboot-after successor
+    takes the node over from the source EFA incident at its MARK_UNSCHEDULABLE,
+    stamping its own ownership annotation; the instant the node carries a
+    successor incident (``!= source_incident_id``) and is cordoned, lift the
+    cordon, and keep re-lifting (bounded by :data:`LIFT_CAP`) while that same
+    successor owns the cordoned node -- its own QUARANTINE re-cordons a lift
+    that landed before it, so a single lift would be undone. Stop when a
+    *different* successor re-isolates the node (the support-after of the refused
+    reboot: the window was met), when the node reboots (boot id change: the lift
+    lost the race), or when ``window`` elapses. Cordon-only throughout.
     """
 
-    record: dict[str, Any] = {"lifted": False, "states": []}
+    record: dict[str, Any] = {"lifts": [], "stopped": None, "successor_incident": None}
 
     def accept() -> dict[str, Any] | None:
-        current = activity(ctx, since, metrics=EFA_METRICS)
-        state = reboot_after_quarantine_state(current, source_id)
-        record["states"].append(state)
-        record["last_state"] = state
-        if state == "window" and not record["lifted"]:
-            lift_cordon(ctx, record)
+        node = ctx.regional.node_snapshot(ctx.settings.node)
+        boot = str(node.get("boot_id") or "")
+        annotation = (node.get("ownership_annotations") or {}).get(ANNOTATION_INCIDENT)
+        unschedulable = bool(node.get("unschedulable"))
+        record["last"] = {
+            "incident": annotation,
+            "unschedulable": unschedulable,
+            "boot_id": boot,
+        }
+        if baseline_boot and boot and boot != baseline_boot:
+            record["stopped"] = "rebooted"
             return record
-        if state in ("refused", "rebooted", "quarantine_failed"):
-            record["closed"] = state
-            return record
+        if annotation and annotation != source_incident_id:
+            if record["successor_incident"] is None:
+                record["successor_incident"] = annotation
+            if annotation != record["successor_incident"]:
+                # A later successor re-isolated the node: the support-after of
+                # the refused reboot. The reboot rung's observe already ran.
+                record["stopped"] = "handed_over"
+                return record
+            if unschedulable:
+                if len(record["lifts"]) >= LIFT_CAP:
+                    record["stopped"] = "lift_cap"
+                    return record
+                lift_cordon(ctx, record)
         return None
 
     ctx.wait_until(
         accept,
         timeout_seconds=window,
-        poll_seconds=LIFT_POLL_SECONDS,
-        name="lifted-quarantine-watch",
+        poll_seconds=NODE_POLL_SECONDS,
+        name="lifted-cordon-hold",
     )
-    ctx.evidence.write("efa-driver-cordon-lift-watch", record)
+    record["stopped"] = record["stopped"] or "window"
+    ctx.evidence.write("efa-driver-cordon-hold", record)
     return record
 
 
@@ -345,8 +349,13 @@ def post_repair_isolation_lifted(ctx: VariantContext) -> dict[str, Any]:
         )
     incidents[:] = _incidents_on_node(detection, node)
     source = efa_chain(detection)
-    source_id = str(source[1].get("request_id")) if source else ""
-    lift = _await_quarantine_and_lift(ctx, started, source_id, window=TRAP_WINDOW + 120)
+    source_incident_id = str(source[0].get("incident_id")) if source else ""
+    lift = hold_cordon_lifted(
+        ctx,
+        source_incident_id=source_incident_id,
+        baseline_boot=baseline_boot,
+        window=TRAP_WINDOW + 120,
+    )
     recovered, observed, node_now, pair, settled = _settle(
         ctx,
         started=started,
@@ -447,8 +456,9 @@ def grade_isolation_lifted(
             )
         raise VariantInconclusive(
             "the reboot-after RESTART_NODE did not refuse for want of observed "
-            f"isolation (last watch state {lift.get('last_state')!r}); the lift did "
-            "not land in the QUARANTINE->RESTART_NODE window"
+            f"isolation (cordon hold stopped {lift.get('stopped')!r} after "
+            f"{len(lift.get('lifts') or [])} lift(s)); the lift did not land in the "
+            "QUARANTINE->RESTART_NODE window"
         )
 
     stages = {
@@ -483,8 +493,8 @@ def grade_isolation_lifted(
             "pci_bdf": bdf,
             "expected_count": expected,
             "baseline_boot_id": baseline_boot,
-            "cordon_lift": lift.get("lift"),
-            "cordon_lift_states": lift.get("states"),
+            "cordon_lifts": lift.get("lifts"),
+            "cordon_hold_stopped": lift.get("stopped"),
             "refused_restart": {
                 "status": refused.get("status"),
                 "error": str(refused.get("error") or "")[:200],
@@ -549,8 +559,8 @@ __all__ = [
     "GENERATION_PROBE",
     "VARIANTS",
     "grade_isolation_lifted",
+    "hold_cordon_lifted",
     "lift_cordon",
     "post_repair_isolation_lifted",
-    "reboot_after_quarantine_state",
     "require_isolation_refusal_generation",
 ]

@@ -222,7 +222,7 @@ def _grade(doc: dict[str, Any], node: dict[str, Any], *, boot: str = BASE_BOOT):
         bdf=BDF,
         expected=16,
         baseline_boot=boot,
-        lift={"last_state": "window", "states": ["pending", "window"]},
+        lift={"stopped": "handed_over", "lifts": [{"patch": {}}]},
         oracle=[{"module_loaded": True, "bound_count": 16}],
     )
 
@@ -250,82 +250,130 @@ def test_variant_is_registered_native_dangerous_in_its_own_module() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# the cordon-lift trigger
+# lift_cordon: cordon only
 # --------------------------------------------------------------------------- #
-def test_trigger_fires_only_after_quarantine_and_before_restart_submits() -> None:
-    src = RECORD
-    # before QUARANTINE succeeds -> pending
-    before = _doc(reboot_after=_reboot_after(restart=None, steps_done=2))
-    assert mod.reboot_after_quarantine_state(before, src) == "pending"
-    # QUARANTINE succeeded, RESTART_NODE not present -> window
-    window = _doc(reboot_after=_reboot_after(restart=None))
-    assert mod.reboot_after_quarantine_state(window, src) == "window"
-    # RESTART_NODE present but still PENDING (not submitted) -> window
-    pending_restart = _doc(
-        reboot_after=_reboot_after(
-            restart=_ex("RESTART_NODE", "WAITING", 3, {"remote_status": "PENDING"})
-        )
+def _snap(incident: str | None, unschedulable: bool, *, boot: str = BASE_BOOT):
+    taints = (
+        [{"key": QUARANTINE_TAINT, "value": incident, "effect": "NoSchedule"}]
+        if incident
+        else []
     )
-    assert mod.reboot_after_quarantine_state(pending_restart, src) == "window"
-    # RESTART_NODE submitted to the provider -> rebooted (late)
-    submitted = _doc(
-        reboot_after=_reboot_after(
-            restart=_ex("RESTART_NODE", "WAITING", 3, {"submitted_nodes": [NODE]})
-        )
-    )
-    assert mod.reboot_after_quarantine_state(submitted, src) == "rebooted"
-    # cordon/quarantine step failed -> quarantine_failed (early)
-    early = _doc(reboot_after=_reboot_after(restart=None, steps_done=2))
-    early["workflows"][1]["step_executions"][1]["status"] = "FAILED"
-    assert mod.reboot_after_quarantine_state(early, src) == "quarantine_failed"
-    # the refusal already landed -> refused
-    refused = _doc(reboot_after=_reboot_after(restart=_refused_restart()))
-    assert mod.reboot_after_quarantine_state(refused, src) == "refused"
+    return {
+        "name": NODE,
+        "boot_id": boot,
+        "ready": "True",
+        "unschedulable": unschedulable,
+        "taints": taints,
+        "ownership_annotations": {ANNOTATION_INCIDENT: incident} if incident else {},
+    }
 
 
-# --------------------------------------------------------------------------- #
-# lift_cordon: one-shot, cordon only
-# --------------------------------------------------------------------------- #
-def _lift_ctx(tmp_path: Path):
-    regional = FakeRegional(node_snapshot=_node(reisolated=True))
+class _SeqRegional(FakeRegional):
+    """A FakeRegional whose node_snapshot walks a scripted sequence (the last
+    reading repeats), recording every kubectl patch."""
+
+    def __init__(self, snapshots, **kwargs):
+        super().__init__(node_snapshot=snapshots[0], **kwargs)
+        self._snaps = list(snapshots)
+        self._i = 0
+
+    def node_snapshot(self, node: str):
+        snap = self._snaps[min(self._i, len(self._snaps) - 1)]
+        self._i += 1
+        return dict(snap)
+
+
+def _ctx_for(regional, tmp_path: Path):
     return make_context(
         SPEC,
         tmp_path=tmp_path,
         regional=regional,
         probes={},
         settings=make_settings(SPEC, node=NODE),
-    ), regional
+    )
 
 
 def test_lift_patches_only_the_cordon(tmp_path: Path) -> None:
-    ctx, regional = _lift_ctx(tmp_path)
-    record: dict[str, Any] = {"lifted": False}
+    regional = FakeRegional(node_snapshot=_node(reisolated=True))
+    ctx = _ctx_for(regional, tmp_path)
+    record: dict[str, Any] = {}
     mod.lift_cordon(ctx, record)
-    assert record["lifted"] is True
+    assert len(record["lifts"]) == 1, record
     assert len(regional.kubectl_calls) == 1
     call = regional.kubectl_calls[0]
     assert call[0] == "gpu" and call[1] == "patch" and call[2] == "node"
     assert call[3] == NODE
-    # The patch is a merge patch naming only spec.unschedulable=false: it does
-    # not mention taints, metadata, annotations or fencing.
+    # A merge patch naming only spec.unschedulable=false: it does not mention
+    # taints, metadata, annotations or fencing.
     payload = call[call.index("-p") + 1]
     assert '"unschedulable": false' in payload
     assert "taints" not in payload and "metadata" not in payload
     assert "annotations" not in payload and "fencing" not in payload
-    assert record["lift"]["patch"] == {"spec": {"unschedulable": False}}
+    assert record["lifts"][0]["patch"] == {"spec": {"unschedulable": False}}
 
 
-def test_lift_is_one_shot(tmp_path: Path) -> None:
-    ctx, regional = _lift_ctx(tmp_path)
-    record: dict[str, Any] = {"lifted": False}
-    mod.lift_cordon(ctx, record)
-    # The watch only lifts while record['lifted'] is False; a second poll in the
-    # window must not patch again.
-    assert record["lifted"] is True
-    # Simulate the guard the watch applies.
-    if not record["lifted"]:  # pragma: no cover - the guard is False here
-        mod.lift_cordon(ctx, record)
-    assert len(regional.kubectl_calls) == 1
+# --------------------------------------------------------------------------- #
+# the cordon-hold trigger (fast node reads)
+# --------------------------------------------------------------------------- #
+SOURCE_INC = "inc-efa"
+
+
+def test_hold_lifts_on_the_successor_and_stops_when_handed_over(tmp_path: Path) -> None:
+    # source-owned (no lift) -> reboot-after cordoned (lift) -> QUARANTINE
+    # re-cordoned my lift (lift again) -> support-after re-isolated (stop).
+    regional = _SeqRegional(
+        [
+            _snap(SOURCE_INC, True),
+            _snap(REBOOT_INCIDENT, True),
+            _snap(REBOOT_INCIDENT, True),
+            _snap(SUPPORT_INCIDENT, True),
+        ]
+    )
+    ctx = _ctx_for(regional, tmp_path)
+    record = mod.hold_cordon_lifted(
+        ctx, source_incident_id=SOURCE_INC, baseline_boot=BASE_BOOT, window=600
+    )
+    assert record["stopped"] == "handed_over", record
+    assert record["successor_incident"] == REBOOT_INCIDENT
+    assert len(record["lifts"]) == 2, record
+    # Never lifted while the source incident still owned the node.
+    assert len(regional.kubectl_calls) == 2
+
+
+def test_hold_stops_on_a_reboot(tmp_path: Path) -> None:
+    regional = _SeqRegional(
+        [_snap(REBOOT_INCIDENT, True), _snap(REBOOT_INCIDENT, True, boot="boot-after")]
+    )
+    ctx = _ctx_for(regional, tmp_path)
+    record = mod.hold_cordon_lifted(
+        ctx, source_incident_id=SOURCE_INC, baseline_boot=BASE_BOOT, window=600
+    )
+    assert record["stopped"] == "rebooted", record
+    assert len(record["lifts"]) == 1
+
+
+def test_hold_is_bounded_by_the_lift_cap(tmp_path: Path) -> None:
+    # A node the successor keeps re-cordoning forever is bounded to LIFT_CAP.
+    regional = _SeqRegional([_snap(REBOOT_INCIDENT, True)])
+    ctx = _ctx_for(regional, tmp_path)
+    record = mod.hold_cordon_lifted(
+        ctx, source_incident_id=SOURCE_INC, baseline_boot=BASE_BOOT, window=600
+    )
+    assert record["stopped"] == "lift_cap"
+    assert len(record["lifts"]) == mod.LIFT_CAP
+
+
+def test_hold_never_lifts_while_the_source_incident_owns_the_node(
+    tmp_path: Path,
+) -> None:
+    regional = _SeqRegional([_snap(SOURCE_INC, True)])
+    ctx = _ctx_for(regional, tmp_path)
+    record = mod.hold_cordon_lifted(
+        ctx, source_incident_id=SOURCE_INC, baseline_boot=BASE_BOOT, window=2
+    )
+    assert record["stopped"] == "window"
+    assert record["lifts"] == []
+    assert regional.kubectl_calls == []
 
 
 # --------------------------------------------------------------------------- #
