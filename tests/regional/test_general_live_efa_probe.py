@@ -7,15 +7,19 @@ inventory, the safety preconditions that refuse to touch the node unless
 exactly one spare function is safe, the deadman arming that fails closed, the
 release that restores the baseline or fails loudly, the kernel's own
 ``driver_override`` read-back that both variants must accept, the trap that
-waits for the fixture's unbind before the product's bind, and the failure line
-the host fixture turns into the case's ``probe-error.json``.
+waits for the fixture's unbind before the product's bind and then re-unbinds on
+the product's post-repair snapshot (the host collector's restart, read-only;
+never before its floor, on the grace when no restart shows), and the failure
+line the host fixture turns into the case's ``probe-error.json``.
 """
 
 from __future__ import annotations
 
+import filecmp
 import hashlib
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -447,7 +451,9 @@ def test_trap_run_waits_for_the_fixture_s_unbind_before_the_product_s_bind(
 ) -> None:
     """The trap is armed while the baseline binding still stands (state first,
     then the unbind): bound, bound, unbound (the fixture), unbound, bound (the
-    product). It fires once, after the grace, after the product's bind."""
+    product). It fires once, after the product's bind -- here on the grace
+    fallback, the scripted ``systemctl`` showing a collector that never
+    restarts."""
 
     script, pauses = _scripted_trap(
         tmp_path, monkeypatch, [True, True, False, False, True]
@@ -458,9 +464,15 @@ def test_trap_run_waits_for_the_fixture_s_unbind_before_the_product_s_bind(
     assert (probe.driver_root() / "unbind").read_text() == BDF_A + "\n"
     # Polls 1-5 saw no unbind write of ours; only the receipt's poll (6) does.
     assert script.unbind_seen_at == [6]
-    assert pauses == [1, 1, 1, 5], "two baseline polls, one unbound poll, the grace"
+    assert pauses[:3] == [1, 1, probe.BIND_POLL_SECONDS], (
+        "two baseline polls, then the short poll for the product's bind"
+    )
+    assert set(pauses[3:]) == {probe.COLLECTOR_POLL_SECONDS}, (
+        "then only the collector watch's short polls, no fixed sleep"
+    )
     fired = json.loads((probe.state_dir(RUN) / "trap-fired").read_text())
     assert fired["fired"] is True
+    assert fired["trigger"] == probe.TRIGGER_GRACE_FALLBACK
 
 
 def test_trap_run_never_unbinds_a_function_that_stayed_bound(
@@ -479,6 +491,349 @@ def test_trap_run_never_unbinds_a_function_that_stayed_bound(
     fired = json.loads((probe.state_dir(RUN) / "trap-fired").read_text())
     assert fired["fired"] is False
     assert fired["reason"] == "unbind not observed"
+
+
+# --------------------------------------------------------------------------- #
+# The re-unbind fires on the product's post-repair snapshot
+# --------------------------------------------------------------------------- #
+#: ``systemctl show`` of the host collector before and after the restart the
+#: product's TRIGGER_HEALTH_SNAPSHOT runs: a new invocation, main process,
+#: main-process start and activation.
+COLLECTOR_RUNNING = {
+    "LoadState": "loaded",
+    "ActiveState": "active",
+    "SubState": "running",
+    "InvocationID": "a" * 32,
+    "MainPID": "4242",
+    "ExecMainStartTimestampMonotonic": "1000000",
+    "ActiveEnterTimestampMonotonic": "1900000",
+}
+COLLECTOR_RESTARTED = {
+    **COLLECTOR_RUNNING,
+    "InvocationID": "b" * 32,
+    "MainPID": "4343",
+    "ExecMainStartTimestampMonotonic": "9000000",
+    "ActiveEnterTimestampMonotonic": "9800000",
+}
+#: The scripted run below: the fixture's unbind lands at t=1, the product's
+#: bind at t=3 (the trap's 1 s unbind poll and 0.25 s bind poll see each one
+#: exactly then).
+BIND_AT = 3.0
+
+
+class SnapshotWorld:
+    """One trap run on a clock only ``pause`` advances.
+
+    The function is bound until t=1 (the fixture's own unbind), bound again
+    from ``BIND_AT`` (the product's REMEDIATE_EFA_DRIVER) and unbound for good
+    once the trap's unbind write exists; ``reunbound_at`` is when the trap
+    first read its own unbind back (the record's ``bound``, right after the
+    write). ``systemctl show`` of the host collector answers
+    ``COLLECTOR_RUNNING`` until ``restart_at`` and ``COLLECTOR_RESTARTED``
+    from then on, or times out on every read (``collector_fails``). Every
+    command is kept with its time.
+    """
+
+    def __init__(
+        self,
+        unbind_file: Path,
+        *,
+        restart_at: float | None = None,
+        collector_fails: bool = False,
+    ) -> None:
+        self.now = 0.0
+        self.pauses: list[float] = []
+        self.commands: list[tuple[float, list[str]]] = []
+        self.unbind_file = unbind_file
+        self.restart_at = restart_at
+        self.collector_fails = collector_fails
+        self.reunbound_at: float | None = None
+
+    def monotonic_clock(self) -> float:
+        return self.now
+
+    def pause(self, seconds: float) -> None:
+        self.pauses.append(seconds)
+        self.now = round(self.now + seconds, 6)
+
+    def bound_now(self) -> bool:
+        if self.unbind_file.exists():
+            if self.reunbound_at is None:
+                self.reunbound_at = self.now
+            return False
+        return self.now < 1.0 or self.now >= BIND_AT
+
+    def is_bound(self, bdf: str) -> bool:
+        return self.bound_now()
+
+    def bound_driver(self, bdf: str) -> str | None:
+        return "efa" if self.bound_now() else None
+
+    def run(
+        self, command: list[str], *, check: bool = True, timeout: int = 120
+    ) -> subprocess.CompletedProcess[str]:
+        self.commands.append((self.now, list(command)))
+        stdout = ""
+        if command[:3] == ["systemctl", "show", probe.SNAPSHOT_COLLECTOR_UNIT]:
+            if self.collector_fails:
+                raise subprocess.TimeoutExpired(command, timeout)
+            restarted = self.restart_at is not None and self.now >= self.restart_at
+            state = COLLECTOR_RESTARTED if restarted else COLLECTOR_RUNNING
+            stdout = "".join(f"{key}={value}\n" for key, value in state.items())
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    def collector_commands(self) -> list[tuple[float, list[str]]]:
+        return [
+            (at, argv)
+            for at, argv in self.commands
+            if probe.SNAPSHOT_COLLECTOR_UNIT in argv
+        ]
+
+
+def _snapshot_trap(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    grace: int = 5,
+    floor: int = 1,
+    restart_at: float | None = None,
+    collector_fails: bool = False,
+) -> tuple[SnapshotWorld, dict[str, Any]]:
+    _tree(tmp_path, monkeypatch)
+    world = SnapshotWorld(
+        probe.driver_root() / "unbind",
+        restart_at=restart_at,
+        collector_fails=collector_fails,
+    )
+    for name in ("monotonic_clock", "pause", "is_bound", "bound_driver", "run"):
+        monkeypatch.setattr(probe, name, getattr(world, name))
+    probe.trap_run(
+        _ns(
+            run_id=RUN,
+            pci_bdf=BDF_A,
+            grace_seconds=grace,
+            floor_seconds=floor,
+            trap_window_seconds=60,
+        )
+    )
+    record = json.loads((probe.state_dir(RUN) / "trap-fired").read_text())
+    assert (probe.driver_root() / "unbind").read_text() == BDF_A + "\n"
+    return world, record
+
+
+def test_the_trap_re_unbinds_the_moment_the_snapshot_collector_restarts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The live order of 2026-11-06: the product's bind, its SUCCEEDED receipt,
+    then TRIGGER_HEALTH_SNAPSHOT restarting the host collector 1.4 s after the
+    bind -- and that collector's first tick about two seconds later, sooner than
+    the old fixed 5 s grace. The trap re-unbinds at the restart itself, so that
+    first tick reads the function unbound, and says so in its record."""
+
+    world, record = _snapshot_trap(tmp_path, monkeypatch, restart_at=BIND_AT + 1.4)
+    assert world.reunbound_at == BIND_AT + 1.4, world.pauses
+    assert record["fired"] is True
+    assert record["trigger"] == probe.TRIGGER_COLLECTOR_RESTART
+    assert record["seconds_after_bind"] == 1.4
+    assert record["collector_unit"] == "gpu-fault-host-collector.service"
+    assert record["collector_before"]["InvocationID"] == "a" * 32
+    assert record["collector_restart"]["property"] == "InvocationID"
+    assert record["collector_restart"]["state"]["MainPID"] == "4343"
+    assert (record["floor_seconds"], record["grace_seconds"]) == (1, 5)
+    # The product's unit is only ever read, and only between the bind and the
+    # re-unbind: no restart, stop or any other verb, no read before the bind.
+    reads = world.collector_commands()
+    assert {tuple(argv[:2]) for _, argv in reads} == {("systemctl", "show")}
+    assert [at for at, _ in reads][0] == BIND_AT
+    assert max(at for at, _ in reads) == world.reunbound_at
+    assert [
+        argv for _, argv in world.commands if argv[:2] != ["systemctl", "show"]
+    ] == []
+
+
+def test_the_trap_falls_back_to_the_grace_when_no_restart_shows(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """No restart of the snapshot collector within the grace: the old fixed
+    delay is the bounded fallback, recorded as such."""
+
+    world, record = _snapshot_trap(tmp_path, monkeypatch, restart_at=None)
+    assert world.reunbound_at == BIND_AT + 5, world.pauses
+    assert record["trigger"] == probe.TRIGGER_GRACE_FALLBACK
+    assert record["seconds_after_bind"] == 5.0
+    assert record["collector_restart"] is None
+    assert record["collector_before"] == COLLECTOR_RUNNING
+    assert record["collector_reads"] == 1 + round(5 / probe.COLLECTOR_POLL_SECONDS)
+
+
+def test_the_trap_never_re_unbinds_before_its_floor(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """A restart nobody planned (the collector's watchdog) right after the
+    bind is seen at once, but the re-unbind waits for the floor: the Node
+    Agent's own bind read-back must have recorded SUCCEEDED first."""
+
+    world, record = _snapshot_trap(
+        tmp_path, monkeypatch, floor=2, restart_at=BIND_AT + 0.2
+    )
+    assert record["trigger"] == probe.TRIGGER_COLLECTOR_RESTART
+    assert record["collector_restart"]["seconds_after_bind"] == 0.2
+    assert world.reunbound_at == BIND_AT + 2, world.pauses
+    assert record["seconds_after_bind"] == 2.0
+    assert world.pauses[-1] == pytest.approx(1.8), "topped up to the floor"
+
+
+def test_a_collector_restart_before_the_product_s_bind_is_not_the_trigger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The watch starts at the product's bind: a restart while the function is
+    still unbound is not the post-repair snapshot, and the collector is not
+    read at all before the bind."""
+
+    world, record = _snapshot_trap(tmp_path, monkeypatch, restart_at=BIND_AT - 1)
+    assert min(at for at, _ in world.collector_commands()) == BIND_AT
+    assert record["collector_before"] == COLLECTOR_RESTARTED
+    assert record["trigger"] == probe.TRIGGER_GRACE_FALLBACK
+    assert world.reunbound_at == BIND_AT + 5, world.pauses
+
+
+def test_an_unreadable_collector_still_ends_on_the_grace_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """``systemctl show`` hanging on every read is a reading without identity,
+    not a crash of the trap: the one re-unbind still lands, on the grace."""
+
+    world, record = _snapshot_trap(tmp_path, monkeypatch, collector_fails=True)
+    assert record["fired"] is True
+    assert record["trigger"] == probe.TRIGGER_GRACE_FALLBACK
+    assert record["collector_before"] == {"error": "TimeoutExpired"}
+    assert world.reunbound_at == BIND_AT + 5, world.pauses
+
+
+@pytest.mark.parametrize(
+    ("after", "expected"),
+    [
+        ({**COLLECTOR_RUNNING, "InvocationID": "c" * 32}, "InvocationID"),
+        (
+            {**COLLECTOR_RUNNING, "MainPID": "0", "ActiveState": "deactivating"},
+            "MainPID",
+        ),
+        (
+            {**COLLECTOR_RUNNING, "ExecMainStartTimestampMonotonic": "5"},
+            "ExecMainStartTimestampMonotonic",
+        ),
+        (
+            {**COLLECTOR_RUNNING, "ActiveEnterTimestampMonotonic": "7"},
+            "ActiveEnterTimestampMonotonic",
+        ),
+        ({**COLLECTOR_RUNNING, "ActiveState": "deactivating"}, "ActiveState"),
+        ({**COLLECTOR_RUNNING, "SubState": "reload"}, None),
+        (dict(COLLECTOR_RUNNING), None),
+        ({"error": "TimeoutExpired"}, None),
+    ],
+    ids=[
+        "new-invocation",
+        "main-process-gone",
+        "new-main-process-start",
+        "new-activation",
+        "stopping",
+        "substate-only",
+        "unchanged",
+        "unreadable",
+    ],
+)
+def test_collector_restart_reads_the_unit_s_identity(
+    after: dict[str, str], expected: str | None
+) -> None:
+    assert probe.collector_restart(COLLECTOR_RUNNING, after) == expected
+    assert probe.collector_restart({"error": "x"}, COLLECTOR_RESTARTED) is None
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "error"),
+    [
+        (0, "LoadState=loaded\nMainPID=7\nnoise\nOther=1\n", None),
+        (1, "", "systemctl show exited 1"),
+        (0, "LoadState=not-found\nMainPID=0\n", "LoadState=not-found"),
+    ],
+    ids=["loaded", "failed", "not-found"],
+)
+def test_collector_state_is_one_read_only_show(
+    monkeypatch, returncode: int, stdout: str, error: str | None
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(command, *, check=True, timeout=120):
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, returncode, stdout, "")
+
+    monkeypatch.setattr(probe, "run", fake_run)
+    state = probe.collector_state()
+    assert state.get("error") == error
+    assert "Other" not in state, "only the identity and state properties are kept"
+    (command,) = calls
+    assert command[:3] == ["systemctl", "show", probe.SNAPSHOT_COLLECTOR_UNIT]
+    assert command[3] == "--property=" + ",".join(probe.COLLECTOR_STATE_PROPERTIES)
+
+
+def test_trap_unbind_arms_the_floor_and_refuses_one_above_the_grace(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    fake = _tree(tmp_path, monkeypatch)
+    code = probe.main(
+        ["trap-unbind", "--run-id", RUN, "--pci-bdf", BDF_A, "--grace-seconds", "5"]
+    )
+    receipt = _last_json(capsys)
+    assert code == 0, receipt
+    assert (receipt["floor_seconds"], receipt["grace_seconds"]) == (1, 5)
+    assert receipt["collector_unit"] == probe.SNAPSHOT_COLLECTOR_UNIT
+    (trap,) = [c for c in fake.calls if c[0] == "systemd-run" and "trap-run" in c]
+    assert trap[trap.index("--floor-seconds") + 1] == "1"
+    assert trap[trap.index("--grace-seconds") + 1] == "5"
+
+    refused_tree = tmp_path / "refused"
+    refused_tree.mkdir()
+    fake = _tree(refused_tree, monkeypatch)
+    code = probe.main(
+        [
+            "trap-unbind",
+            "--run-id",
+            RUN,
+            "--pci-bdf",
+            BDF_A,
+            "--grace-seconds",
+            "2",
+            "--floor-seconds",
+            "3",
+        ]
+    )
+    error = _last_json(capsys)
+    assert code == 1, error
+    assert error["error_message"] == "floor is outside 1..2"
+    assert [call for call in fake.calls if call[0] == "systemd-run"] == []
+    assert not (probe.driver_root() / "unbind").exists(), "refused before the unbind"
+
+
+def test_a_re_arm_of_the_same_run_runs_the_shipped_trap_and_reads_its_own_record(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """An earlier arm of this run id on this boot left its probe copy and its
+    trap record in ``/run`` (a run the product never rebooted): the deadman and
+    the trap unit run the shipped probe, not that copy, and ``summary`` reads
+    nothing until the new trap writes its own record."""
+
+    _tree(tmp_path, monkeypatch)
+    directory = probe.state_dir(RUN)
+    directory.mkdir(parents=True)
+    (directory / "probe.py").write_text("# an older probe: a fixed-grace trap\n")
+    (directory / "trap-fired").write_text(json.dumps({"fired": True, "at": "old"}))
+    assert probe.main(["trap-unbind", "--run-id", RUN, "--pci-bdf", BDF_A]) == 0
+    capsys.readouterr()
+    assert filecmp.cmp(directory / "probe.py", probe.__file__, shallow=False), (
+        "the deadman and the trap unit run the shipped probe"
+    )
+    assert not (directory / "trap-fired").exists(), "the old record is not this trap's"
+    assert probe.summary(RUN, BDF_A)["trap_fired_at"] is None
 
 
 # --------------------------------------------------------------------------- #

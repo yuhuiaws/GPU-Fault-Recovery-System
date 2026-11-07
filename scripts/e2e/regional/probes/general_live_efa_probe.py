@@ -24,11 +24,16 @@ spec requires:
   reboot clears.
 * ``trap-unbind`` (``post_repair_failure``): the unbind, plus a bounded
   transient unit that waits for this unbind and then for the product's bind
-  of the same function, lets the Node Agent's own read-back verification
-  finish (a grace of a few seconds), unbinds it once more and records when. The
-  action's receipt therefore says SUCCEEDED (bound 16/16, ``rebound_pci_bdfs``
-  = [BDF]) while every later reading shows the shortfall again, so the
-  post-action validation fails on fresh evidence.
+  of the same function, then watches -- by reading its ``systemctl show``
+  state, nothing else -- the host collector the product restarts for its
+  post-repair snapshot (``TRIGGER_HEALTH_SNAPSHOT``), unbinds the function
+  once more the moment that restart shows (never sooner than a floor after the
+  bind, so the Node Agent's own bind read-back has finished; at the old grace
+  after the bind at the latest when no restart shows) and records when and on
+  which trigger. The action's receipt therefore says SUCCEEDED (bound 16/16,
+  ``rebound_pci_bdfs`` = [BDF]) while the restarted collector's first reading
+  -- the sample the post-action validation judges -- and every later one show
+  the shortfall again, so the validation fails on fresh evidence.
 
 Before any of these a deadman timer is armed that stops the trap, clears the
 override and rebinds the function, so the node returns to its baseline even
@@ -101,6 +106,57 @@ MIN_RESTORE_SECONDS = 60
 MAX_RESTORE_SECONDS = 5400
 MIN_GRACE_SECONDS = 1
 MAX_GRACE_SECONDS = 60
+#: The trap's re-unbind never lands sooner than this after the product's bind
+#: was seen, whatever restart it sees: the Node Agent reads every function back
+#: right after its bind write returns (``REMEDIATE_EFA_DRIVER``'s
+#: ``bind_and_verify``), and the product's own restart only follows that
+#: SUCCEEDED receipt, so the floor only ever guards against a restart of the
+#: collector nobody planned (its watchdog, ``Restart=always``).
+MIN_FLOOR_SECONDS = 1
+#: The unit whose restart IS the product's post-repair snapshot. The plan runs
+#: TRIGGER_HEALTH_SNAPSHOT after RESTART_EFA_DEVICE_PLUGIN; the Node Agent
+#: writes the gpu/host snapshot requests, ``systemctl restart``s
+#: gpu-fault-metrics-collector.service and then this unit
+#: (``node_agent/operations/diagnostics.py`` ``_trigger_health_snapshot``). The
+#: restarted host collector sends READY=1 and, with the ``host.request`` force
+#: snapshot pending, runs its first tick at once without the start-up spread
+#: (``collectors/host/collector.py`` ``run``): that tick's EFA inventory, about
+#: two seconds after the start, is the sample VALIDATE_FABRIC judges -- the
+#: first newer than the last recovery step (``adapters/gpu_validation.py``
+#: ``inventory_observation_window``). The trap only ever READS this unit's
+#: state; it never restarts, stops or changes it.
+SNAPSHOT_COLLECTOR_UNIT = "gpu-fault-host-collector.service"
+#: The ``systemctl show`` properties that change when that unit (re)starts: a
+#: new invocation (systemd >= 232), a new or departed main process, a new
+#: start of the main process, a new activation (READY=1 of ``Type=notify``).
+COLLECTOR_IDENTITY_PROPERTIES = (
+    "InvocationID",
+    "MainPID",
+    "ExecMainStartTimestampMonotonic",
+    "ActiveEnterTimestampMonotonic",
+)
+COLLECTOR_STATE_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    *COLLECTOR_IDENTITY_PROPERTIES,
+)
+#: The ActiveState of a unit that was active and is now being stopped or
+#: started again: a restart in progress, its next first tick still ahead.
+RESTARTING_STATES = frozenset({"deactivating", "inactive", "failed", "activating"})
+#: How often the trap looks for the product's bind: the collector's state is
+#: first read when the bind shows, so a slower poll would let a restart that
+#: follows the bind closely land before that first reading and go unseen.
+BIND_POLL_SECONDS = 0.25
+#: How often the trap reads the collector between the product's bind and the
+#: restart (the restart-to-first-tick margin is about two seconds), and how
+#: long one read may take before it counts as a reading without identity.
+COLLECTOR_POLL_SECONDS = 0.2
+COLLECTOR_READ_TIMEOUT_SECONDS = 10
+#: ``trigger`` of the trap's record: the collector's restart was seen, or none
+#: was within the grace and the trap fell back to the old fixed delay.
+TRIGGER_COLLECTOR_RESTART = "collector_restart"
+TRIGGER_GRACE_FALLBACK = "grace_fallback"
 #: Node facts the runner's preflight reads back (values are shell-quoted by
 #: the installer's ``write_env``; the quotes are stripped).
 ENV_KEYS = (
@@ -412,6 +468,63 @@ def unit_state(unit: str) -> dict[str, str]:
     return values
 
 
+def collector_state() -> dict[str, str]:
+    """The snapshot collector's (re)start identity, read-only.
+
+    One ``systemctl show`` of ``SNAPSHOT_COLLECTOR_UNIT`` -- never a restart,
+    stop or any other verb on the product's unit. A read that fails or hangs is
+    a reading carrying ``error`` instead of an exception: the trap must still
+    reach its grace fallback.
+    """
+
+    try:
+        completed = run(
+            [
+                "systemctl",
+                "show",
+                SNAPSHOT_COLLECTOR_UNIT,
+                "--property=" + ",".join(COLLECTOR_STATE_PROPERTIES),
+            ],
+            check=False,
+            timeout=COLLECTOR_READ_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return {"error": type(error).__name__}
+    values: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key in COLLECTOR_STATE_PROPERTIES:
+            values[key] = value.strip()
+    if completed.returncode:
+        values["error"] = f"systemctl show exited {completed.returncode}"
+    elif values.get("LoadState") != "loaded":
+        values["error"] = f"LoadState={values.get('LoadState') or '?'}"
+    return values
+
+
+def collector_restart(before: dict[str, str], now: dict[str, str]) -> str | None:
+    """The property saying the snapshot collector restarted between two
+    readings, ``None`` when none does (or either reading is unusable).
+
+    A changed InvocationID, main PID, main-process start or activation is a new
+    -- or departing -- process; an ``active`` unit that now reads stopping or
+    starting is a restart under way. Either way the restarted collector's first
+    tick, the sample the post-repair validation judges, is still ahead.
+    """
+
+    if before.get("error") or now.get("error"):
+        return None
+    for key in COLLECTOR_IDENTITY_PROPERTIES:
+        if key in before and key in now and before[key] != now[key]:
+            return key
+    if (
+        before.get("ActiveState") == "active"
+        and now.get("ActiveState") in RESTARTING_STATES
+    ):
+        return "ActiveState"
+    return None
+
+
 def run_units(run_id: str) -> list[str]:
     """The transient units of this run systemd still knows."""
 
@@ -464,12 +577,22 @@ def summary(run_id: str, bdf: str) -> dict[str, Any]:
 # Deadman: a copy of this file the timer runs after the Pod is gone
 # --------------------------------------------------------------------------- #
 def probe_copy(run_id: str) -> Path:
+    """The copy of this file the deadman and the trap unit run.
+
+    Always the shipped version: a copy an earlier arm of the same run id left
+    in ``/run`` on this boot (an older probe -- one whose trap slept a fixed
+    grace) is replaced, atomically, rather than run again.
+    """
+
     directory = state_dir(run_id)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     target = directory / "probe.py"
-    if not target.is_file():
-        target.write_bytes(Path(__file__).resolve().read_bytes())
-        target.chmod(0o700)
+    source = Path(__file__).resolve().read_bytes()
+    if not target.is_file() or target.read_bytes() != source:
+        temporary = target.with_suffix(".tmp")
+        temporary.write_bytes(source)
+        temporary.chmod(0o700)
+        os.replace(temporary, target)
     return target
 
 
@@ -642,17 +765,36 @@ def hold_unbind(arguments: argparse.Namespace) -> None:
     )
 
 
+def trap_timing(arguments: argparse.Namespace) -> tuple[int, int]:
+    """``(grace, floor)`` of the trap: the latest and the earliest re-unbind
+    after the product's bind, in seconds; the floor may not exceed the grace.
+    A caller without ``floor_seconds`` gets ``MIN_FLOOR_SECONDS``."""
+
+    grace = bounded(
+        arguments.grace_seconds, MIN_GRACE_SECONDS, MAX_GRACE_SECONDS, "grace"
+    )
+    floor = bounded(
+        getattr(arguments, "floor_seconds", MIN_FLOOR_SECONDS),
+        MIN_FLOOR_SECONDS,
+        grace,
+        "floor",
+    )
+    return grace, floor
+
+
 def trap_unbind(arguments: argparse.Namespace) -> None:
     """post_repair_failure: unbind now, and re-unbind right after the product
-    binds it back, so the action's receipt succeeds and the post-action
-    validation fails on fresh evidence.
+    binds it back -- on its post-repair snapshot -- so the action's receipt
+    succeeds and the post-action validation fails on fresh evidence.
 
     A bounded transient unit waits for this unbind and then for the function to
-    be bound again (the product's REMEDIATE_EFA_DRIVER), lets the Node Agent's
-    synchronous read-back verification finish (``grace`` seconds), unbinds it
-    once more and records when. No ``driver_override`` is used, so the second
-    unbind is the only change and the deadman's plain rebind restores the
-    baseline.
+    be bound again (the product's REMEDIATE_EFA_DRIVER), then watches the
+    product's host collector restart for TRIGGER_HEALTH_SNAPSHOT
+    (``trap_run``) and unbinds the function once more when it shows -- never
+    sooner than ``floor`` seconds after the bind, at ``grace`` seconds at the
+    latest -- and records when and why. No ``driver_override`` is used, so the
+    second unbind is the only change and the deadman's plain rebind restores
+    the baseline.
     """
 
     run_id = checked_run_id(arguments.run_id)
@@ -660,15 +802,18 @@ def trap_unbind(arguments: argparse.Namespace) -> None:
     restore_seconds = bounded(
         arguments.restore_seconds, MIN_RESTORE_SECONDS, MAX_RESTORE_SECONDS, "restore"
     )
-    grace = bounded(
-        arguments.grace_seconds, MIN_GRACE_SECONDS, MAX_GRACE_SECONDS, "grace"
-    )
+    grace, floor = trap_timing(arguments)
     trap_window = bounded(
         arguments.trap_window_seconds, 30, MAX_RESTORE_SECONDS, "trap window"
     )
     facts = _preconditions(bdf)
     deadman = arm_deadman(run_id, bdf, restore_seconds)
-    trap = _arm_trap(run_id, bdf, grace=grace, window=trap_window)
+    trap = _arm_trap(run_id, bdf, grace=grace, floor=floor, window=trap_window)
+    # The record an earlier arm of this run id left on this boot is not this
+    # trap's (``_arm_trap`` stopped that arm's unit, and this one writes
+    # nothing before the unbind below): ``summary`` must read nothing until
+    # this unit writes its own.
+    (state_dir(run_id) / "trap-fired").unlink(missing_ok=True)
     save_state(
         run_id,
         {
@@ -679,6 +824,8 @@ def trap_unbind(arguments: argparse.Namespace) -> None:
             "trap_unit": trap,
             "restore_seconds": restore_seconds,
             "grace_seconds": grace,
+            "floor_seconds": floor,
+            "collector_unit": SNAPSHOT_COLLECTOR_UNIT,
             "override_value": None,
             **facts,
         },
@@ -692,6 +839,8 @@ def trap_unbind(arguments: argparse.Namespace) -> None:
             "bound": is_bound(bdf),
             "trap_unit": trap + ".service",
             "grace_seconds": grace,
+            "floor_seconds": floor,
+            "collector_unit": SNAPSHOT_COLLECTOR_UNIT,
             "deadman_timer": deadman + ".timer",
             "restore_seconds": restore_seconds,
             "baseline_bound_count": facts["baseline_bound_count"],
@@ -700,7 +849,7 @@ def trap_unbind(arguments: argparse.Namespace) -> None:
     )
 
 
-def _arm_trap(run_id: str, bdf: str, *, grace: int, window: int) -> str:
+def _arm_trap(run_id: str, bdf: str, *, grace: int, floor: int, window: int) -> str:
     """A bounded transient unit that re-unbinds the function once, later.
 
     The unit keeps systemd-run's default ``Type=simple``: ``systemd-run`` waits
@@ -731,6 +880,8 @@ def _arm_trap(run_id: str, bdf: str, *, grace: int, window: int) -> str:
             bdf,
             "--grace-seconds",
             str(grace),
+            "--floor-seconds",
+            str(floor),
             "--trap-window-seconds",
             str(window),
         ]
@@ -742,17 +893,31 @@ def _arm_trap(run_id: str, bdf: str, *, grace: int, window: int) -> str:
 
 def trap_run(arguments: argparse.Namespace) -> None:
     """Inside the trap unit: wait for the fixture's unbind, then the product's
-    bind, then re-unbind once.
+    bind, then re-unbind once on the product's post-repair snapshot.
+
+    After the bind the unit reads the snapshot collector's state every
+    ``COLLECTOR_POLL_SECONDS`` (``collector_state``, read-only) and re-unbinds
+    as soon as a reading differs from the one taken when the bind was seen
+    (``collector_restart``): the restart's first tick comes about two seconds
+    later and must already read the function unbound. Never sooner than
+    ``floor`` seconds after the bind; when no restart shows within ``grace``
+    seconds, at ``grace`` -- the old fixed delay, kept as the bounded fallback.
+    Live 2026-11-06 (HyperPod, R23 validation) that fixed 5 s grace alone lost
+    the race: TRIGGER_HEALTH_SNAPSHOT restarted the collectors right after the
+    bind receipt, the restarted host collector's first sample (16/16) came
+    about 3.6 s after the bind the trap had seen and VALIDATE_FABRIC SUCCEEDED
+    on it, before the re-unbind 5 s after that bind; earlier runs had had the
+    opposite order.
 
     Prints nothing the runner reads (it runs detached); it records its own
-    outcome in ``trap-fired`` so ``summary`` can report it.
+    outcome in ``trap-fired`` so ``summary`` can report it: ``trigger``
+    (``collector_restart`` or ``grace_fallback``), the seconds from the bind it
+    saw to the re-unbind, and the collector readings the trigger rests on.
     """
 
     run_id = checked_run_id(arguments.run_id)
     bdf = normalize_bdf(arguments.pci_bdf)
-    grace = bounded(
-        arguments.grace_seconds, MIN_GRACE_SECONDS, MAX_GRACE_SECONDS, "grace"
-    )
+    grace, floor = trap_timing(arguments)
     window = bounded(
         arguments.trap_window_seconds, 30, MAX_RESTORE_SECONDS, "trap window"
     )
@@ -786,17 +951,71 @@ def trap_run(arguments: argparse.Namespace) -> None:
         if is_bound(bdf) and bound_driver(bdf) == DRIVER:
             bound_seen = True
             break
-        pause(1)
+        pause(BIND_POLL_SECONDS)
     if not bound_seen:
         not_fired("bind not observed")
         return
-    # Let the Node Agent's synchronous bind read-back record SUCCEEDED first.
-    pause(grace)
+    bind_seen = monotonic_clock()
+    bind_seen_at = utc_now()
+    trigger, before, restart, reads = _await_snapshot_restart(bind_seen, grace)
+    # The Node Agent's synchronous bind read-back records SUCCEEDED before the
+    # product restarts anything; the floor covers a restart nobody planned.
+    elapsed = monotonic_clock() - bind_seen
+    if elapsed < floor:
+        pause(floor - elapsed)
     _unbind(bdf)
+    fired_after = monotonic_clock() - bind_seen
     (directory / "trap-fired").write_text(
-        json.dumps({"fired": True, "bound": is_bound(bdf), "at": utc_now()}),
+        json.dumps(
+            {
+                "fired": True,
+                "bound": is_bound(bdf),
+                "at": utc_now(),
+                "trigger": trigger,
+                "bind_seen_at": bind_seen_at,
+                "seconds_after_bind": round(fired_after, 3),
+                "floor_seconds": floor,
+                "grace_seconds": grace,
+                "collector_unit": SNAPSHOT_COLLECTOR_UNIT,
+                "collector_before": before,
+                "collector_restart": restart,
+                "collector_reads": reads,
+            },
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
+
+
+def _await_snapshot_restart(
+    bind_seen: float, grace: int
+) -> tuple[str, dict[str, str], dict[str, Any] | None, int]:
+    """Watch the snapshot collector from the product's bind on, read-only.
+
+    ``(trigger, reading at the bind, the restart seen or None, reads)``: the
+    first usable reading is the baseline, a later one ``collector_restart``
+    tells apart ends the watch on ``TRIGGER_COLLECTOR_RESTART``, and the grace
+    ends it on ``TRIGGER_GRACE_FALLBACK``.
+    """
+
+    before = collector_state()
+    reads = 1
+    while monotonic_clock() - bind_seen < grace:
+        pause(COLLECTOR_POLL_SECONDS)
+        now = collector_state()
+        reads += 1
+        if before.get("error"):
+            before = now
+            continue
+        changed = collector_restart(before, now)
+        if changed is not None:
+            restart = {
+                "property": changed,
+                "state": now,
+                "seconds_after_bind": round(monotonic_clock() - bind_seen, 3),
+            }
+            return TRIGGER_COLLECTOR_RESTART, before, restart, reads
+    return TRIGGER_GRACE_FALLBACK, before, None, reads
 
 
 # --------------------------------------------------------------------------- #
@@ -937,10 +1156,12 @@ def parser() -> argparse.ArgumentParser:
     trap = command("trap-unbind", trap_unbind)
     trap.add_argument("--restore-seconds", type=int, default=900)
     trap.add_argument("--grace-seconds", type=int, default=5)
+    trap.add_argument("--floor-seconds", type=int, default=MIN_FLOOR_SECONDS)
     trap.add_argument("--trap-window-seconds", type=int, default=600)
 
     runner = command("trap-run", trap_run)
     runner.add_argument("--grace-seconds", type=int, default=5)
+    runner.add_argument("--floor-seconds", type=int, default=MIN_FLOOR_SECONDS)
     runner.add_argument("--trap-window-seconds", type=int, default=600)
 
     rel = command("release", release)

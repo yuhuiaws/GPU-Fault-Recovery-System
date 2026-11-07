@@ -276,7 +276,9 @@ def test_the_trap_gives_up_when_the_product_never_binds_back(
     )
     fired = json.loads((probe.state_dir(RUN) / "trap-fired").read_text())
     assert (fired["fired"], fired["reason"]) == (False, "bind not observed")
-    assert pauses == [1, 1], "polled until the window closed, no grace, no unbind"
+    assert pauses == [probe.BIND_POLL_SECONDS] * 2, (
+        "polled until the window closed, no collector watch, no unbind"
+    )
     assert not (probe.driver_root() / "unbind").exists(), "the trap never fired"
 
 

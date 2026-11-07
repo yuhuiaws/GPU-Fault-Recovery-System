@@ -3048,7 +3048,14 @@ DRIVER_UNBOUND finding -- escalates to RESTART_NODE, the approved branch for a
 bind that will not take (and the one that clears the per-device override). No
 global `efa` unload ever happens: the module stays loaded and every other
 function keeps its binding. `post_repair_failure` uses no override; a bounded
-one-shot trap re-unbinds the function a few seconds after the product's bind, so
+one-shot trap re-unbinds the function after the product's bind, on the
+product's own post-repair snapshot: once the bind shows it reads
+`gpu-fault-host-collector.service`'s state (`systemctl show`: InvocationID,
+main PID, main-process start and activation timestamps -- only ever a read,
+never a restart, stop or change of the product's unit) and re-unbinds the
+moment `TRIGGER_HEALTH_SNAPSHOT` restarts that collector, never sooner than a
+1 s floor after the bind and at the old 5 s grace when no restart shows (the
+trap's record names its `trigger`, `collector_restart` or `grace_fallback`). So
 `REMEDIATE_EFA_DRIVER` records SUCCEEDED (`rebound_pci_bdfs=[BDF]`) and a later
 post-repair step (`RESTART_EFA_DEVICE_PLUGIN` or `VALIDATE_FABRIC`)
 independently FAILS on fresh evidence and escalates to the same reboot -- the
@@ -3137,14 +3144,22 @@ reboot.
 
 `post_repair_failure` exercises the post-repair validation of a node that stays
 unbound. REMEDIATE_EFA_DRIVER binds the function back (the trap re-unbinds it
-after its grace and records `fired=true`), RESTART_EFA_DEVICE_PLUGIN passes as
+when the snapshot below restarts the host collector and records `fired=true`
+with its trigger), RESTART_EFA_DEVICE_PLUGIN passes as
 `already_healthy` on the plugin's unchanged allocatable
 (`adapters/kubernetes/node_operations.py` `_restart_device_plugin_node`:
 `allocatable >= expected` restarts nothing), TRIGGER_HEALTH_SNAPSHOT restarts the
 collectors, and the restarted host collector's first tick (the `host.request`
 force snapshot skips the start-up spread) delivers the short
 `efa_inventory_active_count` with the DRIVER_UNBOUND verdict -- the sample
-`inventory_observation_window` asks for. The inventory gate fails a node on an
+`inventory_observation_window` asks for. That first tick is why the trap waits
+for the restart rather than for a fixed delay after the bind: the restarted
+collector's first sample can reach the product sooner than a 5 s grace (about
+3.6 s after the bind in one run), and VALIDATE_FABRIC then SUCCEEDS on the
+still-bound count -- the record ends SUCCEEDED, the late re-unbind reads as a
+new incident and no reboot rung follows. Re-unbinding on the restart orders the
+unbind before that tick by construction (the tick follows the start by about two
+seconds); the grace is only the bounded fallback. The inventory gate fails a node on an
 inventory row its host collector delivered since the action even when a
 collector the step waits for is stale or erroring
 (`adapters/inventory_verdict.py` `inventory_failure_despite_collection_error`,

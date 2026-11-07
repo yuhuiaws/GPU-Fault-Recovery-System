@@ -852,6 +852,58 @@ def test_post_repair_failure_accepts_a_plugin_restart_failure(tmp_path: Path) ->
     assert result["verdict"] == "PASS", result["errors"]
 
 
+@pytest.mark.parametrize(
+    ("changes", "trigger", "phrase"),
+    [
+        (
+            {"trigger": "collector_restart", "seconds_after_bind": 1.4},
+            "collector_restart",
+            "1.4s after the product's bind, on the gpu-fault-host-collector.service "
+            "restart of its post-repair snapshot",
+        ),
+        (
+            {
+                "trigger": "grace_fallback",
+                "seconds_after_bind": 5.0,
+                "grace_seconds": 5,
+            },
+            "grace_fallback",
+            "5.0s after the product's bind, on its 5s grace fallback",
+        ),
+        ({}, None, "after the product's bind (its record names no trigger)"),
+    ],
+    ids=["collector-restart", "grace-fallback", "no-trigger"],
+)
+def test_post_repair_arms_the_snapshot_trap_and_names_its_trigger(
+    tmp_path: Path, changes: dict[str, Any], trigger: str | None, phrase: str
+) -> None:
+    """The fixture arms the trap with its floor and grace, and the result says
+    which trigger fired it: the host collector's restart for the product's
+    post-repair snapshot, or the bounded grace fallback. Either is a fired
+    trap; the trigger is evidence, not a stage."""
+
+    text = json.dumps({**json.loads(TRAP_FIRED_TEXT), **changes})
+    probe = _probe(trap_text=text)
+    ctx = _ctx(
+        "post_repair_failure",
+        doc=_doc(
+            remediation_status="SUCCEEDED",
+            node_results=REPAIRED,
+            post_repair=("VALIDATE_FABRIC", "FAILED"),
+        ),
+        probe=probe,
+        tmp_path=tmp_path,
+    )
+    result = mod.post_repair_failure(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["trap_trigger"] == trigger
+    assert phrase in result["notes"][0], result["notes"][0]
+    (call,) = [item for item in probe.calls if item[0] == "trap-unbind"]
+    assert call[call.index("--grace-seconds") + 1] == "5"
+    assert call[call.index("--floor-seconds") + 1] == "1"
+    assert (mod.TRAP_GRACE_SECONDS, mod.TRAP_FLOOR_SECONDS) == (5, 1)
+
+
 def test_post_repair_trap_read_waits_for_the_unit_to_write_its_record(
     tmp_path: Path,
 ) -> None:

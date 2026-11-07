@@ -3111,7 +3111,15 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   bind 失败并记入独立 `bind_errors` 回执。该步骤带 `failure_escalation_action=REBOOT_NODE`，
   产品升级到 `RESTART_NODE`——这是“bind 确实绑不上”的已批准分支，重启也顺带清掉逐设备
   override；全程**不做**全局 `efa` 卸载（模块保持加载、其余功能保持绑定）。`post_repair_failure`：
-  不设 override，解绑后由一个有界一次性 trap 在产品 bind 回执**之后**几秒再次解绑，于是
+  不设 override，解绑后由一个有界一次性 trap 在产品 bind **之后**、在产品自己的修复后快照上再次解绑：
+  看到 bind 之后，trap 只读 `gpu-fault-host-collector.service` 的状态（`systemctl show`：
+  InvocationID、主进程 PID、主进程启动与激活时间戳；只读，从不重启、停止或改动产品的单元），
+  `TRIGGER_HEALTH_SNAPSHOT` 重启该采集器的那一刻即再次解绑——不早于 bind 后 1 s 的下限，看不到重启时
+  按原来的 5 s 宽限兜底，trap 记录写明触发方式 `trigger`（`collector_restart` 或 `grace_fallback`）。
+  只按 bind 后固定延时不能保证再次解绑先于重启后采集器的第一拍：那一拍可能早于 5 s 宽限到达（某次实跑在
+  bind 后约 3.6 s），VALIDATE_FABRIC 随即在仍为 16/16 的计数上 SUCCEEDED，记录以 SUCCEEDED 结束，迟到的
+  再次解绑被当成新 incident，也就没有 reboot 梯级；按重启触发由构造保证先后（第一拍在启动后约 2 s），
+  宽限只作有界兜底。于是
   `REMEDIATE_EFA_DRIVER` 记 SUCCEEDED（`rebound_pci_bdfs=[BDF]`）而其后的
   `RESTART_EFA_DEVICE_PLUGIN`/`VALIDATE_FABRIC` 在新鲜证据上独立 FAILED，升级到
   `RESTART_NODE`——即动作成功但动作后验证失败所要求的独立回执与升级。两者只按

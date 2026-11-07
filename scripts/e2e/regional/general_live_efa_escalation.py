@@ -461,10 +461,12 @@ def trap_record(reading: dict[str, Any]) -> dict[str, Any]:
     """The trap's own record from a probe reading.
 
     ``summary`` carries it as ``trap_fired_at`` -- the JSON text of
-    ``/run/.../trap-fired`` (``{"fired": true, "bound": false, "at": ...}``,
-    or ``fired: false`` with a ``reason``), ``None`` until the unit wrote it
-    (the live shape) -- and ``release`` as ``trap_fired``; a scripted reading
-    may carry the object itself.
+    ``/run/.../trap-fired`` (``{"fired": true, "bound": false, "at": ...,
+    "trigger": "collector_restart" | "grace_fallback", "seconds_after_bind":
+    ...}`` plus the collector readings the trigger rests on, or ``fired:
+    false`` with a ``reason``), ``None`` until the unit wrote it (the live
+    shape) -- and ``release`` as ``trap_fired``; a scripted reading may carry
+    the object itself.
     """
 
     value = reading.get("trap_fired_at", reading.get("trap_fired"))

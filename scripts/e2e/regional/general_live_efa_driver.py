@@ -24,7 +24,8 @@ one real EFA data function that the fixture unbinds -- the same unbind and
   override. No global ``efa`` unload ever happens (the module stays loaded,
   every other function keeps its binding).
 * ``post_repair_failure``: no override; the function is unbound, and a bounded
-  one-shot trap re-unbinds it a few seconds after the product's bind, so
+  one-shot trap re-unbinds it after the product's bind -- on the product's own
+  post-repair snapshot, the host collector's restart (see below) -- so
   ``REMEDIATE_EFA_DRIVER`` records SUCCEEDED (``rebound_pci_bdfs=[BDF]``) and a
   later post-repair step (``RESTART_EFA_DEVICE_PLUGIN`` or ``VALIDATE_FABRIC``)
   independently FAILS on fresh evidence, which escalates to the same reboot --
@@ -80,6 +81,28 @@ through the product's validated restore once the function is bound again
 receipt is read from ``node_results`` of the step execution / the remote
 command's ``step.operation`` (``general_live_efa_escalation.node_result``), not
 a top-level ``operation`` the command record never had.
+
+The trap's own timing lost a race too (live 2026-11-06, HyperPod, R23
+validation): REMEDIATE_EFA_DRIVER SUCCEEDED (bound 16/16),
+RESTART_EFA_DEVICE_PLUGIN passed, TRIGGER_HEALTH_SNAPSHOT restarted the metrics
+and then the host collector right away, and the restarted host collector's
+first sample -- 16/16, about 3.6 s after the bind the trap had seen -- reached
+the product before the trap's fixed 5 s grace ran out. VALIDATE_FABRIC
+SUCCEEDED on it (a sample newer than the last recovery step), the record ended
+SUCCEEDED, the late re-unbind read as a new incident whose remediation then
+held (the trap is one-shot), and no reboot-after successor followed; earlier
+PASS runs had had the opposite order. The trap now fires on that snapshot
+itself: once the product's bind shows (polled every 0.25 s), it reads
+``gpu-fault-host-collector.service``'s state (``systemctl show``: InvocationID,
+main PID, start and activation timestamps -- a read, never a restart, stop or
+change of the product's unit) every 0.2 s and re-unbinds the moment the
+restart shows, so the restarted collector's first tick, about two seconds
+after its start, already reads the function unbound. It never fires sooner
+than ``TRAP_FLOOR_SECONDS`` after the bind (the Node Agent's read-back is done
+before the product restarts anything; the floor guards a restart nobody
+planned) and, when no restart shows, falls back to the old
+``TRAP_GRACE_SECONDS``; its record names the trigger (``collector_restart`` or
+``grace_fallback``) and the seconds from the bind to the re-unbind.
 
 Both keep the fixture scoped to ONE function, node-reversible and
 deadman-restorable (clear the override, rebind), and both grade only on the
@@ -152,6 +175,12 @@ from scripts.e2e.regional.general_live_verdicts import (
     verdict,
 )
 from scripts.e2e.regional.host_probe_fixture import HostProbeError
+from scripts.e2e.regional.probes.general_live_efa_probe import (
+    MIN_FLOOR_SECONDS,
+    SNAPSHOT_COLLECTOR_UNIT,
+    TRIGGER_COLLECTOR_RESTART,
+    TRIGGER_GRACE_FALLBACK,
+)
 
 PROBES = Path(__file__).with_name("probes")
 #: The on-node EFA driver fixture probe (sibling of the shared node probe).
@@ -182,6 +211,11 @@ REBOOT_SETTLE_BUDGET = 2400
 SOURCE_CLOSE_BUDGET = 180
 #: How often the trap's own record is read while the product repairs.
 TRAP_POLL_SECONDS = 10
+#: The trap's re-unbind after the product's bind: on the host collector's
+#: restart for the post-repair snapshot, never sooner than the floor, at the
+#: grace (the old fixed delay) when no restart shows.
+TRAP_FLOOR_SECONDS = MIN_FLOOR_SECONDS
+TRAP_GRACE_SECONDS = 5
 
 
 class EfaDriverFixture:
@@ -282,9 +316,17 @@ class EfaDriverFixture:
         return value
 
     def trap_unbind(
-        self, *, restore_seconds: int, grace_seconds: int, trap_window_seconds: int
+        self,
+        *,
+        restore_seconds: int,
+        grace_seconds: int,
+        trap_window_seconds: int,
+        floor_seconds: int = TRAP_FLOOR_SECONDS,
     ) -> dict[str, Any]:
-        """post_repair_failure: unbind, and re-unbind after the product rebinds."""
+        """post_repair_failure: unbind, and re-unbind after the product rebinds
+        -- on the host collector's restart for its post-repair snapshot, never
+        sooner than ``floor_seconds`` after the bind, at ``grace_seconds`` when
+        no restart shows."""
 
         bdf = self.target_bdf()
         require_action_time(120)
@@ -296,6 +338,8 @@ class EfaDriverFixture:
             str(int(restore_seconds)),
             "--grace-seconds",
             str(int(grace_seconds)),
+            "--floor-seconds",
+            str(int(floor_seconds)),
             "--trap-window-seconds",
             str(int(trap_window_seconds)),
             timeout=180,
@@ -1040,6 +1084,39 @@ def _post_repair_failure_errors(
     return [], failed[-1]
 
 
+def _trap_note(bdf: str, record: dict[str, Any], injected: dict[str, Any]) -> str:
+    """What the trap did, in the words of its own record: on the collector's
+    restart for the post-repair snapshot, or on the grace fallback."""
+
+    after = record.get("seconds_after_bind")
+    delay = (
+        f" {after}s"
+        if isinstance(after, (int, float)) and not isinstance(after, bool)
+        else ""
+    )
+    trigger = record.get("trigger")
+    if trigger == TRIGGER_COLLECTOR_RESTART:
+        why = (
+            f", on the {SNAPSHOT_COLLECTOR_UNIT} restart of its post-repair snapshot "
+            "(TRIGGER_HEALTH_SNAPSHOT)"
+        )
+    elif trigger == TRIGGER_GRACE_FALLBACK:
+        grace = record.get("grace_seconds", injected.get("grace_seconds"))
+        why = (
+            f", on its {grace}s grace fallback (no {SNAPSHOT_COLLECTOR_UNIT} restart "
+            "showed between the bind and the grace)"
+        )
+    elif record.get("fired") is True:
+        why = " (its record names no trigger)"
+    else:
+        why = " (the trap's own record was not read)"
+    return (
+        f"{bdf} unbound; a bounded one-shot trap re-unbound it{delay} after the "
+        f"product's bind{why}, so the action receipt is SUCCEEDED and the "
+        "post-repair step fails on fresh evidence"
+    )
+
+
 def post_repair_failure(ctx: VariantContext) -> dict[str, Any]:
     """The product binds the function back (SUCCEEDED receipt), the fixture
     re-unbinds it, and the post-repair step fails independently and escalates."""
@@ -1058,7 +1135,8 @@ def post_repair_failure(ctx: VariantContext) -> dict[str, Any]:
     trap_window = DETECTION_BUDGET + 180
     injected = fixture.trap_unbind(
         restore_seconds=ctx.spec.max_minutes * 60,
-        grace_seconds=5,
+        grace_seconds=TRAP_GRACE_SECONDS,
+        floor_seconds=TRAP_FLOOR_SECONDS,
         trap_window_seconds=trap_window,
     )
     oracle = [fixture.summary()]
@@ -1138,12 +1216,11 @@ def post_repair_failure(ctx: VariantContext) -> dict[str, Any]:
         stages["recovered"] = _recovered_errors(recovered) + exit_errors(
             observed, pair, node_now
         )
+    trap = trap_outcome.get("record") or {}
     return _result(
         stages,
         notes=[
-            f"{bdf} unbound; a bounded trap re-unbound it {injected.get('grace_seconds')}s "
-            "after the product's bind, so the action receipt is SUCCEEDED and the "
-            "post-repair step fails on fresh evidence",
+            _trap_note(bdf, trap, injected),
             *(WITHHELD_NOTES if withheld else REBOOT_NOTES),
         ],
         extra={
@@ -1162,7 +1239,8 @@ def post_repair_failure(ctx: VariantContext) -> dict[str, Any]:
                     if key in {"node_pending", "node_failures", "inventory_evidence"}
                 },
             },
-            "trap": trap_outcome.get("record") or {},
+            "trap": trap,
+            "trap_trigger": trap.get("trigger"),
             "trap_witness": trap_witness,
             "product_gap": PRODUCT_GAP_WITHHELD if withheld else None,
             "node_isolated_at_exit": node_isolated(node_now),
@@ -1220,8 +1298,11 @@ VARIANTS = [
         "post_repair_failure",
         injection=(
             "unbind one allow-listed EFA data function, and a bounded one-shot trap "
-            "re-unbinds it a few seconds after the product's REMEDIATE_EFA_DRIVER bind "
-            "(no driver_override), so the action receipt SUCCEEDS and the post-repair step fails"
+            "re-unbinds it after the product's REMEDIATE_EFA_DRIVER bind -- when the "
+            "product's post-repair snapshot restarts the host collector (read-only "
+            f"watch), never sooner than {TRAP_FLOOR_SECONDS} s after the bind, at a "
+            f"{TRAP_GRACE_SECONDS} s grace when no restart shows (no driver_override) "
+            "-- so the action receipt SUCCEEDS and the post-repair step fails"
         ),
         expected=(
             "REMEDIATE_EFA_DRIVER SUCCEEDED (rebound_pci_bdfs=[BDF]) then an independent "
