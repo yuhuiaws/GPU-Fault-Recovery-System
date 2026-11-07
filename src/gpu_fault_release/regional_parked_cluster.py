@@ -917,15 +917,17 @@ def report_fields(checks: Sequence[Any]) -> dict[str, Any]:
 
 def _groups_text(entry: Mapping[str, Any]) -> str:
     groups = [_mapping(item) for item in entry.get("groups") or ()]
-    if entry.get("provider") == HYPERPOD:
+    # An absent provider is HyperPod (cluster_scope.cluster_provider), so only
+    # an eks-managed entry reads as node groups.
+    if entry.get("provider") == EKS_MANAGED:
         return ", ".join(
-            f"{item.get('name')}: TargetCount {item.get('target')}, CurrentCount "
-            f"{item.get('current')}"
+            f"{item.get('name')}: desiredSize {item.get('desired')}, "
+            f"min {item.get('min')}, max {item.get('max')}"
             for item in groups
         )
     return ", ".join(
-        f"{item.get('name')}: desiredSize {item.get('desired')}, "
-        f"min {item.get('min')}, max {item.get('max')}"
+        f"{item.get('name')}: TargetCount {item.get('target')}, CurrentCount "
+        f"{item.get('current')}"
         for item in groups
     )
 
