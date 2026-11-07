@@ -12430,7 +12430,12 @@ pin 取自有 live Agent 的集群）、resume 与 <code>sync-state</code>
 集群都没有节点时带 Agent wave 的发布，或节点组未声明安装器认识的 GPU
 实例类型的集群上滚动 Reconciler 的发布。证明只读取
 <code>regional_contexts</code>
-已经读取的内容；离场节点清理本身不参考它。</p>
+已经读取的内容；离场节点清理本身不参考它。证明从不开启读快照（<code>regional_release_state.read_snapshot</code>）：
+快照的缓存保存在所有线程共享的发布对象上，而发布步骤（候选
+preflight、集群滚动）以并行线程处理各集群，这些线程的节点安全读取
+必须是新鲜读取（快照开启期间 <code>gpu_node_items</code>
+拒绝新鲜读取）。在调用方自己开启的快照内（<code>status</code>、发布对上一版状态的捕获），
+证明加入该快照，只读取一次。</p>
 <p>代码依据：<code>src/gpu_fault/departed_node_cleanup.py::DepartedNodeCleanup.run_once</code>、
 <code>src/gpu_fault/departed_node_cleanup_actions.py::DepartureWrites</code>、<code>src/gpu_fault/departed_nodes.py</code>、
 <code>src/gpu_fault/kubernetes_node_inventory.py</code>、<code>src/gpu_fault/departed_node_provider.py</code>、
