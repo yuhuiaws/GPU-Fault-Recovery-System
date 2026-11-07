@@ -39,9 +39,16 @@ COSIGN ?= cosign
 # Every sign-blob runs through scripts/cosign_sign_blob.py: when Rekor answers
 # 409 because it already integrated this signing's own retried upload, cosign
 # up to v3.1.3 fails without a bundle; the wrapper writes the bundle from that
-# entry and keeps it only after cosign verify-blob accepted it.
+# entry and keeps it only after cosign verify-blob accepted it. It also retries
+# a transient Sigstore failure a bounded number of times, then refuses.
+# UNLOGGED_SIGNATURE=1 is the deploy's --allow-unlogged-signature: the payload
+# declares it (the reason comes from the environment the deploy hands down,
+# never from this command line) and the wrapper signs with the key only.
+UNLOGGED_SIGNATURE ?=
+UNLOGGED_SIGNATURE_DECLARE = $(if $(filter 1,$(UNLOGGED_SIGNATURE)),--unlogged-signature,)
 COSIGN_SIGN_BLOB = $(PYTHON) scripts/cosign_sign_blob.py --cosign "$(COSIGN)" \
-	$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",)
+	$(if $(COSIGN_SIGNING_KEY),--key "$(COSIGN_SIGNING_KEY)",) \
+	$(if $(filter 1,$(UNLOGGED_SIGNATURE)),--unlogged,)
 RUNTIME_IMAGE_PLATFORM ?= linux/amd64
 RELEASE_ATTESTATION := dist/current-attestation.json
 RELEASE_ATTESTATION_BUNDLE := dist/current-attestation.bundle.json
@@ -663,7 +670,7 @@ release-build:
 		env -u COSIGN_PASSWORD $(PYTHON) -m pytest tests/test_artifact_consistency.py
 	env -u COSIGN_PASSWORD $(MAKE) sbom PYTHON="$(PYTHON)"
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
-		--sbom-dir "$(SBOM_DIR)"
+		--sbom-dir "$(SBOM_DIR)" $(UNLOGGED_SIGNATURE_DECLARE)
 	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
 		"$(RELEASE_ATTESTATION)"
@@ -698,7 +705,7 @@ release-build-promoted:
 	env -u COSIGN_PASSWORD $(MAKE) sbom PYTHON="$(PYTHON)"
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-release-attestation.py \
 		--ci-gate "$(CI_GATE)" \
-		--sbom-dir "$(SBOM_DIR)"
+		--sbom-dir "$(SBOM_DIR)" $(UNLOGGED_SIGNATURE_DECLARE)
 	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
 		"$(RELEASE_ATTESTATION)"
@@ -746,7 +753,7 @@ release-build-staging:
 		--staging-only \
 		--impact-base "$(BASE)" \
 		--impact-plan "$(STAGING_IMPACT_PLAN)" \
-		--sbom-dir "$(SBOM_DIR)"
+		--sbom-dir "$(SBOM_DIR)" $(UNLOGGED_SIGNATURE_DECLARE)
 	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(RELEASE_ATTESTATION_BUNDLE)" \
 		"$(RELEASE_ATTESTATION)"
@@ -801,7 +808,7 @@ release-deploy:
 deploy-host-bundle:
 	env -u COSIGN_PASSWORD $(PYTHON) scripts/build-deploy-host-bundle.py \
 		--python "$(PYTHON)" \
-		--output "$(DEPLOY_HOST_ARCHIVE)" $(if $(DEPLOY_HOST_WHEELHOUSE),--wheelhouse "$(DEPLOY_HOST_WHEELHOUSE)",) $(if $(DEPLOY_HOST_TOOLS_DIR),--tools-dir "$(DEPLOY_HOST_TOOLS_DIR)",) $(if $(filter true yes 1,$(DEPLOY_HOST_ALLOW_DIRTY)),--allow-dirty,)
+		--output "$(DEPLOY_HOST_ARCHIVE)" $(if $(DEPLOY_HOST_WHEELHOUSE),--wheelhouse "$(DEPLOY_HOST_WHEELHOUSE)",) $(if $(DEPLOY_HOST_TOOLS_DIR),--tools-dir "$(DEPLOY_HOST_TOOLS_DIR)",) $(if $(filter true yes 1,$(DEPLOY_HOST_ALLOW_DIRTY)),--allow-dirty,) $(UNLOGGED_SIGNATURE_DECLARE)
 	$(COSIGN_SIGN_BLOB) \
 		--bundle "$(DEPLOY_HOST_SIGNATURE_BUNDLE)" \
 		"$(DEPLOY_HOST_ARCHIVE)"

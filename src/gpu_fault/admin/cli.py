@@ -19,7 +19,7 @@ from gpu_fault.admin import aurora_failback, eks_nodegroup_prepare, operator_ide
 from gpu_fault.admin import capacity_fleet
 from gpu_fault.admin import cpu_rolling_update_command, hyperpod_scheduled_update
 from gpu_fault.admin.cpu_rolling_update import load_last_run
-from gpu_fault.admin import remediation_storm
+from gpu_fault.admin import remediation_storm, transparency_backfill
 from gpu_fault.admin.deploy_host_binding import (
     DEPLOY_HOST_STATE_BINDING as DEPLOY_HOST_STATE_BINDING,
     enforce_deploy_host_state_dir,
@@ -518,6 +518,7 @@ def parser() -> argparse.ArgumentParser:
     add_store_maintenance_command(commands, _add_managed_site_arguments)
     remediation_storm.add_command(commands, _add_managed_site_arguments)
     aurora_failback.add_command(commands, _add_managed_site_arguments)
+    transparency_backfill.add_command(commands, _add_managed_site_arguments)
     add_replace_resource_command(commands, _add_managed_site_arguments)
     join = commands.add_parser(
         "join-cluster",
@@ -894,7 +895,13 @@ def _run_readonly_managed_command(
                 text=is_status,
             )
         if is_status:
-            print_status_report(completed.stdout, site=site, site_file=site_file)
+            failing_signature = print_status_report(
+                completed.stdout, site=site, site_file=site_file
+            )
+            # The release signed without a log entry for too long: status is
+            # red until the backfill (the engine's verdict was otherwise kept).
+            if failing_signature and completed.returncode == 0:
+                return 1
         elif arguments.command == "verify" and completed.returncode == 0:
             # Every cluster judged again: a join/remove's findings are history.
             clear_membership_findings(site_file.parent)
@@ -1356,6 +1363,7 @@ def run(arguments: argparse.Namespace) -> int:
         "store-maintenance": run_store_maintenance_command,
         "replace-resource": run_replace_resource_command,
         remediation_storm.VERB: remediation_storm.run_command,
+        transparency_backfill.VERB: transparency_backfill.run_command,
     }
     if arguments.command in site_verbs:
         site_file = cast(Path, _managed_site_file(arguments, command=arguments.command))

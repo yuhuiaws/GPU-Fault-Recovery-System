@@ -117,12 +117,15 @@ def run_source_deploy(
     extra_environment: Mapping[str, str] | None = None,
     wait_for_email_confirmation: int = 0,
     rerun_command: str | None = None,
+    unlogged_signature_reason: str | None = None,
 ) -> int:
     """Run the source preparer (``scripts/staging_deploy.py``) for this deploy.
 
     It receives the resolved inputs; ``rerun_command`` is the operator's own
     command line (``deploy_command.deploy_rerun_command``), which a stop in its
-    first minute prints to be rerun.
+    first minute prints to be rerun; ``unlogged_signature_reason`` is the
+    operator's ``--allow-unlogged-signature --reason``, passed as the same two
+    arguments.
     """
 
     repository_root = resolve_source_repository(
@@ -157,6 +160,10 @@ def run_source_deploy(
         )
     if rerun_command:
         command.extend(("--rerun-command", rerun_command))
+    if unlogged_signature_reason is not None:
+        command.extend(
+            ("--allow-unlogged-signature", "--reason", unlogged_signature_reason)
+        )
     completed = run_driver(
         command,
         cwd=repository_root,

@@ -316,7 +316,7 @@ def test_release_deploy_profile_plan_json_is_read_only(
     )
     monkeypatch.setattr(release_deploy, "plan_runtime_profile", planner)
     for module, name in (
-        (release_deploy, "verify_attestation"),
+        (release_deploy, "verify_attestation_signature"),
         (release_deploy, "execute_release"),
         (release_deploy_profile, "write_profile_plan"),
     ):

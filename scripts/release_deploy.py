@@ -40,7 +40,7 @@ from gpu_fault_release.regional_validation_evidence import (
 )
 
 if __package__:
-    from scripts.release_attestation import verify_attestation
+    from scripts.release_attestation import verify_attestation_signature
     from scripts.release_deploy_evidence import (
         PreparedRelease,
         ReleaseDeployError,
@@ -80,7 +80,7 @@ if __package__:
         read_live_release_state as _read_live_release_state,
     )
 else:
-    from release_attestation import verify_attestation
+    from release_attestation import verify_attestation_signature
     from release_deploy_evidence import (
         PreparedRelease,
         ReleaseDeployError,
@@ -857,12 +857,50 @@ def _commit_and_complete(
     )
 
 
+def record_release_signing(
+    prepared: PreparedRelease,
+    signing: Mapping[str, Any],
+    artifacts: tuple[Path, Path] | None,
+) -> None:
+    """The release record names how its attestation was signed and accepted.
+
+    The attestation and its bundle are kept beside the record: ``dist/`` is
+    rewritten by the next build, and ``gpu-fault-admin status`` and
+    ``backfill-transparency-log`` read the copies of the release that runs.
+    """
+
+    if artifacts is not None:
+        for source, name in zip(
+            artifacts, ("attestation.json", "attestation.sigstore.json")
+        ):
+            target = prepared.state_dir / name
+            temporary = target.with_name(f".{name}.tmp")
+            temporary.write_bytes(source.read_bytes())
+            temporary.chmod(0o600)
+            os.replace(temporary, target)
+    state = json.loads((prepared.state_dir / "state.json").read_text(encoding="utf-8"))
+    update_phase(
+        prepared,
+        str(state.get("phase") or "PREPARED"),
+        signing={
+            **dict(signing),
+            **(
+                {"bundle": str(prepared.state_dir / "attestation.sigstore.json")}
+                if artifacts is not None
+                else {}
+            ),
+        },
+    )
+
+
 def _execute_release_locked(
     site_file: Path,
     *,
     admin_email: str | None = None,
     run_checks: bool = True,
     live_state: dict[str, Any] | None = None,
+    signing: Mapping[str, Any] | None = None,
+    signing_artifacts: tuple[Path, Path] | None = None,
 ) -> PreparedRelease:
     if admin_email:
         raise ReleaseDeployError(
@@ -904,6 +942,8 @@ def _execute_release_locked(
             profile_plan=profile_plan,
             live_state=current_state,
         )
+        if signing is not None:
+            record_release_signing(prepared, signing, signing_artifacts)
     deployment_succeeded = False
     commit_started = False
     deployment: dict[str, Any] = {}
@@ -1019,6 +1059,8 @@ def execute_release(
     admin_email: str | None = None,
     run_checks: bool = True,
     live_state: dict[str, Any] | None = None,
+    signing: Mapping[str, Any] | None = None,
+    signing_artifacts: tuple[Path, Path] | None = None,
 ) -> PreparedRelease:
     try:
         with profile_approval_lock(site_file.parent):
@@ -1027,6 +1069,8 @@ def execute_release(
                 admin_email=admin_email,
                 run_checks=run_checks,
                 live_state=live_state,
+                signing=signing,
+                signing_artifacts=signing_artifacts,
             )
     except ProfileApprovalError as exc:
         raise ReleaseDeployError(str(exc)) from exc
@@ -1062,6 +1106,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--allow-staging-release",
         action="store_true",
         help="allow a staging-only signed release; never use for production",
+    )
+    parser.add_argument(
+        "--allow-unlogged-signature",
+        action="store_true",
+        help=(
+            "the deploy carries the operator's --allow-unlogged-signature: accept "
+            "an attestation bundle without a transparency-log entry whose signed "
+            "attestation declares it"
+        ),
     )
     parser.add_argument(
         "--profile-plan-json",
@@ -1110,7 +1163,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "release-deploy requires a signed prebuilt attestation"
             )
         with admin_phase("release-deploy", "attestation"):
-            attestation = verify_attestation(
+            attestation, verification = verify_attestation_signature(
                 ROOT,
                 arguments.prebuilt_attestation.resolve(),
                 signature=(
@@ -1132,6 +1185,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 certificate_identity=arguments.certificate_identity,
                 certificate_oidc_issuer=(arguments.certificate_oidc_issuer),
                 allow_staging=arguments.allow_staging_release,
+                allow_unlogged=arguments.allow_unlogged_signature,
+                # Read only for a bundle without a log entry and no consent:
+                # ``config`` re-rolling the release that already runs.
+                live_release=lambda: read_live_release_state(site_file),
             )
         _manifest, current_release_id = release_manifest(ROOT)
         subject = dict(attestation.get("subject") or {})
@@ -1145,10 +1202,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         prepared = execute_release(
             site_file,
             run_checks=False,
+            signing=verification.record(arguments.prebuilt_attestation.resolve()),
+            signing_artifacts=(
+                (
+                    arguments.prebuilt_attestation.resolve(),
+                    arguments.prebuilt_bundle.resolve(),
+                )
+                if arguments.prebuilt_bundle is not None
+                else None
+            ),
         )
     except (OSError, ReleaseDeployError, subprocess.SubprocessError, ValueError) as exc:
         return report_failure("release-deploy", exc)
     state = json.loads((prepared.state_dir / "state.json").read_text(encoding="utf-8"))
+    for line in signing_summary_lines(
+        state.get("signing"), release_id=prepared.release_id, state_dir=site_file.parent
+    ):
+        print(f"release-deploy: {line}", file=sys.stderr, flush=True)
     print(
         json.dumps(
             {
@@ -1166,6 +1236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "stability": state.get("stability"),
                 "release_summary": state.get("release_summary"),
                 "completion_warnings": state.get("completion_warnings", []),
+                "signing": state.get("signing"),
                 # GPU clusters the release found without nodes (state, reason,
                 # groups), as its verify named them.
                 "zero_node_clusters": (
@@ -1177,6 +1248,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     )
     return 0
+
+
+def signing_summary_lines(
+    signing: object, *, release_id: str, state_dir: Path
+) -> list[str]:
+    """The deploy summary's signing lines: an unlogged release, a pinned root."""
+
+    if not isinstance(signing, Mapping):
+        return []
+    lines = []
+    if signing.get("transparency_log") == "unlogged":
+        lines.append(
+            f"release {release_id} is signed without a transparency-log entry "
+            f"(declared {signing.get('declared_at')}: {signing.get('reason')}); "
+            "run gpu-fault-admin backfill-transparency-log --state-dir "
+            f"{state_dir} once the transparency log answers"
+        )
+    pin = signing.get("trust_pin")
+    if isinstance(pin, Mapping):
+        lines.append(
+            f"release {release_id} was verified against the site-pinned Sigstore "
+            f"trust root (pinned {pin.get('pinned_at')}, "
+            f"{pin.get('pin_age_days')} days old at use) because Sigstore TUF "
+            "did not answer"
+        )
+    return lines
 
 
 if __name__ == "__main__":

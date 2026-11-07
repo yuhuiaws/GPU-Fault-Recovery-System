@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 if __package__:
+    from scripts import signing_transparency as transparency
     from scripts.deploy_host_bundle import (
         DeployHostBundleError,
         dependency_identity,
@@ -19,6 +20,7 @@ if __package__:
         validate_host_compatibility,
     )
 else:
+    import signing_transparency as transparency
     from deploy_host_bundle import (
         DeployHostBundleError,
         dependency_identity,
@@ -70,7 +72,18 @@ def verify_bundle_signature(
     certificate_identity: str | None,
     certificate_oidc_issuer: str | None,
     allow_unsigned: bool,
+    allow_unlogged: bool = False,
 ) -> None:
+    """``cosign verify-blob`` of the archive, as it always ran.
+
+    A signature bundle without a transparency-log entry is taken only with
+    ``allow_unlogged`` (the deploy's ``--allow-unlogged-signature``, handed
+    down) and a ``"signing": {"transparency_log": "unlogged", ...}``
+    declaration in the archive's own -- signed -- manifest. When cosign's live
+    TUF fetch fails, the logged signature is checked once more against the
+    site's pinned trust root (``signing_transparency``).
+    """
+
     if allow_unsigned:
         return
     if signature_bundle is None:
@@ -94,8 +107,46 @@ def verify_bundle_signature(
                 certificate_oidc_issuer,
             ]
         )
+    if transparency.bundle_transparency(signature_bundle) == transparency.UNLOGGED:
+        try:
+            transparency.require_unlogged_acceptance(
+                artifact=archive,
+                declaration=transparency.artifact_declaration(archive),
+                keyed=bool(cosign_key),
+                approved=allow_unlogged,
+                approval_hint=transparency.UNLOGGED_REFUSAL_HINT,
+            )
+        except transparency.SigningTransparencyError as exc:
+            raise DeployHostSetupError(str(exc)) from None
+        command.append(transparency.IGNORE_TLOG_FLAG)
     command.append(str(archive))
-    _run(command, capture=True)
+    pin_directory = transparency.pin_directory_for_key(cosign_key)
+    try:
+        _run(command, capture=True)
+    except DeployHostSetupError as exc:
+        cause = transparency.tuf_fetch_failure(str(exc))
+        pin = transparency.load_trust_pin(pin_directory) if cause else None
+        if pin is None:
+            raise
+        _run(
+            [*command[:-1], "--trusted-root", str(pin.trusted_root), command[-1]],
+            capture=True,
+        )
+        transparency.record_pin_use(pin.directory, pin.usage())
+        print(
+            f"setup-deploy-host: Sigstore TUF did not answer ({cause}); verified "
+            f"the bundle signature against {pin.describe()}",
+            file=sys.stderr,
+        )
+        return
+    if transparency.IGNORE_TLOG_FLAG in command:
+        print(
+            f"setup-deploy-host: {archive.name} is signed WITHOUT a "
+            "transparency-log entry; accepted with --allow-unlogged-signature",
+            file=sys.stderr,
+        )
+    else:
+        transparency.refresh_trust_pin(pin_directory)
 
 
 def validate_bundle_source(
@@ -730,6 +781,7 @@ def setup_deploy_host(
     allow_unsigned: bool,
     allow_network: bool,
     allow_source_mismatch: bool,
+    allow_unlogged: bool = False,
 ) -> dict[str, Any]:
     if archive is None and not allow_network:
         raise DeployHostSetupError(
@@ -756,6 +808,7 @@ def setup_deploy_host(
             certificate_identity=certificate_identity,
             certificate_oidc_issuer=certificate_oidc_issuer,
             allow_unsigned=allow_unsigned,
+            allow_unlogged=allow_unlogged,
         )
         if venv.is_dir():
             state_path = venv / STATE_NAME
@@ -907,6 +960,16 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--allow-unsigned", action="store_true")
     parser.add_argument("--allow-network", action="store_true")
     parser.add_argument("--allow-source-mismatch", action="store_true")
+    parser.add_argument(
+        transparency.ALLOW_UNLOGGED_FLAG,
+        dest="allow_unlogged_signature",
+        action="store_true",
+        help=(
+            "accept a signature bundle without a transparency-log entry when the "
+            "archive's signed manifest declares it (the deploy's "
+            "--allow-unlogged-signature)"
+        ),
+    )
     parser.add_argument("--check", action="store_true")
     options = parser.parse_args(arguments)
     repo_root = options.repo_root.expanduser().resolve()
@@ -938,6 +1001,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 allow_unsigned=options.allow_unsigned,
                 allow_network=options.allow_network,
                 allow_source_mismatch=options.allow_source_mismatch,
+                allow_unlogged=options.allow_unlogged_signature,
             )
         )
     except (

@@ -28,6 +28,11 @@ from gpu_fault.admin.rds_ca_bundle_drift import rds_ca_bundle_findings
 from gpu_fault.admin.resource_registry_outcome import FIELD, status_view
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault_release.regional_admin_commands import status_header_lines
+from gpu_fault_release.regional_release_signing import (
+    release_signing_view,
+    trust_pin_view,
+    with_failing_check,
+)
 
 
 def status_document(stdout: str) -> dict[str, Any] | None:
@@ -106,7 +111,7 @@ def print_status_report(
     site: RenderedSite | None = None,
     findings: Sequence[str] = (),
     site_file: Path | None = None,
-) -> None:
+) -> bool:
     """Five readable lines on stderr, then the engine's JSON document.
 
     The JSON document is what scripts parse (`staging_live_evidence`, the
@@ -142,7 +147,16 @@ def print_status_report(
     on GPU clusters it did not target adds them (``membership_verify``), as
     findings and the ``membership_verify_findings`` field, until the next such
     verb or a passing verify of the whole site.
+
+    With ``site_file`` the release record also says how the running release's
+    attestation was signed (``regional_release_signing``): a release signed
+    without a transparency-log entry is a finding for its first
+    ``UNLOGGED_ADVISORY_HOURS``, then the ``release_signature`` failing check
+    (``healthy`` false, and the return value True so the command exits 1)
+    until ``backfill-transparency-log`` logs it; the pinned Sigstore trust
+    root's age is the ``sigstore_trust_pin`` field, a WARN finding when old.
     """
+    failing_signature = False
     if site is not None:
         state_dir = site_file.parent if site_file is not None else None
         findings = [
@@ -164,15 +178,35 @@ def print_status_report(
         view = status_view(site_file.parent, release_id=_running_release_id(report))
         # The last join/remove-cluster's findings on clusters it did not target.
         membership, membership_lines = membership_verify.status_view(site_file.parent)
+        signing, signing_findings, signing_check = release_signing_view(
+            site_file.parent, release_id=_running_release_id(report)
+        )
+        pin, pin_findings = trust_pin_view(site_file.parent)
+        signing_fields: dict[str, Any] = {
+            **({"release_signing": signing} if signing is not None else {}),
+            **({"sigstore_trust_pin": pin} if pin is not None else {}),
+        }
+        if signing_check is not None and report is not None:
+            report = with_failing_check(report, signing_check)
+            signing_fields.update(health=report["health"], healthy=False)
+            failing_signature = True
         findings = [
             *findings,
             *declaration_findings,
             *([view["finding"]] if view["finding"] else []),
             *membership_lines,
+            *signing_findings,
+            *pin_findings,
         ]
         stdout = _with_deploy_host_fields(
             stdout,
-            {**fields, FIELD: view, **capacity_topology_field(report), **membership},
+            {
+                **fields,
+                FIELD: view,
+                **capacity_topology_field(report),
+                **membership,
+                **signing_fields,
+            },
         )
     log_path = os.environ.get(ADMIN_LOG_ENVIRONMENT, "").strip()
     destination = "stdout" + (f" (also in {log_path})" if log_path else "")
@@ -189,3 +223,4 @@ def print_status_report(
     if stdout:
         sys.stdout.write(stdout)
         sys.stdout.flush()
+    return failing_signature

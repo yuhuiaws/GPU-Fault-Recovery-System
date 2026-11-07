@@ -1,15 +1,75 @@
+"""The signed release attestation: what it binds and how it is verified.
+
+Verification is ``cosign verify-blob`` with the site key (or a keyless
+identity) over the attestation, after every digest it binds was checked
+against the files on disk. A bundle with a transparency-log entry takes the
+same command as always; when cosign's live TUF fetch fails, it is repeated once
+against the site's pinned trust root (``signing_transparency``). A bundle
+without a log entry is refused unless the signed attestation declares unlogged
+signing (``"signing": {"transparency_log": "unlogged", ...}``) and one of two
+approvals holds: ``allow_unlogged`` -- the operator's
+``--allow-unlogged-signature`` on the command that is running -- or the
+cluster's own release record, read through ``live_release``, naming this
+release and its delivery digest as the committed live release. That record is
+written by the release engine with the operator's cluster credentials, so a
+holder of the signing key alone can satisfy neither; a forged attestation
+that passes the second one attests exactly the delivery already deployed.
+"""
+
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-from pathlib import Path
 import subprocess
+import sys
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+
+if __package__:
+    from scripts import signing_transparency as transparency
+else:
+    import signing_transparency as transparency
 
 
 class ReleaseAttestationError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class SignatureVerification:
+    """How the attestation's signature was accepted, for the release record."""
+
+    #: ``logged``, ``unlogged`` or ``unknown`` (no bundle, another format).
+    transparency_log: str
+    declaration: Mapping[str, str] | None = None
+    #: ``consent`` or ``live_release`` for an unlogged bundle, else None.
+    approval: str | None = None
+    #: ``signing_transparency.TrustPin.usage`` when the pinned root was used.
+    trust_pin: Mapping[str, Any] | None = None
+
+    def record(self, attestation: Path) -> dict[str, Any]:
+        """The ``signing`` block of a release or source-deploy record."""
+
+        value: dict[str, Any] = {
+            "transparency_log": self.transparency_log,
+            "attestation_sha256": sha256(attestation),
+        }
+        if self.declaration is not None:
+            value["reason"] = self.declaration["reason"]
+            value["declared_at"] = self.declaration["declared_at"]
+        if self.approval is not None:
+            value["approval"] = self.approval
+        # Which Sigstore trust root the verification read: the live TUF one,
+        # the site's pinned copy, or none (a key-only check without a log entry).
+        value["trusted_root"] = (
+            "pinned" if self.trust_pin else "none" if self.approval else "tuf"
+        )
+        if self.trust_pin:
+            value["trust_pin"] = dict(self.trust_pin)
+        return value
 
 
 PRODUCTION_QUALITY_GATES = (
@@ -97,6 +157,7 @@ def build_attestation(
     impact_plan_path: Path | None = None,
     ci_gate_path: Path | None = None,
     sbom_dir: Path | None = None,
+    unlogged_signature_reason: str | None = None,
 ) -> dict[str, Any]:
     manifest = load_manifest(manifest_path, allow_staging=staging_only)
     if manifest.get("staging_only", False) is not staging_only:
@@ -175,6 +236,11 @@ def build_attestation(
         sbom_entries = _sbom_entries(root, sbom_dir)
         if sbom_entries:
             result["sbom"] = sbom_entries
+    if unlogged_signature_reason is not None:
+        # Inside the signed bytes: the only place a verifier trusts it.
+        result[transparency.DECLARATION_FIELD] = transparency.unlogged_declaration(
+            unlogged_signature_reason
+        )
     return result
 
 
@@ -216,7 +282,63 @@ def verify_attestation(
     certificate_identity: str | None,
     certificate_oidc_issuer: str | None,
     allow_staging: bool = False,
+    allow_unlogged: bool = False,
+    live_release: Callable[[], Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    return verify_attestation_signature(
+        root,
+        attestation_path,
+        signature=signature,
+        bundle=bundle,
+        cosign_key=cosign_key,
+        certificate=certificate,
+        certificate_identity=certificate_identity,
+        certificate_oidc_issuer=certificate_oidc_issuer,
+        allow_staging=allow_staging,
+        allow_unlogged=allow_unlogged,
+        live_release=live_release,
+    )[0]
+
+
+def _live_release_approves(
+    live_release: Callable[[], Mapping[str, Any]] | None,
+    subject: Mapping[str, Any],
+) -> bool:
+    """Whether the cluster's committed live release is this attestation's."""
+
+    if live_release is None:
+        return False
+    try:
+        state = live_release()
+    except Exception as exc:  # noqa: BLE001 - any unreadable record approves nothing
+        raise ReleaseAttestationError(
+            "the release is signed without a transparency-log entry and the live "
+            f"release record cannot be read to approve it: {exc}"
+        ) from None
+    return (
+        state.get("transaction_committed") is True
+        and str(state.get("phase") or "").lower() in {"complete", "completed"}
+        and bool(subject.get("release_id"))
+        and state.get("release_id") == subject.get("release_id")
+        and bool(subject.get("delivery_sha256"))
+        and state.get("release_delivery_sha256") == subject.get("delivery_sha256")
+    )
+
+
+def verify_attestation_signature(
+    root: Path,
+    attestation_path: Path,
+    *,
+    signature: Path | None,
+    bundle: Path | None,
+    cosign_key: str | None,
+    certificate: Path | None,
+    certificate_identity: str | None,
+    certificate_oidc_issuer: str | None,
+    allow_staging: bool = False,
+    allow_unlogged: bool = False,
+    live_release: Callable[[], Mapping[str, Any]] | None = None,
+) -> tuple[dict[str, Any], SignatureVerification]:
     value = json.loads(attestation_path.read_text(encoding="utf-8"))
     if not isinstance(value, dict) or value.get("schema_version") != 1:
         raise ReleaseAttestationError("release attestation schema_version must be 1")
@@ -310,6 +432,35 @@ def verify_attestation(
         raise ReleaseAttestationError(
             "prebuilt release signature or bundle is required"
         )
+    try:
+        declaration = transparency.payload_declaration(value)
+    except transparency.SigningTransparencyError as exc:
+        raise ReleaseAttestationError(f"release attestation {exc}") from None
+    transparency_log = (
+        transparency.bundle_transparency(bundle)
+        if bundle is not None
+        else transparency.UNKNOWN
+    )
+    approval: str | None = None
+    if transparency_log == transparency.UNLOGGED:
+        if allow_unlogged:
+            approval = "consent"
+        elif (
+            cosign_key
+            and declaration is not None
+            and _live_release_approves(live_release, subject)
+        ):
+            approval = "live_release"
+        try:
+            transparency.require_unlogged_acceptance(
+                artifact=attestation_path,
+                declaration=declaration,
+                keyed=bool(cosign_key),
+                approved=approval is not None,
+                approval_hint=transparency.UNLOGGED_REFUSAL_HINT,
+            )
+        except transparency.SigningTransparencyError as exc:
+            raise ReleaseAttestationError(str(exc)) from None
     command = ["cosign", "verify-blob"]
     if bundle is not None:
         command.extend(["--bundle", str(bundle)])
@@ -338,17 +489,31 @@ def verify_attestation(
         )
     if signature is not None:
         command.extend(["--signature", str(signature)])
+    if approval is not None:
+        command.append(transparency.IGNORE_TLOG_FLAG)
     command.append(str(attestation_path))
-    completed = subprocess.run(
+    completed = transparency.run_verify_blob(
         command,
+        pin_directory=transparency.pin_directory_for_key(cosign_key),
         cwd=root,
-        check=False,
-        env=os.environ,
-        capture_output=True,
-        text=True,
+        environment=os.environ,
     )
     if completed.returncode:
         raise ReleaseAttestationError(
             "cosign verification failed: " + completed.stderr.strip()
         )
-    return value
+    if approval is not None and declaration is not None:
+        print(
+            f"release-attestation: {value['subject'].get('release_id')} is signed "
+            "WITHOUT a transparency-log entry "
+            f"(declared {declaration['declared_at']}: {declaration['reason']}); "
+            f"accepted by {approval.replace('_', ' ')}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return value, SignatureVerification(
+        transparency_log=transparency_log,
+        declaration=declaration,
+        approval=approval,
+        trust_pin=completed.pinned.usage() if completed.pinned else None,
+    )

@@ -26,6 +26,7 @@ from gpu_fault.admin.release_postgres import isolated_postgres_allocation
 from gpu_fault_release import REPOSITORY_ROOT_ENV
 
 if __package__:
+    from scripts import signing_transparency as transparency
     from scripts.setup_deploy_host import prune_venv_versions
     from scripts.staging_deploy_inputs import (
         dcgm_declaration_mode,
@@ -50,8 +51,22 @@ if __package__:
         read_live_status,
         successful_source_live_matches,
     )
+    from scripts.staging_signing import (
+        cached_unlogged_bundle,
+        consent_environment,
+        deploy_host_signing_refusal,
+        release_record_signing,
+        report_unlogged_deploy,
+        resolve_unlogged_consent,
+        signing_result,
+        success_record_command,
+        success_record_signing,
+        trust_pin_used_since,
+        verify_with_trust_pin,
+    )
     from scripts.staging_source_snapshot import _run, prepare_source_checkout
     from scripts.staging_state_hygiene import (
+        require_state_outside_repository,
         DeployHostArtifacts,
         SigningMaterial,
         SourceCheckout,
@@ -66,6 +81,7 @@ if __package__:
         source_success_paths,
     )
 else:
+    import signing_transparency as transparency
     from setup_deploy_host import prune_venv_versions
     from staging_deploy_inputs import (
         dcgm_declaration_mode,
@@ -90,8 +106,22 @@ else:
         read_live_status,
         successful_source_live_matches,
     )
+    from staging_signing import (
+        cached_unlogged_bundle,
+        consent_environment,
+        deploy_host_signing_refusal,
+        release_record_signing,
+        report_unlogged_deploy,
+        resolve_unlogged_consent,
+        signing_result,
+        success_record_command,
+        success_record_signing,
+        trust_pin_used_since,
+        verify_with_trust_pin,
+    )
     from staging_source_snapshot import _run, prepare_source_checkout
     from staging_state_hygiene import (
+        require_state_outside_repository,
         DeployHostArtifacts,
         SigningMaterial,
         SourceCheckout,
@@ -108,11 +138,8 @@ else:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-#: Pending changes of the next deploy only an application release applies:
-#: drift the release's own probes see (observability, Aurora refresh, a live
-#: DCGM exporter serving another mode than recorded) and a DCGM host engine
-#: mode the site records or its node groups declare but no release rolled.
-#: Every shortcut (UNCHANGED, QUALITY_ONLY, DEPLOY_HOST_ONLY) would leave it.
+
+
 RELEASE_ONLY_CHANGES = frozenset(
     {
         "observability_drift",
@@ -280,6 +307,7 @@ def record_trusted_ci_candidate(
     state_dir: Path,
     signing: SigningMaterial,
     candidate: Mapping[str, object],
+    unlogged_reason: str | None = None,
 ) -> None:
     output = _run(
         [
@@ -298,9 +326,12 @@ def record_trusted_ci_candidate(
             str(candidate["run_id"]),
             "--signing-key",
             str(signing.private_key),
+            *(["--unlogged-signature"] if unlogged_reason is not None else []),
         ],
         cwd=repository_root,
-        env={**os.environ, "COSIGN_PASSWORD": signing.password},
+        env=consent_environment(
+            {**os.environ, "COSIGN_PASSWORD": signing.password}, unlogged_reason
+        ),
         capture=True,
     )
     try:
@@ -319,12 +350,15 @@ def ensure_deploy_host_bundle(
     repository_root: Path,
     signing: SigningMaterial,
     wheelhouse_cache: Path | None = None,
+    unlogged_reason: str | None = None,
 ) -> bool:
     present = (
         artifacts.archive.is_file(),
         artifacts.checksum.is_file(),
         artifacts.signature_bundle.is_file(),
     )
+    if all(present) and cached_unlogged_bundle(artifacts, unlogged_reason):
+        present = (True, True, False)
     if any(present) and not all(present):
         for path in (
             artifacts.archive,
@@ -335,7 +369,9 @@ def ensure_deploy_host_bundle(
     if all(present):
         return True
     artifacts.archive.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    environment = {**os.environ, "COSIGN_PASSWORD": signing.password}
+    environment = consent_environment(
+        {**os.environ, "COSIGN_PASSWORD": signing.password}, unlogged_reason
+    )
     command = [
         "make",
         "deploy-host-bundle",
@@ -343,14 +379,22 @@ def ensure_deploy_host_bundle(
         f"COSIGN_SIGNING_KEY={signing.private_key}",
         f"DEPLOY_HOST_ARCHIVE={artifacts.archive}",
         f"DEPLOY_HOST_SIGNATURE_BUNDLE={artifacts.signature_bundle}",
+        # Explicit either way, so an exported value never decides it.
+        f"UNLOGGED_SIGNATURE={'1' if unlogged_reason is not None else ''}",
     ]
     if wheelhouse_cache is not None:
         command.append(f"DEPLOY_HOST_WHEELHOUSE={wheelhouse_cache}")
-    _run(
-        command,
-        cwd=repository_root,
-        env=environment,
-    )
+    try:
+        _run(
+            command,
+            cwd=repository_root,
+            env=environment,
+        )
+    except StagingDeployError as exc:
+        refusal = deploy_host_signing_refusal(artifacts)
+        if refusal is None:
+            raise
+        raise refusal from exc
     if not all(
         path.is_file()
         for path in (
@@ -370,6 +414,7 @@ def ensure_deploy_host_venv(
     signing: SigningMaterial,
     artifacts: DeployHostArtifacts,
     lock_fd: int,
+    allow_unlogged: bool = False,
 ) -> Path:
     """Install the signed bundle into ``deployer-venv`` and bind it to the state.
 
@@ -392,6 +437,7 @@ def ensure_deploy_host_venv(
             str(artifacts.signature_bundle),
             "--cosign-key",
             str(signing.public_key),
+            *([transparency.ALLOW_UNLOGGED_FLAG] if allow_unlogged else []),
         ],
         cwd=repository_root,
         env=environment,
@@ -429,6 +475,7 @@ def load_successful_source_deploy(
     state_dir: Path,
     *,
     signing: SigningMaterial,
+    allow_unlogged: bool = False,
 ) -> dict[str, object] | None:
     state_path, signature_path = source_success_paths(state_dir)
     present = (state_path.is_file(), signature_path.is_file())
@@ -436,18 +483,16 @@ def load_successful_source_deploy(
         return None
     if not all(present):
         raise StagingDeployError("successful source deploy authorization is incomplete")
-    _run(
-        [
-            "cosign",
-            "verify-blob",
-            "--bundle",
-            str(signature_path),
-            "--key",
-            str(signing.public_key),
-            str(state_path),
-        ],
+    verify_with_trust_pin(
+        success_record_command(
+            state_path,
+            signature_path,
+            public_key=signing.public_key,
+            allow_unlogged=allow_unlogged,
+        ),
         cwd=state_dir,
-        capture=True,
+        public_key=signing.public_key,
+        run=_run,
     )
     try:
         value = json.loads(state_path.read_text(encoding="utf-8"))
@@ -488,6 +533,9 @@ def record_successful_source_deploy(
     mode: str,
     live_evidence: Mapping[str, object],
     zero_node_clusters: Mapping[str, object] | None = None,
+    unlogged_reason: str | None = None,
+    release_signing: Mapping[str, object] | None = None,
+    trust_pin: Mapping[str, object] | None = None,
 ) -> Path:
     state_path, signature_path = source_success_paths(state_dir)
     application = identities.get("application")
@@ -525,6 +573,7 @@ def record_successful_source_deploy(
             if zero_node_clusters is not None
             else {}
         ),
+        **success_record_signing(unlogged_reason, release_signing, trust_pin),
     }
     temporary_state = state_path.with_suffix(".tmp")
     temporary_signature = signature_path.with_suffix(".tmp")
@@ -544,10 +593,13 @@ def record_successful_source_deploy(
             str(signing.private_key),
             "--bundle",
             str(temporary_signature),
+            *(["--unlogged"] if unlogged_reason is not None else []),
             str(temporary_state),
         ],
         cwd=state_dir,
-        env={**os.environ, "COSIGN_PASSWORD": signing.password},
+        env=consent_environment(
+            {**os.environ, "COSIGN_PASSWORD": signing.password}, unlogged_reason
+        ),
         capture=True,
     )
     temporary_signature.chmod(0o600)
@@ -773,6 +825,7 @@ def prepare_deploy_host_only_checkout(
     repository_root: Path,
     state_dir: Path,
     signing: SigningMaterial,
+    allow_unlogged: bool = False,
 ) -> bytes:
     site_file = state_dir / "site.yaml"
     original = site_file.read_bytes()
@@ -810,6 +863,14 @@ def prepare_deploy_host_only_checkout(
             "--cosign-key",
             str(signing.public_key),
             "--allow-staging-release",
+            # The release this copies is the live one: without a log entry it
+            # is taken on this command's consent or on the cluster's record
+            # of it as the committed live release.
+            *(
+                [transparency.ALLOW_UNLOGGED_FLAG]
+                if allow_unlogged
+                else ["--live-release-site", str(site_file)]
+            ),
         ],
         cwd=repository_root,
     )
@@ -835,6 +896,7 @@ def run_admin_deploy(
     staging_only_release: bool,
     impact_base: str,
     lock_fd: int,
+    unlogged_reason: str | None = None,
 ) -> None:
     command = [
         str(venv / "bin/gpu-fault-admin"),
@@ -859,6 +921,15 @@ def run_admin_deploy(
     )
     if staging_only_release:
         command.append("--staging-only-release")
+    if unlogged_reason is not None:
+        # The inner hop takes the consent from its own command line.
+        command.extend(
+            (
+                transparency.ALLOW_UNLOGGED_FLAG,
+                transparency.REASON_FLAG,
+                unlogged_reason,
+            )
+        )
     # The admin deploy re-runs the static gates inside the prepared snapshot,
     # which by construction carries no tool cache; pointing them at the state
     # directory is what makes the second run of an identical analysis cheap.
@@ -866,10 +937,13 @@ def run_admin_deploy(
         command,
         cwd=repository_root,
         env=admin_cli_environment(
-            {
-                **tool_cache_environment(state_dir),
-                SITE_OPERATION_LOCK_FD_ENV: str(lock_fd),
-            },
+            consent_environment(
+                {
+                    **tool_cache_environment(state_dir),
+                    SITE_OPERATION_LOCK_FD_ENV: str(lock_fd),
+                },
+                None,
+            ),
             repository_root=repository_root,
             venv=venv,
         ),
@@ -884,6 +958,7 @@ def _ensure_deploy_host(
     signing: SigningMaterial,
     artifacts: DeployHostArtifacts,
     lock_fd: int,
+    unlogged_reason: str | None = None,
 ) -> tuple[bool, Path]:
     """The signed bundle and the venv installed from it, built once if missing.
 
@@ -899,6 +974,7 @@ def _ensure_deploy_host(
         repository_root=source.repository_root,
         signing=signing,
         wheelhouse_cache=wheelhouse_cache,
+        unlogged_reason=unlogged_reason,
     )
     venv = ensure_deploy_host_venv(
         state_dir,
@@ -906,6 +982,7 @@ def _ensure_deploy_host(
         signing=signing,
         artifacts=artifacts,
         lock_fd=lock_fd,
+        allow_unlogged=unlogged_reason is not None,
     )
     return bundle_reused, venv
 
@@ -923,6 +1000,8 @@ def apply_source_deploy(
     trusted_ci_candidate: Mapping[str, object] | None,
     lock_fd: int,
     live_evidence: Mapping[str, object] | None = None,
+    unlogged_reason: str | None = None,
+    started_at: str | None = None,
 ) -> tuple[str, dict[str, object]]:
     """Apply ``prepared_mode`` and record the success that authorizes the next run.
 
@@ -955,12 +1034,14 @@ def apply_source_deploy(
             state_dir=state_dir,
             signing=signing,
             candidate=trusted_ci_candidate,
+            unlogged_reason=unlogged_reason,
         )
     if mode == "DEPLOY_HOST_ONLY":
         original_site = prepare_deploy_host_only_checkout(
             repository_root=source.repository_root,
             state_dir=state_dir,
             signing=signing,
+            allow_unlogged=unlogged_reason is not None,
         )
         try:
             run_admin_preflight(
@@ -983,6 +1064,7 @@ def apply_source_deploy(
             staging_only_release=source.snapshot,
             impact_base=arguments.base.strip(),
             lock_fd=lock_fd,
+            unlogged_reason=unlogged_reason,
         )
     # UNCHANGED deployed nothing, so the evidence read before the apply still
     # describes the site. An APPLICATION_RELEASE just wrote the summary the
@@ -1011,7 +1093,13 @@ def apply_source_deploy(
             if mode == "APPLICATION_RELEASE"
             else None
         ),
+        unlogged_reason=unlogged_reason,
+        release_signing=(
+            release_record_signing(state_dir) if mode == "APPLICATION_RELEASE" else None
+        ),
+        trust_pin=trust_pin_used_since(signing.public_key, started_at),
     )
+    report_unlogged_deploy(state_dir, unlogged_reason)
     return mode, evidence
 
 
@@ -1107,6 +1195,7 @@ def _prepare_deploy_host(
     artifacts: DeployHostArtifacts,
     venv: Path,
     lock_fd: int,
+    unlogged_reason: str | None = None,
 ) -> tuple[str, bool, Path]:
     """``(mode, bundle reused, venv)``: the deploy host, built once if missing."""
 
@@ -1117,6 +1206,7 @@ def _prepare_deploy_host(
             signing=signing,
             artifacts=artifacts,
             lock_fd=lock_fd,
+            unlogged_reason=unlogged_reason,
         )
         return mode, reused, venv
     if not (venv / "bin/gpu-fault-admin").is_file():
@@ -1131,6 +1221,7 @@ def _prepare_deploy_host(
             signing=signing,
             artifacts=artifacts,
             lock_fd=lock_fd,
+            unlogged_reason=unlogged_reason,
         )
         return "APPLICATION_RELEASE", reused, venv
     return mode, True, venv
@@ -1141,14 +1232,9 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
     state_dir = arguments.state_dir.expanduser().resolve()
     if not arguments.base.strip():
         raise StagingDeployError("impact test base must not be empty")
-    try:
-        state_dir.relative_to(repository_root)
-    except ValueError:
-        pass
-    else:
-        raise StagingDeployError(
-            "staging state directory must be outside the Git repository"
-        )
+    unlogged_reason = resolve_unlogged_consent(arguments)
+    started_at = transparency.utc_timestamp()
+    require_state_outside_repository(state_dir, repository_root)
     # Created before the gate runs so the gate has somewhere to record its
     # verdict; the directory is empty and 0700 either way, and nothing is
     # deployed from it until the gate has passed.
@@ -1197,7 +1283,9 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
     # a classification that another operation can invalidate has to be re-read,
     # which is the 45-second call this ordering deletes.
     with site_operation_lock(state_dir, wait=True) as lock_fd:
-        previous = load_successful_source_deploy(state_dir, signing=signing)
+        previous = load_successful_source_deploy(
+            state_dir, signing=signing, allow_unlogged=bool(unlogged_reason)
+        )
         venv = state_dir / "deployer-venv"
         report, live_evidence, profile_change_pending = pre_deploy_reading(
             previous=previous,
@@ -1264,6 +1352,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             artifacts=artifacts,
             venv=venv,
             lock_fd=lock_fd,
+            unlogged_reason=unlogged_reason,
         )
         prepared_mode = mode
 
@@ -1295,6 +1384,8 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             trusted_ci_candidate=trusted_ci_candidate,
             lock_fd=lock_fd,
             live_evidence=live_evidence,
+            unlogged_reason=unlogged_reason,
+            started_at=started_at,
         )
         try:
             prune_source_snapshots(
@@ -1333,6 +1424,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             "email_confirmation": email_confirmation.as_dict(),
             "live_release": live_release_block(report),
             "next_deploy": next_deploy_block(report),
+            "signing": signing_result(unlogged_reason),
         }
 
 
@@ -1366,6 +1458,18 @@ def parser() -> argparse.ArgumentParser:
     # ``gpu-fault-admin deploy`` passes the operator's command line
     # (``deploy_command.deploy_rerun_command``) for the email stop to print.
     value.add_argument("--rerun-command", help=argparse.SUPPRESS)
+    # The operator's consent from ``gpu-fault-admin deploy``, as typed there;
+    # never read from the environment.
+    value.add_argument(
+        transparency.ALLOW_UNLOGGED_FLAG,
+        dest="allow_unlogged_signature",
+        action="store_true",
+        help=(
+            "sign this deploy's artifacts with the site key only, without a "
+            "transparency-log entry; requires --reason"
+        ),
+    )
+    value.add_argument(transparency.REASON_FLAG, dest="reason")
     return value
 
 

@@ -76,6 +76,16 @@ def private_state_file(path: Path, description: str) -> Path:
     return path
 
 
+def require_state_outside_repository(state_dir: Path, repository_root: Path) -> None:
+    try:
+        state_dir.relative_to(repository_root)
+    except ValueError:
+        return
+    raise StagingDeployError(
+        "staging state directory must be outside the Git repository"
+    )
+
+
 def public_state_file(path: Path, description: str) -> Path:
     if not path.is_file():
         raise StagingDeployError(f"{description} is missing: {path}")

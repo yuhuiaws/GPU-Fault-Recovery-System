@@ -17,8 +17,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -46,6 +49,13 @@ from gpu_fault.admin.registration_anchor import (
 )
 from gpu_fault.admin.release_consent import add_release_consent_arguments
 from gpu_fault.admin.site import SiteConfigError
+from gpu_fault_release.regional_release_signing import (
+    ALLOW_UNLOGGED_FLAG,
+    REASON_FLAG,
+    UNLOGGED_SIGNATURE_REASON_ENV,
+    UnloggedSignatureError,
+    validate_reason,
+)
 
 # Written by ``scripts/staging_deploy.py`` (``staging_state_hygiene``) after a
 # successful source deploy; ``mode`` says whether a release was applied.
@@ -133,12 +143,71 @@ def add_deploy_command(commands: Any) -> None:
         help=argparse.SUPPRESS,
     )
     add_release_consent_arguments(deploy)
+    add_unlogged_signature_arguments(deploy)
     deploy.add_argument("--impact-base", default="origin/main", help=argparse.SUPPRESS)
     deploy.add_argument(
         "--prepared-source-release",
         action="store_true",
         help=argparse.SUPPRESS,
     )
+
+
+def add_unlogged_signature_arguments(deploy: argparse.ArgumentParser) -> None:
+    deploy.add_argument(
+        ALLOW_UNLOGGED_FLAG,
+        dest="allow_unlogged_signature",
+        action="store_true",
+        help=(
+            "the public Sigstore transparency log is unavailable: sign this "
+            "deploy's release with the site key only, without a transparency-log "
+            "entry; requires --reason. The signed attestation declares it, the "
+            "deploy summary and status name it until gpu-fault-admin "
+            "backfill-transparency-log logs the signature; for this deploy only, "
+            "never a site default"
+        ),
+    )
+    deploy.add_argument(
+        REASON_FLAG,
+        dest="reason",
+        metavar="REASON",
+        help=(
+            "why this deploy is signed without a transparency-log entry (one "
+            "line, recorded in the signed attestation); only with "
+            "--allow-unlogged-signature"
+        ),
+    )
+
+
+def unlogged_signature_reason(arguments: argparse.Namespace) -> str | None:
+    """The command's ``--allow-unlogged-signature --reason``: both or neither."""
+
+    allowed = bool(getattr(arguments, "allow_unlogged_signature", False))
+    reason = getattr(arguments, "reason", None)
+    if not allowed:
+        if reason is not None:
+            raise SiteConfigError(
+                f"{REASON_FLAG} is only used with {ALLOW_UNLOGGED_FLAG}"
+            )
+        return None
+    try:
+        return validate_reason(reason)
+    except UnloggedSignatureError as exc:
+        raise SiteConfigError(str(exc)) from None
+
+
+@contextmanager
+def unlogged_signature_environment(reason: str | None) -> Iterator[None]:
+    """This hop's children carry the reason; an inherited value never does."""
+
+    previous = os.environ.pop(UNLOGGED_SIGNATURE_REASON_ENV, None)
+    if reason is not None:
+        os.environ[UNLOGGED_SIGNATURE_REASON_ENV] = reason
+    try:
+        yield
+    finally:
+        os.environ.pop(UNLOGGED_SIGNATURE_REASON_ENV, None)
+        if previous is not None:
+            os.environ[UNLOGGED_SIGNATURE_REASON_ENV] = previous
 
 
 def add_deploy_action_arguments(deploy: argparse.ArgumentParser) -> None:
@@ -352,6 +421,12 @@ def refuse_rollback_options(arguments: argparse.Namespace) -> None:
                 "--supersede-failed-transaction",
                 getattr(arguments, "supersede_failed_transaction", False),
             ),
+            # A rollback signs nothing and verifies no signature.
+            (
+                ALLOW_UNLOGGED_FLAG,
+                getattr(arguments, "allow_unlogged_signature", False),
+            ),
+            (REASON_FLAG, getattr(arguments, "reason", None)),
         )
         if value
     ]
@@ -483,6 +558,7 @@ _RERUN_VALUE_OPTIONS: tuple[tuple[str, str], ...] = (
     ("reference", "--reference"),
     ("grafana_workspace_id", "--grafana-workspace-id"),
     ("grafana_viewer", "--grafana-viewer"),
+    ("reason", REASON_FLAG),
 )
 _RERUN_SWITCHES: tuple[tuple[str, str], ...] = (
     ("accept_schema_change", "--accept-schema-change"),
@@ -492,6 +568,7 @@ _RERUN_SWITCHES: tuple[tuple[str, str], ...] = (
     ),
     ("supersede_failed_transaction", "--supersede-failed-transaction"),
     ("allow_inflight_installs", "--allow-inflight-installs"),
+    ("allow_unlogged_signature", ALLOW_UNLOGGED_FLAG),
 )
 RERUN_REPEATED_OPTIONS = frozenset(
     {
@@ -528,6 +605,11 @@ def deploy_rerun_command(arguments: argparse.Namespace, state_dir: Path) -> str:
             # Typed for --registration-cluster, which is not repeated; a lone
             # --reference is refused.
             continue
+        if attribute == "reason" and not getattr(
+            arguments, "allow_unlogged_signature", False
+        ):
+            # A lone --reason is refused before any stop prints this line.
+            continue
         value = getattr(arguments, attribute, None)
         if attribute == "state_dir":
             value = state_dir
@@ -563,8 +645,11 @@ def run_public_deploy(
     An application release joins the delta itself right after the release
     (``pending_gpu_cluster_arns``); a deploy that applied no release -- the
     site would NOOP -- skips the 40-minute rollout and joins the delta directly.
+    The unlogged-signature consent is handed to the source preparer as its own
+    two arguments, never as an inherited variable.
     """
 
+    reason = unlogged_signature_reason(arguments)
     status = int(
         hooks.run_source_deploy(
             cpu_cluster_arn=cpu_cluster_arn,
@@ -581,6 +666,7 @@ def run_public_deploy(
                 getattr(arguments, "wait_for_email_confirmation", 0) or 0
             ),
             rerun_command=deploy_rerun_command(arguments, state_dir),
+            **({"unlogged_signature_reason": reason} if reason is not None else {}),
         )
     )
     if status or not delta or source_deploy_applied_release(state_dir):
@@ -602,10 +688,41 @@ def run_prepared_deploy(
     admin_email: str,
     hooks: DeployHooks,
 ) -> int:
-    """The inner hop inside the prepared snapshot: bootstrap, release, join."""
+    """The inner hop inside the prepared snapshot: bootstrap, release, join.
+
+    ``--allow-unlogged-signature --reason`` arrives from the source preparer on
+    this command line; for the release build (make, the attestation builder,
+    the signing wrapper) it becomes the variable those children read, and the
+    release driver gets the flag.
+    """
 
     repository_root = (arguments.repo_root or Path.cwd()).resolve()
     staging_only = bool(getattr(arguments, "staging_only_release", False))
+    reason = unlogged_signature_reason(arguments)
+    with unlogged_signature_environment(reason):
+        return _run_prepared_deploy(
+            arguments,
+            repository_root=repository_root,
+            staging_only=staging_only,
+            cpu_cluster_arn=cpu_cluster_arn,
+            gpu_cluster_arns=gpu_cluster_arns,
+            admin_email=admin_email,
+            hooks=hooks,
+            unlogged=reason is not None,
+        )
+
+
+def _run_prepared_deploy(
+    arguments: argparse.Namespace,
+    *,
+    repository_root: Path,
+    staging_only: bool,
+    cpu_cluster_arn: str,
+    gpu_cluster_arns: tuple[str, ...],
+    admin_email: str,
+    hooks: DeployHooks,
+    unlogged: bool,
+) -> int:
     with administrator_operation_lock(arguments.state_dir):
         bootstrap_result = hooks.bootstrap_from_arns(
             BootstrapRequest(
@@ -625,6 +742,7 @@ def run_prepared_deploy(
             site_file=bootstrap_result.site_file,
             state_dir=arguments.state_dir,
             staging_only_release=staging_only,
+            **({"allow_unlogged_signature": True} if unlogged else {}),
         )
     )
     if status:
@@ -720,6 +838,10 @@ def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
     if arguments.state_dir is None:
         raise SiteConfigError("deploy requires --state-dir")
     state_dir = arguments.state_dir.expanduser().resolve()
+    if not getattr(arguments, "rollback", False):
+        # An incomplete --allow-unlogged-signature/--reason pair is refused
+        # before anything runs.
+        unlogged_signature_reason(arguments)
     with administrator_operation_lock(state_dir):
         refuse_deploy_during_uninstall(state_dir)
         _retire_site_after_uninstall_locked(state_dir)

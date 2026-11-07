@@ -27,6 +27,16 @@ from gpu_fault.admin.release_consent import (
     ALLOW_INFLIGHT_INSTALLS_ENV,
     SUPERSEDE_FAILED_TRANSACTION_ENV,
 )
+from gpu_fault_release.regional_release_signing import (
+    ALLOW_UNLOGGED_FLAG,
+    REASON_FLAG,
+    UNLOGGED_SIGNATURE_REASON_ENV,
+    UnloggedSignatureError,
+    bundle_has_log_entry,
+    read_refusal_marker,
+    refusal_marker,
+    validate_reason,
+)
 
 DEFAULT_ADOT_IMAGE_AMD64 = (
     "public.ecr.aws/aws-observability/aws-otel-collector@"
@@ -80,12 +90,22 @@ def load_reusable_signed_release(
     impact_base: str,
     cosign_public_key: Path | None = None,
     node_agent_environment: Mapping[str, str] | None = None,
+    allow_unlogged: bool = False,
 ) -> dict[str, Any] | None:
     manifest = repository_root / "dist/current-release.json"
     attestation = repository_root / "dist/current-attestation.json"
     bundle = repository_root / "dist/current-attestation.bundle.json"
     required = (manifest, attestation, bundle)
     if not all(path.is_file() for path in required):
+        return None
+    if bundle_has_log_entry(bundle) is False and not allow_unlogged:
+        # Signed without a transparency-log entry by a deploy that allowed it;
+        # this one did not, so the release is built and signed again.
+        print(
+            "release-build: the existing signed release has no transparency-log "
+            "entry and this deploy did not allow one; building it again",
+            file=sys.stderr,
+        )
         return None
     try:
         manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
@@ -119,6 +139,7 @@ def load_reusable_signed_release(
         state_dir=state_dir,
         cosign_public_key=cosign_public_key,
         staging_only=staging_only,
+        allow_unlogged=allow_unlogged,
     )
     release = load_prebuilt_release(
         runner,
@@ -388,7 +409,17 @@ def verify_prebuilt_release(
     state_dir: Path,
     cosign_public_key: Path | None = None,
     staging_only: bool = False,
+    allow_unlogged: bool = False,
 ) -> None:
+    """``scripts/verify-release-attestation.py`` over ``dist/``.
+
+    A bundle without a transparency-log entry is accepted with
+    ``allow_unlogged`` (the running deploy's ``--allow-unlogged-signature``),
+    or -- for ``config`` and the other commands that re-verify the release the
+    site already runs -- when the cluster's committed live release is this one
+    (``--live-release-site``). The default command is unchanged.
+    """
+
     attestation = repository_root / "dist/current-attestation.json"
     bundle = repository_root / "dist/current-attestation.bundle.json"
     public_key = (
@@ -412,9 +443,36 @@ def verify_prebuilt_release(
             "--cosign-key",
             str(public_key),
             *(["--allow-staging-release"] if staging_only else []),
+            *_unlogged_approval(bundle, state_dir, allow_unlogged=allow_unlogged),
         ],
         cwd=repository_root,
     )
+
+
+def _unlogged_approval(
+    bundle: Path, state_dir: Path, *, allow_unlogged: bool
+) -> list[str]:
+    """What lets the verifier take a bundle without a transparency-log entry."""
+
+    if bundle_has_log_entry(bundle) is not False:
+        return []
+    if allow_unlogged:
+        return [ALLOW_UNLOGGED_FLAG]
+    site_file = state_dir / "site.yaml"
+    return ["--live-release-site", str(site_file)] if site_file.is_file() else []
+
+
+def consented_unlogged_reason() -> str | None:
+    """The reason this deploy's own hop set from its ``--allow-unlogged-
+    signature --reason`` (``deploy_command.unlogged_signature_environment``)."""
+
+    value = os.environ.get(UNLOGGED_SIGNATURE_REASON_ENV)
+    if value is None:
+        return None
+    try:
+        return validate_reason(value)
+    except UnloggedSignatureError as exc:
+        raise BootstrapError(str(exc)) from None
 
 
 def prepare_staging_impact_plan(
@@ -498,6 +556,7 @@ def load_verified_ci_candidate_receipt(
     repository_root: Path,
     state_dir: Path,
     cosign_public_key: Path | None = None,
+    allow_unlogged: bool = False,
 ) -> dict[str, Any] | None:
     commit = _git_output(repository_root, "rev-parse", "HEAD")
     receipt_root = state_dir / "ci-candidates" / commit
@@ -521,6 +580,7 @@ def load_verified_ci_candidate_receipt(
             str(state_dir),
             "--public-key",
             str(public_key),
+            *([ALLOW_UNLOGGED_FLAG] if allow_unlogged else []),
         ],
         cwd=repository_root,
     )
@@ -594,6 +654,7 @@ def build_signed_release(
         "--untracked-files=normal",
     ):
         raise BootstrapError("release build requires a clean source tree")
+    unlogged_reason = consented_unlogged_reason()
     reusable = load_reusable_signed_release(
         runner,
         repository_root=repository_root,
@@ -605,6 +666,7 @@ def build_signed_release(
         impact_base=impact_base,
         cosign_public_key=cosign_public_key,
         node_agent_environment=node_agent_environment,
+        allow_unlogged=unlogged_reason is not None,
     )
     if reusable is not None:
         return reusable
@@ -615,6 +677,7 @@ def build_signed_release(
             repository_root=repository_root,
             state_dir=state_dir,
             cosign_public_key=cosign_public_key,
+            allow_unlogged=unlogged_reason is not None,
         )
         if promoted_candidate is None:
             promoted_candidate = restore_main_ci_candidate(
@@ -687,6 +750,9 @@ def build_signed_release(
         ),
         f"RUNTIME_IMAGE_REPOSITORY={runtime_repository}",
         f"COSIGN_SIGNING_KEY={signing_key}",
+        # Explicit either way, so an exported value never decides it; the
+        # reason itself reaches the attestation builder in the environment.
+        f"UNLOGGED_SIGNATURE={'1' if unlogged_reason is not None else ''}",
     ]
     if promoted_candidate is not None:
         command.append(f"CI_GATE={promoted_candidate['ci_gate']}")
@@ -720,19 +786,17 @@ def build_signed_release(
         else nullcontext(PostgresTestAllocation(""))
     )
     with postgres_context as postgres:
-        environment = postgres.build_environment(
-            release_gate_environment(
-                tools_environment,
-                postgres_url=postgres.url,
-                cosign_password=password,
-            )
-        )
-        runner.run(
+        run_release_make(
+            runner,
             command,
-            cwd=repository_root,
-            env=environment,
-            mutate=True,
-            capture=False,
+            repository_root=repository_root,
+            environment=postgres.build_environment(
+                release_gate_environment(
+                    tools_environment,
+                    postgres_url=postgres.url,
+                    cosign_password=password,
+                )
+            ),
         )
     verify_prebuilt_release(
         runner,
@@ -740,6 +804,7 @@ def build_signed_release(
         state_dir=state_dir,
         cosign_public_key=cosign_public_key,
         staging_only=staging_only,
+        allow_unlogged=unlogged_reason is not None,
     )
     release = load_prebuilt_release(
         runner,
@@ -753,6 +818,45 @@ def build_signed_release(
         "release_reused": False,
         "release_source": release_source,
     }
+
+
+def run_release_make(
+    runner: CommandRunner,
+    command: Sequence[str],
+    *,
+    repository_root: Path,
+    environment: Mapping[str, str],
+) -> None:
+    """``make release-build*``; a signing the Sigstore services refused says so.
+
+    The signing wrapper leaves a note beside the bundle it could not write
+    (make reports only its own exit status). The release is then not signed,
+    so the deploy stops before anything rolls: the refusal says that and
+    names ``--allow-unlogged-signature --reason``.
+    """
+
+    signature_bundle = repository_root / "dist/current-attestation.bundle.json"
+    refusal_marker(signature_bundle).unlink(missing_ok=True)
+    try:
+        runner.run(
+            list(command),
+            cwd=repository_root,
+            env=environment,
+            mutate=True,
+            capture=False,
+        )
+    except BootstrapError as exc:
+        refused = read_refusal_marker(signature_bundle)
+        if refused is None:
+            raise
+        raise BootstrapError(
+            "release signing: the Sigstore services did not accept the release "
+            f"attestation's signature after {refused.get('attempts')} attempts "
+            f"({refused.get('cause')}). The release is not signed, so nothing "
+            "was rolled out and the live release is unchanged. Retry once they "
+            f'answer, or rerun this deploy with {ALLOW_UNLOGGED_FLAG} {REASON_FLAG} "<why>" '
+            "to sign it with the site key only, without a transparency-log entry"
+        ) from exc
 
 
 def load_prebuilt_release(

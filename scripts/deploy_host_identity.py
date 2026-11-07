@@ -27,6 +27,15 @@ BUNDLE_INPUTS = (
     "scripts/deploy_host_bundle.py",
     "scripts/deploy_host_component.py",
     "scripts/deploy_host_identity.py",
+    # The unlogged-signature declaration and the pinned Sigstore trust root
+    # every deploy-host signer and verifier shares (setup_deploy_host.py runs
+    # it with the system Python), the source preparer's half of it, and the
+    # backfill verb's script. Hashed here rather than in the orchestration list
+    # of deploy_source_identity.py, which is an identity-protocol input of the
+    # application identity: a deploy-host change stays DEPLOY_HOST_ONLY.
+    "scripts/signing_transparency.py",
+    "scripts/staging_signing.py",
+    "scripts/backfill_transparency_log.py",
     "src/gpu_fault/data/deploy-host-tools.json",
 )
 

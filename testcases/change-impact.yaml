@@ -196,13 +196,24 @@ rules:
       - scripts/build-release-attestation.py
       - scripts/verify-release-attestation.py
       - scripts/cosign_sign_blob.py
+      - scripts/signing_transparency.py
+      - scripts/backfill_transparency_log.py
+      - src/gpu_fault_release/regional_release_signing.py
+      - src/gpu_fault/admin/transparency_backfill.py
       - tests/test_cosign_sign_blob.py
+      - tests/test_signing_transparency.py
+      - tests/test_unlogged_release_signing.py
+      - tests/test_unlogged_release_admin.py
+      - tests/_unlogged_signing_support.py
       - src/gpu_fault/__init__.py
     pytest:
       - tests/test_release_identity.py
       - tests/test_release_image.py
       - tests/test_release_attestation.py
       - tests/test_cosign_sign_blob.py
+      - tests/test_signing_transparency.py
+      - tests/test_unlogged_release_signing.py
+      - tests/test_unlogged_release_admin.py
       - tests/test_release_gates.py
       - tests/test_artifact_consistency.py
       - tests/test_component_wheel_closures.py
@@ -268,6 +279,7 @@ rules:
       - scripts/restore_ci_candidate.py
       - scripts/staging_deploy.py
       - scripts/staging_deploy_inputs.py
+      - scripts/staging_signing.py
       - scripts/staging_state_hygiene.py
       - scripts/staging_source_snapshot.py
       - tests/admin/test_admin_source_deploy.py
@@ -355,6 +367,7 @@ rules:
       - scripts/setup_deploy_host.py
       - scripts/staging_deploy.py
       - scripts/staging_deploy_inputs.py
+      - scripts/staging_signing.py
       - scripts/staging_state_hygiene.py
       - scripts/staging_source_snapshot.py
       - config/admin-config.example.yaml

@@ -16,6 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 SLOW_COMMAND_SECONDS = 5.0
 
 
+#: The deploy's unlogged-signature reason (``signing_transparency``): consent
+#: for the build that signs, never an input the gates' tests inherit.
+UNLOGGED_SIGNATURE_REASON_ENV = "GPU_FAULT_RELEASE_UNLOGGED_SIGNATURE_REASON"
+
+
 def isolated_gate_environment(parent: Mapping[str, str]) -> dict[str, str]:
     """Tests have their own clocks/budgets; the build's supervisor still owns them."""
     values = {
@@ -28,7 +33,8 @@ def isolated_gate_environment(parent: Mapping[str, str]) -> dict[str, str]:
                 "GPU_FAULT_DEPLOY_API_",
             )
         )
-        and name != "GPU_FAULT_DEPLOY_RECOVERY_ACTIVE"
+        and name
+        not in ("GPU_FAULT_DEPLOY_RECOVERY_ACTIVE", UNLOGGED_SIGNATURE_REASON_ENV)
     }
     root = parent.get("GPU_FAULT_DEPLOY_API_BUDGET_DIR")
     if root and "PATH" in values:

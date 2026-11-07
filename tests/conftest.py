@@ -274,6 +274,8 @@ def deploy_consent_is_never_ambient(monkeypatch) -> None:
         "GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION",
         "GPU_FAULT_RELEASE_ACCEPT_SCHEMA_CHANGE",
         "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256",
+        # The deploy's --allow-unlogged-signature reason.
+        "GPU_FAULT_RELEASE_UNLOGGED_SIGNATURE_REASON",
         "COSIGN_PASSWORD",
     ):
         monkeypatch.delenv(name, raising=False)

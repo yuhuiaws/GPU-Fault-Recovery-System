@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from release_attestation import build_attestation
+from signing_transparency import (
+    UNLOGGED_SIGNATURE_REASON_ENV,
+    SigningTransparencyError,
+    consented_reason,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +30,23 @@ def main() -> None:
             "path and SHA-256 is bound into the signed attestation"
         ),
     )
+    parser.add_argument(
+        "--unlogged-signature",
+        action="store_true",
+        help=(
+            "declare in the attestation that it is signed without a "
+            "transparency-log entry, with the reason the deploy hands down in "
+            f"{UNLOGGED_SIGNATURE_REASON_ENV} (gpu-fault-admin deploy "
+            "--allow-unlogged-signature --reason ...)"
+        ),
+    )
     arguments = parser.parse_args()
+    reason = None
+    if arguments.unlogged_signature:
+        try:
+            reason = consented_reason(os.environ)
+        except SigningTransparencyError as exc:
+            parser.error(str(exc))
     manifest = ROOT / "dist/current-release.json"
     attestation = build_attestation(
         ROOT,
@@ -34,6 +56,7 @@ def main() -> None:
         impact_plan_path=arguments.impact_plan,
         ci_gate_path=arguments.ci_gate,
         sbom_dir=arguments.sbom_dir,
+        unlogged_signature_reason=reason,
     )
     release_id = attestation["subject"]["release_id"]
     path = ROOT / "dist" / release_id / "attestation.json"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,12 @@ from deploy_host_bundle import (
     write_sha256_sidecar,
 )
 from deploy_host_identity import build_identity as build_deploy_host_identity
+from signing_transparency import (
+    DECLARATION_FIELD,
+    SigningTransparencyError,
+    consented_reason,
+    unlogged_declaration,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -151,6 +158,7 @@ def build_bundle(
     wheelhouse: Path | None,
     tools_dir: Path | None,
     allow_dirty: bool,
+    unlogged_signature_reason: str | None = None,
 ) -> dict[str, str]:
     status = _git_output("status", "--porcelain", "--untracked-files=normal")
     if status and not allow_dirty:
@@ -212,6 +220,13 @@ def build_bundle(
                 "admin_config_template": (
                     admin_config_template.relative_to(staging).as_posix()
                 ),
+                # Signed with the archive: the declaration setup_deploy_host.py
+                # requires before it takes a signature without a log entry.
+                **(
+                    {DECLARATION_FIELD: unlogged_declaration(unlogged_signature_reason)}
+                    if unlogged_signature_reason is not None
+                    else {}
+                ),
             },
         )
         write_deterministic_archive(staging, output)
@@ -239,7 +254,21 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--wheelhouse", type=Path)
     parser.add_argument("--tools-dir", type=Path)
     parser.add_argument("--allow-dirty", action="store_true")
+    parser.add_argument(
+        "--unlogged-signature",
+        action="store_true",
+        help=(
+            "declare in the bundle manifest that the archive is signed without a "
+            "transparency-log entry (gpu-fault-admin deploy "
+            "--allow-unlogged-signature --reason ...)"
+        ),
+    )
     options = parser.parse_args(arguments)
+    try:
+        reason = consented_reason(os.environ) if options.unlogged_signature else None
+    except SigningTransparencyError as exc:
+        print(f"build-deploy-host-bundle: {exc}", file=sys.stderr)
+        return 2
     try:
         result = build_bundle(
             python=_python_executable(options.python),
@@ -251,6 +280,7 @@ def main(arguments: list[str] | None = None) -> int:
                 options.tools_dir.resolve() if options.tools_dir is not None else None
             ),
             allow_dirty=options.allow_dirty,
+            unlogged_signature_reason=reason,
         )
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
         print(f"build-deploy-host-bundle: {exc}", file=sys.stderr)

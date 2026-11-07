@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Mapping
 
 from gpu_fault.admin.operation_lock import SITE_OPERATION_LOCK_FD_ENV
+from gpu_fault_release.regional_release_signing import SIGNING_CHECK
 
 
 class LiveEvidenceError(RuntimeError):
@@ -122,7 +123,17 @@ def read_live_status(
         pass_fds=(lock_fd,) if lock_fd is not None else (),
     )
     # Unhealthy reports guide repair/resume; only healthy reports prove a NOOP.
-    if completed.returncode and not (allow_unhealthy and completed.returncode == 1):
+    # A release signed without a transparency-log entry for too long fails the
+    # administrator's status, never the deploy that would backfill or replace
+    # it: that check alone is read as healthy here.
+    if (
+        completed.returncode
+        and not (allow_unhealthy and completed.returncode == 1)
+        and not (
+            completed.returncode == 1
+            and deploy_healthy(_status_object(completed.stdout))
+        )
+    ):
         raise LiveEvidenceError(
             f"status failed ({completed.returncode}): "
             + (completed.stderr or "").strip()
@@ -145,6 +156,37 @@ def read_live_status(
     return report
 
 
+def _status_object(stdout: str | None) -> Mapping[str, object] | None:
+    try:
+        value = json.loads(stdout or "")
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def deploy_healthy(report: Mapping[str, object] | None) -> bool:
+    """Healthy, or unhealthy only by the overdue unlogged-signature check.
+
+    ``gpu-fault-admin status`` adds that check on the administrator side
+    (``gpu_fault_release.regional_release_signing``) so the site reads red
+    until the signature is backfilled; the deploy, which is one way out of it,
+    reads the engine's own verdict.
+    """
+
+    if report is None or report.get("mode") != "status":
+        return False
+    if report.get("healthy") is True:
+        return True
+    health = report.get("health")
+    checks = health.get("checks") if isinstance(health, Mapping) else None
+    failing = [
+        item.get("name")
+        for item in (checks if isinstance(checks, list) else [])
+        if isinstance(item, Mapping) and item.get("status") not in ("PASS", "SKIP")
+    ]
+    return failing == [SIGNING_CHECK]
+
+
 def collect_live_deploy_evidence(
     *,
     repository_root: Path,
@@ -162,7 +204,7 @@ def collect_live_deploy_evidence(
             venv=venv,
             lock_fd=lock_fd,
         )
-    if report.get("mode") != "status" or report.get("healthy") is not True:
+    if not deploy_healthy(report):
         raise LiveEvidenceError(
             "live deployment is not a healthy committed NOOP release"
         )

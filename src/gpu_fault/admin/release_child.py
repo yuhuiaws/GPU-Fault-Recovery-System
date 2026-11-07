@@ -27,6 +27,7 @@ def run_automatic_release(
     state_dir: Path,
     staging_only_release: bool,
     lock_fd: int | None = None,
+    allow_unlogged_signature: bool = False,
 ) -> int:
     command = [
         sys.executable,
@@ -42,6 +43,10 @@ def run_automatic_release(
     ]
     if staging_only_release:
         command.append("--allow-staging-release")
+    if allow_unlogged_signature:
+        # The deploy that signed this release without a log entry, on the
+        # operator's --allow-unlogged-signature.
+        command.append("--allow-unlogged-signature")
     # release-deploy takes the site lock itself; hand it the one this command
     # holds (the deploy host script does the same for its children), or it
     # refuses its own parent as "another administrator mutation".
