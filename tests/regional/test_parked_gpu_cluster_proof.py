@@ -11,6 +11,7 @@ outage, a replacement in progress or a misconfiguration: the cluster is
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -613,3 +614,30 @@ def test_the_snapshot_entry_has_no_identity_and_no_node() -> None:
     assert PARKED.live_identities({"a": {"node_ids": ["n"]}, "b": entry}) == {
         "a": {"node_ids": ["n"]}
     }
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [{}, {"kind": "List"}, {"items": None}, {"items": {}}],
+    ids=["empty-document", "no-items", "null-items", "items-not-a-list"],
+)
+def test_a_node_answer_without_an_items_list_proves_nothing(answer: Any) -> None:
+    """Only a list the API returns empty is a cluster without nodes; an answer
+    without an ``items`` list leaves the cluster to the node path, which
+    refuses an empty node set."""
+
+    reads: list[list[str]] = []
+    release = SimpleNamespace(
+        **{
+            "_gpu": lambda _target, *arguments: ["kubectl", *arguments],
+            "_get_json": lambda arguments: reads.append(arguments) or answer,
+        }
+    )
+    target = SimpleNamespace(
+        cluster_id="gpu-eks-cluster", provider="eks-managed", node_selector=OWNERSHIP
+    )
+
+    assert PARKED.without_nodes(release, target) is None, answer
+    assert reads == [["kubectl", "get", "nodes", "-l", OWNERSHIP]], (
+        "only the node list is read; no provider document"
+    )

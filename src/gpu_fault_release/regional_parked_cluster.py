@@ -593,17 +593,19 @@ def _selected_nodes(release: Any, target: Any) -> list[Mapping[str, Any]] | None
 
     Taken as the API answers, without the local re-check the fleet's node names
     get (``target_node_names``): only a list the API itself returns empty is a
-    cluster without nodes. A node the re-check would drop leaves the cluster to
-    the node path, which refuses an empty node set -- the safe direction.
+    cluster without nodes, and an answer without an ``items`` list is no list
+    at all. A node the re-check would drop leaves the cluster to the node path,
+    which refuses an empty node set -- the safe direction.
     """
 
     try:
         listing = release._get_json(
             release._gpu(target, "get", "nodes", "-l", node_selector(target))
         )
-        return [
-            item for item in listing.get("items") or () if isinstance(item, Mapping)
-        ]
+        items = listing.get("items")
+        if not isinstance(items, list):
+            return None
+        return [item for item in items if isinstance(item, Mapping)]
     except Exception:  # noqa: BLE001 - an unreadable node list proves nothing
         return None
 

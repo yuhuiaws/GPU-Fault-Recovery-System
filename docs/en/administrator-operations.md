@@ -3978,8 +3978,8 @@ retired (`REVOKED`) or proven departed by its provider, and no node carries anyt
 `<cluster>: GPU cluster without nodes (<state>): no node selected; <reason>; no node cleanup target (...)` and the node
 cleanup reads `SKIPPED` with that reason; the node-key Secrets go with the namespaces as for any cluster. A record whose
 instance the provider still has (`an active fleet node is missing: ...`) or a node list that cannot be read still refuses
-(`node cleanup has no proven fleet targets`). `rotate-token` for such a cluster updates the Secret and the data plane and then
-stops at its node roll: scale a group back up first. **Alerts:** nothing pages for a fleet without nodes whose product Deployments
+(`node cleanup has no proven fleet targets`). `rotate-token` of such a cluster skips and records its node roll (§6.1) and
+completes; the next deploy is not blocked by it. **Alerts:** nothing pages for a fleet without nodes whose product Deployments
 still run on its other nodes -- the collector-silence, stale-Agent and topology alerts count ACTIVE Agents only;
 `GpuFaultDataplaneCollectorMissing` fires for the cluster only when no node is left to run its watcher, which is a real fault.
 An unavailable cluster is therefore seen in `status`, the deploy log and the deploy record, not through an alert.
@@ -4122,7 +4122,13 @@ gpu-fault-admin rotate-token \
    Completion Watcher / Resource Collector, and all node Agents (reinstalled wave by wave via the same fleet wave as a
    release); on the CPU side the finalisation rewrites the `gpu-fault-regional-clusters` Secret and rolls the three
    Deployments that read it -- api-ha, control-worker, telemetry-spool-worker -- one at a time (each restart waits for
-   its rollout to complete before the next).
+   its rollout to complete before the next). A cluster whose selector selects no node at all -- parked or unavailable --
+   has no Agent to reinstall: on the release engine's zero-node proof the node roll is skipped and recorded (the
+   journal's `node_rollout.zero_nodes` and the `NODES_ROLLED` evidence: state, reason, groups, and in
+   `departed_unrolled` the recorded nodes that left before their wave; the output's `zero_nodes`), a
+   `zero-node-gpu-cluster ... step=rotate-token` line says so, and every other step runs as for any cluster. The
+   connection Secret already holds the new token, so a node that joins later is installed with it. A node list that
+   cannot be read keeps the refusal (`<cluster> has no GPU nodes for fleet rollout`).
 3. **Read-only checks**: `gpu-fault-admin status` healthy; a first rotation has no conflicting `IN_PROGRESS` transaction,
    and interrupted recovery of the same rotation must reuse `<state-dir>/rotate-token/<cluster-id>/state.json`,
    which must not be deleted first. The journal records two site bindings: `site_sha256` (the raw digest of

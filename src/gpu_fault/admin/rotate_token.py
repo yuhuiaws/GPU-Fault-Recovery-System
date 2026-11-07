@@ -138,6 +138,7 @@ from gpu_fault.admin.rotate_token_policy import (
     require_rotation_policy,
     rotation_policy,
 )
+from gpu_fault.admin import rotate_token_zero_nodes as zero_nodes
 from gpu_fault.admin.site import (
     RenderedSite,
     effective_environment,
@@ -747,11 +748,11 @@ def roll_node_tokens(
     ``only_nodes`` restricts a rollback to the nodes the forward pass moved.
     """
 
-    node_names = target_node_names(release, target)
-    if progress.get("node_names") is not None and set(progress["node_names"]) != set(
-        node_names
-    ):
-        raise BootstrapError("rotation node inventory changed since the first wave")
+    node_names = zero_nodes.rotation_node_names(
+        release, target, progress, record, only_nodes, target_node_names
+    )
+    if not node_names:
+        return zero_nodes.zero_node_roll(progress)
     completed = set(progress.get("completed_nodes") or [])
     remaining = tuple(
         name
@@ -1330,7 +1331,7 @@ def rotation_summary(state: Mapping[str, Any]) -> dict[str, Any]:
             (steps.get(STEP_TOKEN_FILE_WRITTEN) or {}).get("evidence") or {}
         ).get("retired_token_file"),
         "steps": {name: item.get("completed_at") for name, item in steps.items()},
-        "reinstalled_nodes": (state.get("node_rollout") or {}).get("completed_nodes"),
+        **zero_nodes.node_rollout_summary(state.get("node_rollout")),
         "warnings": list(state.get("warnings") or []),
         "operator": state.get("operator"),
         "reference": state.get("reference"),

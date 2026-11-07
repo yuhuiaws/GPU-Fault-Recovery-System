@@ -33,8 +33,10 @@ without nodes; that path is proven offline through the real bootstrap task
 graph with fake runners. `uninstall` and `remove-cluster` clean a cluster
 without nodes as an empty, proven target set; that is proven offline only,
 through the real cleanup script and tools over a fake Kubernetes API and a fake
-`aws`, never on a live cluster. `rotate-token` still needs a node on that
-cluster, and so does configured node-key custody.
+`aws`, never on a live cluster. `rotate-token` skips and records the node
+roll of such a cluster; that is proven offline through the real rotation and
+its real node roll with fake reads. Configured node-key custody still needs a
+node on that cluster.
 
 ## Xid linkage and Drain P2P recovery
 
