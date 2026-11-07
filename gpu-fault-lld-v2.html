@@ -12424,11 +12424,15 @@ preflight 批处理、fleet rollout、wave 与等待被跳过并 记录，稳态
 Reconciler
 以本次发布的节点运行时滚动（安装模板按声明的节点组渲染，<code>render_node</code>，之后加入的节点安装当前发布），
 CPU 滚动的心跳屏障、回滚（只回滚 Reconciler，使用固定的上一版模板；Agent
-pin 取自有 live Agent 的集群）、resume 与 <code>sync-state</code>
-都沿用这条条目。只有无法完成或无法回滚的发布才会在部署 preflight
-被拒绝（<code>zero_node_gpu_clusters</code>）：每个 GPU
-集群都没有节点时带 Agent wave 的发布，或节点组未声明安装器认识的 GPU
-实例类型的集群上滚动 Reconciler 的发布。证明只读取
+pin 取自有 live Agent 的集群——快照为每个集群都 记下零节点条目时没有任何
+Agent 运行过，controller stage 暂存上一版自己的 pin，取自捕获记录的
+<code>-config-core</code> （<code>cpu_role_config_maps</code>），CPU
+恢复因此保留它重启过的层级，每个层级只滚动一次；快照缺少任一集群的条目时仍然拒绝）、resume
+与 <code>sync-state</code> 都沿用这条条目。只有无法完成的发布才会在部署
+preflight
+被拒绝（<code>zero_node_gpu_clusters</code>）：节点组未声明安装器 认识的
+GPU 实例类型的集群上滚动 Reconciler 的发布。每个 GPU
+集群都没有节点本身不拒绝任何发布。证明只读取
 <code>regional_contexts</code>
 已经读取的内容；离场节点清理本身不参考它。证明从不开启读快照（<code>regional_release_state.read_snapshot</code>）：
 快照的缓存保存在所有线程共享的发布对象上，而发布步骤（候选
@@ -12444,8 +12448,14 @@ preflight、集群滚动）以并行线程处理各集群，这些线程的节�
 Store 与 PostgreSQL 上的端到端、全部拒绝情形、单写者、重启续跑）、
 <code>tests/execution/test_cluster_executor_node_inventory.py</code>、<code>tests/regional/test_departed_node_status.py</code>、
 <code>tests/admin/test_admin_config_departed_node_cleanup.py</code>、<code>tests/regional/test_parked_gpu_cluster_proof.py</code>、
-<code>tests/regional/test_parked_gpu_cluster_release.py</code>、<code>tests/regional/test_zero_node_release_waves.py</code>
-和 <code>tests/deploy/test_reconciler_zero_node_cluster.py</code>。</p>
+<code>tests/regional/test_parked_gpu_cluster_release.py</code>、<code>tests/regional/test_zero_node_release_waves.py</code>、
+<code>tests/regional/test_zero_node_snapshot_concurrency.py</code>（停放集群与有节点集群的候选
+preflight 在并行线程中进行）、
+<code>tests/regional/test_zero_node_deploy_engine.py</code>（带 Agent
+wave 的 DATA_PLANE_COMPATIBLE 发布经由真实的
+<code>RegionalRelease</code>、
+它的线程池与报告快照，覆盖停放集群旁边分别为有节点、停放与不可用集群的站点：部署、提交与自动回滚）和
+<code>tests/deploy/test_reconciler_zero_node_cluster.py</code>。</p>
 <hr />
 <h2 data-number="1.9" id="8-接口设计"><span class="header-section-number">1.9</span> 接口设计</h2>
 <p>本章的路由表是<strong>装配真实 app
