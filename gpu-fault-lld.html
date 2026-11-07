@@ -8366,14 +8366,44 @@ VALIDATE_GPU/RESTORE_SCHEDULING 扩到从未隔离过的对端节点、把 incid
 <ol type="1">
 <li><code>RESET_GPU/RESET_ALL_GPUS_NVSWITCHES</code> 失败：创建
 <code>RESTART_NODE</code> workflow。<code>RESTART_FABRIC_MANAGER</code>
-失败时同样如此 （阶段 <code>fabric_manager_restart</code>）：solo XID 45
+的 unit 本身失败时同样如此 （阶段
+<code>fabric_manager_restart</code>）：节点动作折叠把 Node Agent
+的结论记为 <code>fabric_manager_restart_outcome</code>
+（<code>adapters/node_action/fabric_manager_outcome.py</code>），只有
+<code>UNIT_FAILED</code>——Agent 自身检查通过后，对该 unit 的
+<code>systemctl</code> 调用以非零状态退出——才是重启的依据。solo XID 45
 计划没有 cordon，所以它经整条记录升级——后继先 cordon 并隔离节点再重启——
-而不在记录内原地升级。Agent 的 GPU 客户端检查拒绝的 Fabric Manager
-重启并未执行，且其 GPU 正在使用：不重启，只做取证并开工单
-（<code>node_action_refused</code>）。</li>
+而不在记录内原地升级。重启的其他失败都没有执行重启，或对 unit
+一无所知：节点配置不允许（<code>REFUSED_BY_NODE_CONFIGURATION</code>）、
+Agent 的 GPU
+客户端检查发现客户端（<code>REFUSED_GPU_CLIENTS</code>）、unit
+之前的读取失败或重新提交次数用尽（<code>NO_UNIT_VERDICT</code>），
+或该命令根本没有得到 Agent 的结论（没有 outcome：fleet gate、任一
+allowlist、传输、步骤上限或期限）。在什么都没停下的节点上，
+它们都不是重启的依据——运维策略禁止的动作不能证明需要更重的动作——所以只做取证并开工单（<code>node_action_refused</code>），
+原因写明为何（<code>failure_outcome.fabric_manager_restart_reason</code>）。未执行的
+reset 仍照常升级：它的链已先 cordon 节点、 停下其作业并静默 GPU
+服务。</li>
 <li><code>RESTART_NODE</code> 失败：创建带
 <code>replacement_strategy=HEALTHY_WARM_SPARE_ONLY</code> 的
-<code>REPLACE_NODE</code> workflow。</li>
+<code>REPLACE_NODE</code> workflow。节点生命周期 Adapter
+因无法观测到节点的隔离而在 provider 调用之前拒绝的 reboot 或 replacement
+不在此列（<code>adapters/hyperpod/lifecycle._observe_isolation</code>，HyperPod
+与 plain EKS 相同；步骤详情
+<code>isolation_not_observed</code>）：节点没有被 cordon、其 quarantine
+taint、incident 或 fencing-token 注解不属于本 workflow， 或者没有
+Kubernetes 节点对应它。没有任何调用到达
+provider，也没有得知任何硬件结论，所以两条梯级都不升级：交接把隔离放回去
+（<code>containment_or_release</code>：FREEZE_EVIDENCE →
+MARK_UNSCHEDULABLE → QUARANTINE →
+ESCALATE_SUPPORT），节点根本无法观测时只交出节点
+（<code>containment_refused</code>），原因写明隔离问题；对 reboot 还写明
+provider 提交账本中是否有该步骤的提交记录（&quot;the node may already have
+rebooted&quot;）。provider 或其预检拒绝的 reboot 仍保留 replacement
+梯级，运维的 reboot 开关拒绝的 reboot 也一样
+（<code>GPU_FAULT_ALLOW_HYPERPOD_REBOOT=false</code>：&quot;HyperPod REBOOT
+mutation is disabled by configuration&quot;），这是有意的：健康热备切换不改动
+故障节点，所以它的预检跳过该开关；没有带标签的热备时它以不回退字面量拒绝，记录以一次支持交接结束。</li>
 <li>replacement 只允许独立健康状态机验证通过且已原子预留的 warm
 spare；托管/provider replacement Adapter 会拒绝该策略。</li>
 <li>replacement 失败：保持 unschedulable/quarantine，执行

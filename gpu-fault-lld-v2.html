@@ -12396,15 +12396,51 @@ promtool 验证），七个 <code>gpu_fault_departed_node_cleanup_*</code>
 用它决定写不写，<code>control_api_inspect</code> 用它在
 <code>status</code> 里报告开关； guard 即
 <code>DEPARTED_AGENT_GUARD_AGE</code>，与 CLI 共用，不可配置。</p>
+<p><strong>集群失去全部节点：停放，或不可用。</strong>
+当离开的节点恰是集群选择器选中的全部节点时，发布引擎向 provider
+求证这是否为
+声明的结果（<code>src/gpu_fault_release/regional_parked_cluster.py</code>）：选择器覆盖的每个
+EKS 托管节点组都是 <code>ACTIVE</code> 且
+<code>scalingConfig.desiredSize</code> 为 0、且没有能启动被选中节点的
+Karpenter NodePool，或覆盖的每个 HyperPod 实例组都是
+<code>InService</code> 且
+<code>TargetCount</code>/<code>CurrentCount</code> 为
+0。得到证明时集群为<em>停放</em>；未得到证明——节点组仍要节点、正在替换、选择器没有覆盖任何节点组、
+读取失败——集群为<em>不可用</em>，每条消息都说明原因。两种状态下零个 GPU
+节点都只影响该集群本身。<code>status</code>/<code>verify</code>
+照常判定它的 Deployment 与 executor，把零节点对零 Agent
+视为覆盖完整，不询问 fleet 与 collector
+readiness，并点名它（<code>zero_node_clusters</code>、
+<code>status</code>
+抬头、部署记录）。停放不算发现；不可用集群的零节点发现（没有 Kubernetes
+节点、没有 Ready 节点、没有注册的 Agent）只让 <code>status</code>
+失败——运维视图保持红色——而部署、它的 preflight 与 verify
+以及其他所有引擎模式把它们记为
+<code>WARN</code>（<code>zero_node_finding</code>）；
+该集群的其他发现仍然阻断，其中包括仍在选择器不再选中的节点上运行的 Agent
+的覆盖漂移。两种状态下每种发布类型都照常进行：Agent
+快照记下一条没有身份也没有节点的显式条目（<code>zero_node_identity</code>），节点
+preflight 批处理、fleet rollout、wave 与等待被跳过并 记录，稳态
+Reconciler
+以本次发布的节点运行时滚动（安装模板按声明的节点组渲染，<code>render_node</code>，之后加入的节点安装当前发布），
+CPU 滚动的心跳屏障、回滚（只回滚 Reconciler，使用固定的上一版模板；Agent
+pin 取自有 live Agent 的集群）、resume 与 <code>sync-state</code>
+都沿用这条条目。只有无法完成或无法回滚的发布才会在部署 preflight
+被拒绝（<code>zero_node_gpu_clusters</code>）：每个 GPU
+集群都没有节点时带 Agent wave 的发布，或节点组未声明安装器认识的 GPU
+实例类型的集群上滚动 Reconciler 的发布。证明只读取
+<code>regional_contexts</code>
+已经读取的内容；离场节点清理本身不参考它。</p>
 <p>代码依据：<code>src/gpu_fault/departed_node_cleanup.py::DepartedNodeCleanup.run_once</code>、
 <code>src/gpu_fault/departed_node_cleanup_actions.py::DepartureWrites</code>、<code>src/gpu_fault/departed_nodes.py</code>、
 <code>src/gpu_fault/kubernetes_node_inventory.py</code>、<code>src/gpu_fault/departed_node_provider.py</code>、
 <code>src/gpu_fault/cluster_executor/node_inventory.py</code>、<code>src/gpu_fault/store/shared/departed_nodes.py</code>。
 行为覆盖见 <code>tests/departed_nodes/</code>（两种 provider 在内存
 Store 与 PostgreSQL 上的端到端、全部拒绝情形、单写者、重启续跑）、
-<code>tests/execution/test_cluster_executor_node_inventory.py</code>、<code>tests/regional/test_departed_node_status.py</code>
-和
-<code>tests/admin/test_admin_config_departed_node_cleanup.py</code>。</p>
+<code>tests/execution/test_cluster_executor_node_inventory.py</code>、<code>tests/regional/test_departed_node_status.py</code>、
+<code>tests/admin/test_admin_config_departed_node_cleanup.py</code>、<code>tests/regional/test_parked_gpu_cluster_proof.py</code>、
+<code>tests/regional/test_parked_gpu_cluster_release.py</code>、<code>tests/regional/test_zero_node_release_waves.py</code>
+和 <code>tests/deploy/test_reconciler_zero_node_cluster.py</code>。</p>
 <hr />
 <h2 data-number="1.9" id="8-接口设计"><span class="header-section-number">1.9</span> 接口设计</h2>
 <p>本章的路由表是<strong>装配真实 app
