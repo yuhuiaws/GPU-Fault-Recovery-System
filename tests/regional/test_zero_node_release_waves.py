@@ -380,3 +380,152 @@ def test_a_resume_after_an_interrupted_wave_asks_nothing_of_the_parked_cluster(
     assert "gpu-eks" not in asked, "no Agent heartbeat asked of the parked cluster"
     if parked_state == "CONVERGED":
         assert asked == {"gpu-a"}
+
+
+# --- a FULL release over the parked cluster, then its rollback ----------------------
+
+FULL_GPU = (
+    ReleaseComponent.DCGM,
+    ReleaseComponent.OBSERVABILITY,
+    ReleaseComponent.EXECUTOR,
+    ReleaseComponent.WATCHER,
+    ReleaseComponent.COLLECTOR,
+    ReleaseComponent.RECONCILER,
+    ReleaseComponent.AGENT,
+)
+
+
+class StageSite(WaveSite):
+    """Records every cluster-level apply; rolls the node runtime for real."""
+
+    executor_wheel_cm = "candidate-wheel"
+    bundle_cm = "candidate-bundle"
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.applied: list[str] = []
+
+    def _apply_gpu_dcgm_exporter(self, target: Any, **_kwargs: Any) -> None:
+        self.applied.append(f"{target.cluster_id}:dcgm")
+
+    def _apply_gpu_adot_collector(self, target: Any) -> None:
+        self.applied.append(f"{target.cluster_id}:adot")
+
+    def _apply_gpu_deployments(
+        self, target: Any, _wheel: str, *, deployment_names: Any, **_kwargs: Any
+    ) -> None:
+        self.applied.extend(
+            f"{target.cluster_id}:{name}" for name in sorted(deployment_names)
+        )
+
+    def _roll_node_runtime(self, target: Any, **kwargs: Any) -> tuple[str, str]:
+        return NODE_RUNTIME.roll_node_runtime(self, target, **kwargs)
+
+
+def test_a_full_release_rolls_the_parked_clusters_components_and_skips_its_nodes(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from gpu_fault_release.regional_release_diff import diff_from_changed
+    from gpu_fault_release.regional_release_gpu_rollout import upgrade_gpu_target
+
+    site = StageSite()
+    progress: list[tuple[tuple[str, ...], str]] = []
+
+    upgrade_gpu_target(
+        site,
+        site.eks,
+        diff_from_changed({"node_runtime_wheel", "executor_wheel", "dcgm"}),
+        ReleaseExecutionPlan(nodes=FULL_GPU),
+        progress=lambda components, status, _detail: progress.append(
+            (tuple(item.value for item in components), status)
+        ),
+        candidate_preflighted=True,
+    )
+
+    assert sorted(site.applied) == sorted(
+        [
+            f"{EKS}:dcgm",
+            f"{EKS}:adot",
+            f"{EKS}:gpu-fault-cluster-executor",
+            f"{EKS}:gpu-fault-completion-watcher",
+            f"{EKS}:gpu-fault-kubernetes-node-resource-collector",
+        ]
+    ), "every cluster-level component rolls"
+    ((_cluster, call),) = site.reconciler_calls
+    assert call["allowed_node_names"] is None and call["zero_nodes"]["parked"] is True
+    assert (("reconciler", "agent"), "COMPLETED") in progress
+    assert "skipped=agent-snapshot" in capsys.readouterr().err
+
+
+class RollbackStageSite(StageSite):
+    def _config_map_sha(self, _kubectl: Any, _name: str, _key: str) -> str:
+        return "2" * 64
+
+
+def test_a_full_rollback_of_the_parked_cluster_restores_its_components_and_reconciler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    site = RollbackStageSite()
+    previous = _previous(site)
+    previous["clusters"][EKS].update(
+        {
+            "wheel": "previous-wheel",
+            "dcgm_image": "registry.example/dcgm@sha256:" + "d" * 64,
+        }
+    )
+    site.state = {"previous": previous}
+    monkeypatch.setattr(
+        ROLLBACK_TARGET, "validate_rollback_node_template", lambda *_a, **_k: None
+    )
+    preflights: list[tuple[str, str, bool]] = []
+    monkeypatch.setattr(
+        NODE_RUNTIME,
+        "ensure_node_candidate_preflight",
+        lambda _release, target, candidate: preflights.append(
+            (target.cluster_id, candidate.phase, candidate.zero_nodes is not None)
+        ),
+    )
+
+    ROLLBACK_TARGET.rollback_target(
+        site,
+        site.eks,
+        previous=previous,
+        artifact="1" * 64,
+        config_digest="7" * 64,
+        runtime_profile_version="hyperpod-v1",
+        executor_artifact="2" * 64,
+        executor_compatibility="2" * 64,
+        node_compatibility="1" * 64,
+        runtime_image="registry.example/runtime@sha256:" + "a" * 64,
+        node_installer_image="registry.example/installer@sha256:" + "c" * 64,
+        components=frozenset(FULL_GPU) - {ReleaseComponent.OBSERVABILITY},
+    )
+
+    assert preflights == [(EKS, "rollback", True)], (
+        "the previous template is admitted in its zero-node mode, no node batch"
+    )
+    assert f"{EKS}:dcgm" in site.applied
+    assert f"{EKS}:gpu-fault-cluster-executor" in site.applied
+    ((_cluster, call),) = site.reconciler_calls
+    assert call["node_dependency_target"] is NodeDependencyTarget.PREVIOUS
+    assert call["wheel_cm"] == "previous-wheel" and call["zero_nodes"] is not None
+    assert site.state["zero_node_clusters"][EKS]["phase"] == "rollback"
+
+
+def test_a_resume_of_a_full_release_validates_the_parked_clusters_reconciler_only() -> (
+    None
+):
+    release = ResourceRelease(("gpu-a", "gpu-eks"))
+    previous = previous_snapshot(release)
+    previous["agent_identities"]["gpu-eks"] = PARKED.zero_node_identity(
+        {"parked": True, "provider": "eks-managed", "reason": "r", "groups": []}
+    )
+
+    RESUME.validate_resume_checkpoint(
+        release,
+        loaded=_checkpoint(release, {"gpu-a": "CONVERGED", "gpu-eks": "CONVERGED"}),
+        previous=previous,
+        plan=ReleaseExecutionPlan(nodes=tuple(RESUME.GPU_COMPONENTS)),
+    )
+
+    assert {item["cluster_id"] for item in release.heartbeat_checks} == {"gpu-a"}
