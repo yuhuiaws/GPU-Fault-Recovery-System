@@ -866,3 +866,34 @@ def test_only_the_overdue_signing_check_reads_as_healthy_to_a_deploy() -> None:
         report(admin_signing.SIGNING_CHECK, "aurora")
     ), "another failing check hid behind the signing check"
     assert not staging_live_evidence.deploy_healthy(None), "no report is not healthy"
+
+
+def test_each_refusal_names_only_the_exits_that_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signer
+) -> None:
+    """Only the release attestation can also be accepted as the committed live
+    release; the deploy's own artefacts name the switch and the backfill only."""
+
+    state = tmp_path / "state"
+    signing = _signing(state)
+    _success_record(state, declared=True)
+    monkeypatch.setattr(staging_deploy, "_run", lambda *_a, **_k: "")
+    with pytest.raises(staging_deploy.StagingDeployError) as record:
+        staging_deploy.load_successful_source_deploy(state, signing=signing)
+    message = str(record.value)
+    assert message.startswith(
+        "successful source deploy authorization: source-deploy-success.json is "
+        "signed without a transparency-log entry (declared "
+    ), message
+    assert message.endswith(
+        f"{REASON}); accepted only by a deploy that carries "
+        "--allow-unlogged-signature --reason ...; run `gpu-fault-admin "
+        "backfill-transparency-log --state-dir STATE_DIR` once the transparency "
+        "log answers"
+    ), message
+    assert "committed release" not in message
+
+    _release(tmp_path, declaration=transparency.unlogged_declaration(REASON))
+    with pytest.raises(release_attestation.ReleaseAttestationError) as release:
+        _verify(tmp_path, UNLOGGED_BUNDLE)
+    assert "or as the committed release the site runs" in str(release.value)

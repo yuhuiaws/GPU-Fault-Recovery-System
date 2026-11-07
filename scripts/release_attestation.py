@@ -457,7 +457,7 @@ def verify_attestation_signature(
                 declaration=declaration,
                 keyed=bool(cosign_key),
                 approved=approval is not None,
-                approval_hint=transparency.UNLOGGED_REFUSAL_HINT,
+                approval_hint=transparency.UNLOGGED_RELEASE_REFUSAL_HINT,
             )
         except transparency.SigningTransparencyError as exc:
             raise ReleaseAttestationError(str(exc)) from None

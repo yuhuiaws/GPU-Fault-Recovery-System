@@ -31,6 +31,7 @@ from gpu_fault_release.regional_admin_commands import status_header_lines
 from gpu_fault_release.regional_release_signing import (
     release_signing_view,
     trust_pin_view,
+    unlogged_signatures_view,
     with_failing_check,
 )
 
@@ -182,9 +183,13 @@ def print_status_report(
             site_file.parent, release_id=_running_release_id(report)
         )
         pin, pin_findings = trust_pin_view(site_file.parent)
+        unlogged, unlogged_findings = unlogged_signatures_view(
+            site_file.parent, release_id=_running_release_id(report)
+        )
         signing_fields: dict[str, Any] = {
             **({"release_signing": signing} if signing is not None else {}),
             **({"sigstore_trust_pin": pin} if pin is not None else {}),
+            **({"unlogged_signatures": unlogged} if unlogged else {}),
         }
         if signing_check is not None and report is not None:
             report = with_failing_check(report, signing_check)
@@ -196,6 +201,7 @@ def print_status_report(
             *([view["finding"]] if view["finding"] else []),
             *membership_lines,
             *signing_findings,
+            *unlogged_findings,
             *pin_findings,
         ]
         stdout = _with_deploy_host_fields(

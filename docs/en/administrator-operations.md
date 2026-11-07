@@ -1476,6 +1476,10 @@ signs and verifies nothing.
   `release_signing` with `status: ADVISORY`. 72 hours after `declared_at` it becomes the failing check `release_signature`
   (`healthy: NO`, exit status 1) until the backfill. That check never stops a deploy: the deploy reads the engine's own verdict, so
   the next deploy -- one way out of it -- is not blocked by it.
+- The site key's other signatures without a log entry -- the success record, deploy-host archives, CI receipts; all that a
+  deploy-host-only deploy with the switch signs, since it changes no release -- are one finding, `<n> signature(s) of the site
+  key have no transparency-log entry (...); run gpu-fault-admin backfill-transparency-log ...`, and the JSON field
+  `unlogged_signatures`; never a failing check.
 
 **While the release runs.** `config`, a deploy-host-only deploy and the other commands that verify the release the site already
 runs accept its attestation without a log entry only when the cluster's own release record (the release state the release engine

@@ -660,7 +660,8 @@ transparency log on localhost exercise the retry and the refusal that names the 
 declaration rules (missing, malformed, tampered), each verifier's acceptance and refusal (the release attestation with the
 operator's switch or the cluster's record of the live release, the deploy-host archive, the CI candidate receipt, the
 successful source deploy record), the hops that carry the consent as arguments and drop an exported value, the records, the
-deploy summary lines, the status finding and its failing check after 72 hours (which the deploy reads as healthy), the backfill
+deploy summary lines, the status finding and its failing check after 72 hours (which the deploy reads as healthy), the finding
+that names the site key's other unlogged signatures after a deploy-host-only deploy, the exits each refusal names, the backfill
 (a fresh upload, an entry that already exists, a signature the site key did not make), the pin refresh (SHA-256 against the TUF
 targets metadata, no lower TUF version, the previous pin kept) and the fallback, which only the three TUF-fetch forms trigger.
 None of these tests signs, uploads or reaches a network.

@@ -169,6 +169,51 @@ def release_signing_view(
     return field, [], check
 
 
+SUCCESS_RECORD_SIGNATURE = "source-deploy-success.sigstore.json"
+
+
+def unlogged_signatures_view(
+    state_dir: Path, *, release_id: str | None
+) -> tuple[list[str], list[str]]:
+    """``(bundles, findings)``: the site key's other signatures still without a
+    transparency-log entry.
+
+    The running release's attestation is ``release_signing_view``'s; this names
+    the rest a deploy with ``--allow-unlogged-signature`` signed -- the success
+    record, the deploy-host archives, the CI receipts, other releases' copies --
+    so a deploy-host-only deploy that changed no release still shows in
+    ``status`` until ``backfill-transparency-log`` logs them.
+    """
+
+    candidates = [
+        state_dir / SUCCESS_RECORD_SIGNATURE,
+        *sorted((state_dir / "deploy-host" / "by-content").glob("*/*.sigstore.json")),
+        *sorted((state_dir / "ci-candidates").glob("*/verification.sigstore.json")),
+        *(
+            path
+            for path in sorted(
+                (state_dir / RELEASE_DEPLOY_DIR).glob("*/attestation.sigstore.json")
+            )
+            if path.parent.name != release_id
+        ),
+    ]
+    unlogged = [path for path in candidates if bundle_has_log_entry(path) is False]
+    if not unlogged:
+        return [], []
+    names = [str(path.relative_to(state_dir)) for path in unlogged]
+    refused = (
+        "; until then a deploy without --allow-unlogged-signature refuses the "
+        "unlogged source-deploy-success.json"
+        if SUCCESS_RECORD_SIGNATURE in names
+        else ""
+    )
+    return names, [
+        f"{len(names)} signature(s) of the site key have no transparency-log entry "
+        f"({', '.join(names)}); run gpu-fault-admin backfill-transparency-log "
+        f"--state-dir {state_dir} once the transparency log answers{refused}"
+    ]
+
+
 def trust_pin_view(
     state_dir: Path, *, now: datetime | None = None
 ) -> tuple[dict[str, Any] | None, list[str]]:

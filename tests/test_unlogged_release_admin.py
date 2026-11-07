@@ -847,3 +847,41 @@ def test_the_release_driver_carries_the_switch_and_records_the_mode(
     assert "release release-a is signed without a transparency-log entry" in (
         captured.err
     )
+
+
+def test_a_deploy_host_only_unlogged_deploy_still_shows_in_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A deploy-host-only deploy with the switch signs the deploy-host archive
+    and the success record without a log entry and changes no release: status
+    still names them, as a finding (never a failing check), until the backfill."""
+
+    _prepared(tmp_path)  # the running release's record: logged, no signing block
+    _write(tmp_path / "source-deploy-success.sigstore.json", UNLOGGED_BUNDLE)
+    archive = (
+        tmp_path / "deploy-host/by-content/abc/gpu-fault-deploy-host-p.sigstore.json"
+    )
+    _write(archive, UNLOGGED_BUNDLE)
+    _write(tmp_path / "ci-candidates/c/verification.sigstore.json", LOGGED_BUNDLE)
+
+    failing, document, header = _status(tmp_path, capsys)
+
+    assert failing is False and document["healthy"] is True
+    assert document["unlogged_signatures"] == [
+        "source-deploy-success.sigstore.json",
+        "deploy-host/by-content/abc/gpu-fault-deploy-host-p.sigstore.json",
+    ]
+    assert (
+        "finding: 2 signature(s) of the site key have no transparency-log entry "
+        "(source-deploy-success.sigstore.json, "
+        "deploy-host/by-content/abc/gpu-fault-deploy-host-p.sigstore.json); run "
+        f"gpu-fault-admin backfill-transparency-log --state-dir {tmp_path} once the "
+        "transparency log answers; until then a deploy without "
+        "--allow-unlogged-signature refuses the unlogged source-deploy-success.json"
+    ) in header
+
+    for path in (tmp_path / "source-deploy-success.sigstore.json", archive):
+        _write(path, LOGGED_BUNDLE)
+    _failing, document, header = _status(tmp_path, capsys)
+    assert "unlogged_signatures" not in document
+    assert "have no transparency-log entry" not in header

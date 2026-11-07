@@ -284,11 +284,22 @@ def require_unlogged_acceptance(
 
 
 #: The exits a refusal of an unlogged signature names.
+_BACKFILL_EXIT = (
+    "run `gpu-fault-admin backfill-transparency-log --state-dir STATE_DIR` once "
+    "the transparency log answers"
+)
+#: The exits a refusal names for the deploy's own artefacts (the deploy-host
+#: archive, the CI receipt, the success record): only the switch accepts them.
 UNLOGGED_REFUSAL_HINT = (
-    "accepted only by the deploy that signed it with "
-    f"{ALLOW_UNLOGGED_FLAG} {REASON_FLAG} ..., or as the release the site "
-    "runs; run `gpu-fault-admin backfill-transparency-log --state-dir STATE_DIR` "
-    "once the transparency log answers"
+    f"accepted only by a deploy that carries {ALLOW_UNLOGGED_FLAG} "
+    f"{REASON_FLAG} ...; {_BACKFILL_EXIT}"
+)
+#: The release attestation is also accepted as the committed release the site
+#: runs, on the cluster's own release record (``release_attestation``).
+UNLOGGED_RELEASE_REFUSAL_HINT = (
+    f"accepted only by a deploy that carries {ALLOW_UNLOGGED_FLAG} "
+    f"{REASON_FLAG} ..., or as the committed release the site runs; "
+    f"{_BACKFILL_EXIT}"
 )
 
 
