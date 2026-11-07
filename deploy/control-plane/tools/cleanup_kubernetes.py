@@ -43,6 +43,7 @@ from cleanup_state import (
     verify_ec2_instance_states,
     verify_provider_nodes,
 )
+import cleanup_zero_nodes as zero_nodes
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_removal_rbac import (
@@ -912,7 +913,19 @@ def node_targets(
                 raise CleanupStateError("node cleanup lacks installed unit inventory")
             recorded[name] = object_identity(by_name[name])[3]
         if not recorded and not nothing_installed(agents, nodes, cluster_id):
-            raise CleanupStateError("node cleanup has no proven fleet targets")
+            # No node of the cluster is a target: proven only for a cluster
+            # whose selector selects no node at all (``cleanup_zero_nodes``).
+            zero = zero_nodes.zero_node_targets(
+                config,
+                cleanup_cluster(config, context, cluster_id) if config else {},
+                agents,
+                cluster_id,
+                departed=departed,
+                prove_departure=functools.partial(
+                    departed_fleet_node, config, document, context
+                ),
+            )
+            document.setdefault(zero_nodes.ZERO_NODE_KEY, {})[cluster_id] = zero
         document.setdefault("node_targets", {})[context] = recorded
         journal = document.setdefault("departed_fleet_nodes", [])
         journal.extend(entry for entry in departed if entry not in journal)
@@ -944,9 +957,9 @@ def nothing_installed(
     ``gpu-fault.io/`` label, annotation or taint -- the node-group
     declarations aside, which a label-convention join requires on every GPU
     node before it starts (``cleanup_node_patch.carries_product_state``). That
-    is an empty, proven target set, not missing proof: a fleet record of any
-    lifecycle, or anything of ours on a node, keeps the "no proven fleet
-    targets" refusal.
+    is an empty, proven target set, not missing proof. Fleet records without a
+    target are proven otherwise -- a cluster without nodes, ``cleanup_zero_nodes``
+    -- or keep the "no proven fleet targets" refusal.
     """
 
     if any(agent.get("cluster_id") == cluster_id for agent in agents):
@@ -1228,7 +1241,7 @@ def run_node_cleanup(
             "name": name,
             "uid": None,
             "status": "SKIPPED",
-            "reason": "no node runtime was installed on this cluster",
+            "reason": zero_nodes.skipped_reason(document, cluster_id),
         }
         atomic_write(state_path, document)
         return

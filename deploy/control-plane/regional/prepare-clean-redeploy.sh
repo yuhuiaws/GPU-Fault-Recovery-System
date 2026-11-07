@@ -1249,9 +1249,10 @@ capture_preflight() {
 log_node_capture_exceptions() {
     # Nodes the capture proved safe to leave out of the fleet targets: agents
     # whose instance the provider no longer has (HyperPod no longer lists it,
-    # or EC2 reports it terminated or unknown), and replacement nodes that
-    # carry only unfinished installer annotations. Both are journaled in the
-    # state file; this only surfaces them in the run output.
+    # or EC2 reports it terminated or unknown), replacement nodes that carry
+    # only unfinished installer annotations, and the clusters without any node
+    # (cleanup_zero_nodes.py). All are journaled in the state file; this only
+    # surfaces them in the run output.
     local line
     local lines
     lines="$(
@@ -1277,6 +1278,13 @@ for context, nodes in sorted((document.get("orphaned_installer_nodes") or {}).it
             f"{context}: node {name} carries only unfinished installer "
             "annotations and no fleet agent; annotations are removed at reset"
         )
+for cluster_id, entry in sorted((document.get("zero_node_clusters") or {}).items()):
+    print(
+        f"{cluster_id}: GPU cluster without nodes ({entry.get('state')}): no node "
+        f"selected; {entry.get('reason')}; no node cleanup target "
+        f"({len(entry.get('retired_agents') or [])} retired and "
+        f"{len(entry.get('departed_agents') or [])} departed fleet record(s))"
+    )
 PY
     )"
     while IFS= read -r line; do

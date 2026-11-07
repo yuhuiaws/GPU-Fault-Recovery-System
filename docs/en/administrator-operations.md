@@ -3971,9 +3971,15 @@ Reconciler installs them with the current release and their Agents register. The
 selector selects one; while they install, `status` reports them like any joining node (`installer is not Succeeded`, Agent
 coverage drift) until the Agents are in.
 
-**What still needs nodes.** `uninstall` and `remove-cluster` of a cluster without nodes refuse in their node cleanup (`node
-cleanup has no proven fleet targets`); `rotate-token` for such a cluster updates the Secret and the data plane and then stops
-at its node roll. Scale a group back up first. **Alerts:** nothing pages for a fleet without nodes whose product Deployments
+**Administrator verbs on a cluster without nodes.** `uninstall` and `remove-cluster` run their node cleanup over an empty,
+proven target set: the cluster's selector selects no node (the same proof as above), every fleet record of the cluster is
+retired (`REVOKED`) or proven departed by its provider, and no node carries anything of ours. The cleanup journal records it
+(`zero_node_clusters.<cluster>`: state, reason, groups, the retired and the departed records), the run output prints
+`<cluster>: GPU cluster without nodes (<state>): no node selected; <reason>; no node cleanup target (...)` and the node
+cleanup reads `SKIPPED` with that reason; the node-key Secrets go with the namespaces as for any cluster. A record whose
+instance the provider still has (`an active fleet node is missing: ...`) or a node list that cannot be read still refuses
+(`node cleanup has no proven fleet targets`). `rotate-token` for such a cluster updates the Secret and the data plane and then
+stops at its node roll: scale a group back up first. **Alerts:** nothing pages for a fleet without nodes whose product Deployments
 still run on its other nodes -- the collector-silence, stale-Agent and topology alerts count ACTIVE Agents only;
 `GpuFaultDataplaneCollectorMissing` fires for the cluster only when no node is left to run its watcher, which is a real fault.
 An unavailable cluster is therefore seen in `status`, the deploy log and the deploy record, not through an alert.

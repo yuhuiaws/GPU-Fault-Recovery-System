@@ -1168,7 +1168,8 @@ def test_a_cluster_that_never_received_node_runtimes_is_an_empty_proven_target_s
 
 def test_a_retired_fleet_record_still_demands_proof() -> None:
     """History for the cluster -- even a RETIRED agent on a departed node --
-    keeps the refusal: the cluster did run a node runtime once."""
+    keeps the refusal: the cluster did run a node runtime once, and nothing
+    here proves it has no node at all (``cleanup_zero_nodes``)."""
 
     client, state = _plain_eks_client(), document()
     state["fleet_snapshot"][0].update(node_id="departed", lifecycle_state="RETIRED")

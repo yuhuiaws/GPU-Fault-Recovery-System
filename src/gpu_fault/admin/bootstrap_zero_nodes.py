@@ -1,28 +1,32 @@
-"""Bootstrap tasks of a GPU cluster without nodes, judged by the release engine's proof.
+"""Administrator steps of a GPU cluster without nodes, judged by the release engine's proof.
 
 The release engine skips the node work of a GPU cluster whose recorded node
 selector selects no Kubernetes node (``gpu_fault_release.regional_parked_cluster``:
 *parked* when its provider declares the capacity zero, *unavailable* otherwise):
-zero GPU nodes never stop a deploy of the site. The bootstrap that runs before
-the release reads the GPU clusters too, and live it did stop one: the
+zero GPU nodes never stop a deploy of the site. The administrator verbs read the
+GPU clusters too, and live one of them did stop a deploy: the bootstrap's
 ``node_keys:<cluster>`` task of an eks-managed cluster scaled to zero ran the
 node-key helper, which refuses an empty node inventory, and the deploy failed
-before any roll.
+before any roll. ``uninstall`` and ``remove-cluster`` (their node cleanup),
+``rotate-token`` (its node roll), ``join-cluster`` (its node inventory) and the
+custody check of ``preflight``/``deploy -f``/``join-cluster`` ask the same
+question of the cluster they act on.
 
 ``zero_node_proof`` asks exactly what the engine asks -- the node list under the
 cluster's recorded selector and, only when the API returns it empty, the
 provider documents (``describe-nodegroup`` and the Karpenter NodePools, or
 HyperPod ``describe-cluster``) -- through ``regional_parked_cluster.without_nodes``
 itself, with the admin runner and the GPU kubeconfig, in the run that acts on
-it. The reads are read-only, so a probe runner answers them. A node list that
-cannot be read proves nothing: the task then runs exactly as before and fails
-closed on what it finds.
+it; ``zero_node_proof_for_entry`` asks it of a site or release-config cluster
+entry. The reads are read-only, so a probe runner answers them. A node list
+that cannot be read proves nothing: the step then runs exactly as before and
+fails closed on what it finds.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -41,13 +45,16 @@ NODE_KEYS_RECORDED = "no node, no key to provision"
 
 class _Reads:
     """What ``regional_parked_cluster`` reads of a release, answered by the admin
-    runner against one GPU cluster (``runner`` is the release's runner too)."""
+    runner against one GPU cluster (``runner`` is the release's runner too).
+    Without ``gpu_kubeconfig`` kubectl reads the ``KUBECONFIG`` it inherits."""
 
     def __init__(
-        self, runner: CommandRunner, *, gpu_kubeconfig: Path, context: str
+        self, runner: CommandRunner, *, gpu_kubeconfig: Path | None, context: str
     ) -> None:
         self._runner = runner
-        self._kubectl = ["kubectl", "--kubeconfig", str(gpu_kubeconfig)]
+        self._kubectl = ["kubectl"]
+        if gpu_kubeconfig is not None:
+            self._kubectl += ["--kubeconfig", str(gpu_kubeconfig)]
         if context:
             self._kubectl += ["--context", context]
         self.runner = self
@@ -88,6 +95,20 @@ def _target(cluster: ClusterIdentity, cluster_id: str) -> SimpleNamespace:
     )
 
 
+def entry_target(entry: Mapping[str, Any], *, region: str = "") -> SimpleNamespace:
+    """A site or release-config cluster entry in the shape of a release target;
+    ``region`` stands in for an entry that records none (the site's)."""
+
+    return SimpleNamespace(
+        cluster_id=str(entry.get("cluster_id") or ""),
+        provider=entry.get("provider"),
+        node_selector=str(entry.get("node_selector") or ""),
+        hyperpod_cluster_name=str(entry.get("hyperpod_cluster_name") or ""),
+        eks_cluster_arn=str(entry.get("eks_cluster_arn") or ""),
+        region=str(entry.get("region") or region or ""),
+    )
+
+
 def zero_node_proof(
     runner: CommandRunner,
     *,
@@ -102,6 +123,26 @@ def zero_node_proof(
     return parked_cluster.without_nodes(
         _Reads(runner, gpu_kubeconfig=gpu_kubeconfig, context=cluster.context),
         _target(cluster, cluster_id),
+    )
+
+
+def zero_node_proof_for_entry(
+    runner: CommandRunner,
+    *,
+    gpu_kubeconfig: Path | None,
+    entry: Mapping[str, Any],
+    region: str = "",
+) -> dict[str, Any] | None:
+    """``zero_node_proof`` of a site or release-config cluster ``entry`` (its
+    ``context``, recorded selector, provider and provider names)."""
+
+    return parked_cluster.without_nodes(
+        _Reads(
+            runner,
+            gpu_kubeconfig=gpu_kubeconfig,
+            context=str(entry.get("context") or ""),
+        ),
+        entry_target(entry, region=region),
     )
 
 

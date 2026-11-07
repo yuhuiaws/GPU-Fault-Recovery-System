@@ -30,8 +30,11 @@ release that rolls the Reconciler is refused while it has no node. No alert
 pages for a cluster that has lost every node once its Agents are retired:
 `status` shows it. The deploy's bootstrap provisions no node key for a cluster
 without nodes; that path is proven offline through the real bootstrap task
-graph with fake runners. `uninstall`, `remove-cluster` and `rotate-token` still
-need a node on that cluster, and so does configured node-key custody.
+graph with fake runners. `uninstall` and `remove-cluster` clean a cluster
+without nodes as an empty, proven target set; that is proven offline only,
+through the real cleanup script and tools over a fake Kubernetes API and a fake
+`aws`, never on a live cluster. `rotate-token` still needs a node on that
+cluster, and so does configured node-key custody.
 
 ## Xid linkage and Drain P2P recovery
 

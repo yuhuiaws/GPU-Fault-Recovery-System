@@ -1850,6 +1850,17 @@ like. `prepare-clean-redeploy.sh` creates a private temporary file and passes it
 empties it on start and writes `<action> <context>: <reason>` on failure (`failure_note`), and the exit trap appends it to the journal's
 `FAILED` message.
 
+The node cleanup of a GPU cluster without nodes is an empty target set proven by
+`deploy/control-plane/tools/cleanup_zero_nodes.py::zero_node_targets`, called by `node_targets` when no fleet record names a listed node.
+The proof is the release engine's own (`gpu_fault.admin.bootstrap_zero_nodes.zero_node_proof_for_entry` over the bound config entry: the
+API lists no node for the recorded selector, then the provider documents); every record not yet retired (`ACTIVE` or `DRAINING`) must be
+proven departed by `departed_fleet_node`, `REVOKED` records count as retired, any other lifecycle refuses, and the existing check that no
+node outside the targets carries our metadata still runs. The decision rests on those facts, not on the provider read: the journal records
+`zero_node_clusters.<cluster>` (state, provider, reason, groups, `retired_agents`, `departed_agents`), the run output and a
+`zero-node-gpu-cluster ... step=node-cleanup` line say so, and `run_node_cleanup` records the skipped DaemonSet with the zero-node reason.
+A selector that still selects a node, an unreadable node list or a record whose instance the provider still has keeps the
+`no proven fleet targets` refusal.
+
 A resume with consumers not yet stopped re-proves DRAINING and the already completed queue drain; an old completion marker cannot serve as a
 continuing admission barrier. A resume after the consumers stopped uses only the original fleet/UID proof and no longer reads the database. Pure registry
 drain uses a context that consumes no images; normal `RegionalRelease` construction and direct calls still check the schema-v3/v4
