@@ -4471,7 +4471,11 @@ Reconciler is rolled with the release's node runtime (its installer template ren
 `sync-state` all carry the entry. A release is refused at its deploy preflight (`zero_node_gpu_clusters`) only when it could
 not finish or roll back: Agent waves while every GPU cluster has zero nodes, or a Reconciler roll over a cluster whose groups
 declare no GPU instance type the installer knows. The proof reads only what `regional_contexts` already reads; the
-departed-node cleanup itself does not consult it.
+departed-node cleanup itself does not consult it. It never opens a read snapshot (`regional_release_state.read_snapshot`):
+the snapshot's cache lives on the release object every thread shares, and a release step -- the candidate preflight, the
+cluster rollout -- runs its clusters in parallel threads whose node safety reads must stay fresh (`gpu_node_items`
+refuses a fresh read while a snapshot is open). Inside a snapshot its caller opened -- `status`, a release's capture of
+its previous state -- the proof joins it and is read once.
 
 Code basis: `src/gpu_fault/departed_node_cleanup.py::DepartedNodeCleanup.run_once`,
 `src/gpu_fault/departed_node_cleanup_actions.py::DepartureWrites`, `src/gpu_fault/departed_nodes.py`,

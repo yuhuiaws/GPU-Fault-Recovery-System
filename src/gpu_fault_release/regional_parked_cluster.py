@@ -85,8 +85,8 @@ import json
 import re
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, cast
+from contextlib import contextmanager
+from typing import Any
 
 from gpu_fault.admin.automatic_node_updates import KARPENTER_NODEPOOLS
 from gpu_fault.admin.bootstrap_ownership import hyperpod_groups_for_selector
@@ -588,13 +588,6 @@ def read_parked(release: Any, target: Any) -> dict[str, Any]:
     )
 
 
-def _snapshot(release: Any) -> AbstractContextManager[Any]:
-    factory = getattr(release, "_read_snapshot", None)
-    if callable(factory):
-        return cast(AbstractContextManager[Any], factory())
-    return nullcontext()
-
-
 def _selected_nodes(release: Any, target: Any) -> list[Mapping[str, Any]] | None:
     """The nodes the API lists for ``target``'s selector; ``None`` when unreadable.
 
@@ -656,16 +649,22 @@ def without_nodes(release: Any, target: Any) -> dict[str, Any] | None:
     """The proof of ``target`` -- parked or unavailable -- when its selector
     selects no node, else ``None``, including when the node list cannot be read.
 
-    The node list and the provider documents are read in one snapshot, so the
-    two describe one observation; a node that appears later is judged by the
-    usual join and churn handling, never by this answer.
+    The node list is read first and the provider documents only when it is
+    empty; a node that appears later is judged by the usual join and churn
+    handling, never by this answer. Inside a report snapshot the caller opened
+    (``status``, a release's capture of its previous state) both reads join it.
+    This never opens one: a snapshot is release-wide state -- its cache lives
+    on the release object every thread shares -- and a release step runs its
+    clusters in parallel threads whose node safety reads must stay fresh
+    (``gpu_node_items(fresh=True)`` refuses inside a snapshot). Live, a parked
+    cluster's snapshot held open for its provider reads failed the other
+    cluster's fresh read in the candidate preflight.
     """
 
-    with _snapshot(release):
-        selected = _selected_nodes(release, target)
-        if selected is None or selected:
-            return None
-        return read_parked(release, target)
+    selected = _selected_nodes(release, target)
+    if selected is None or selected:
+        return None
+    return read_parked(release, target)
 
 
 # --- what the checks make of it -------------------------------------------
