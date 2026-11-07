@@ -2483,7 +2483,10 @@ Whole-record hardware recovery escalation is invoked idempotently by the Dispatc
    MARK_UNSCHEDULABLE → QUARANTINE → ESCALATE_SUPPORT), or hands the node over alone when it cannot be observed at
    all (`containment_refused`), its reason naming the isolation problem and, for a reboot, a submission of the step
    the provider-submission ledger holds ("the node may already have rebooted"). A reboot the provider or its
-   preflight refused keeps the replacement rung.
+   preflight refused keeps the replacement rung, including one the operator's reboot switch refused
+   (`GPU_FAULT_ALLOW_HYPERPOD_REBOOT=false`: "HyperPod REBOOT mutation is disabled by configuration"), by design: the
+   healthy warm-spare failover does not mutate the faulted node, so its preflight skips that switch, and with no
+   labelled spare it refuses with the no-fallback literal and the record ends in one support hand-off.
 3. Replacement only allows a warm spare that has passed the independent health state machine's validation and has been atomically reserved; the managed/provider
    replacement Adapter rejects this strategy.
 4. Replacement fails: keep unschedulable/quarantine, execute `ESCALATE_SUPPORT`,
