@@ -1731,7 +1731,11 @@ node lifecycle adapter refused before its provider call because it could not
 observe the node's isolation takes the containment hand-off instead of the
 replacement rung, its reason naming the isolation problem: software-tested
 only (`tests/execution/test_lifecycle_isolation_refusal.py`), no live case
-refuses a reboot for isolation. So is the support hand-off of a validate-then-readmit
+refuses a reboot for isolation. The agent given back after a reboot whose
+reservation was refused before the provider call is software-tested against
+the memory, SQLite and regional submission ledgers
+(`tests/execution/test_submission_unrecorded_real_stores.py`); no live case
+refuses a reservation. So is the support hand-off of a validate-then-readmit
 record whose validation fails with no recovery step before it while its cordon
 still holds the node (stage `held_chain_step`;
 `tests/orchestration/test_cov95_runtime_escalation.py`,

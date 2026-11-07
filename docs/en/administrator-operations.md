@@ -1905,8 +1905,10 @@ Semantics and boundaries of `eks-managed`:
   refused the reservation with 403), or the provider rejected every node -- the step undoes its own revocation (the
   provider-rejection path writes step `details.revoked_agents`/`reactivated_agents`; the exception path keeps the
   executor's own failure/retry classification and logs an Executor WARNING `agent <cluster>/<node> reactivated`) and
-  the Agent keeps heartbeating under its incarnation. A recorded submission (INTENDED/UNKNOWN/SUBMITTED) or a partial
-  acceptance keeps the Agent REVOKED: the provider may still reboot it. An Agent left REVOKED gets every
+  the Agent keeps heartbeating under its incarnation. The proof is the ledger's own answer: the INTENDED record is
+  written before the provider call, so a ledger that answers it holds no record for the step proves nothing was
+  submitted, while a lookup that fails proves nothing and keeps the Agent REVOKED. A recorded submission
+  (INTENDED/UNKNOWN/SUBMITTED) or a partial acceptance keeps the Agent REVOKED: the provider may still reboot it. An Agent left REVOKED gets every
   heartbeat answered 409 `agent incarnation has been retired`.
   Recovery **without rebooting the node**: read `generation` and `transition_id` (the revoking
   `<workflow>/<step>/<op>/hyperpod-lifecycle`) from `GET /v1/fleet/agents/{cluster_id}/{node_id}`, then

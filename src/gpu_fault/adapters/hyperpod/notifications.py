@@ -189,29 +189,18 @@ class HyperPodNotificationMixin:
     def _submission_unrecorded(self, context: WorkflowStepContext) -> bool:
         """True only when the submission ledger provably holds no record for
         this step: the reservation itself was refused before any provider call.
-        No ledger, a record in any state, or a failing lookup all answer False
-        (fail closed: the agents stay revoked)."""
 
-        store = getattr(getattr(self, "dispatcher", None), "adapter", None)
-        store = getattr(store, "store", None)
-        if store is None:
-            return False
-        try:
-            record = store.get_hyperpod_submission(
-                context.request.confirm_cluster_name,
-                hyperpod_submission_idempotency_key(
-                    context.workflow.request_id,
-                    context.step_index,
-                    context.step.operation,
-                ),
-            )
-        except Exception:  # noqa: BLE001 - an unreadable ledger keeps the revoke
-            LOGGER.exception(
-                "submission ledger lookup failed; agents of %s stay revoked",
-                context.workflow.request_id,
-            )
-            return False
-        return record is None
+        The ledger is write-ahead: ``provider_submissions.ProviderSubmissionLedger
+        .reserve`` writes the INTENDED record before HyperPod's
+        ``BatchRebootClusterNodes`` or EC2's ``RebootInstances`` is called, and a
+        call that raised leaves it UNKNOWN. So a store that answers it has no
+        record -- its ``LookupError`` (``_submission_record_state``) -- proves
+        nothing was submitted. Every store used to land in the failing-lookup
+        branch for that answer, so the agents of a refused reservation were
+        never given back. No durable ledger, a record in any state, or a failing
+        lookup all answer False (fail closed: the agents stay revoked)."""
+
+        return self._submission_record_state(context) == "none"
 
     def _reactivate_agents(
         self, context: WorkflowStepContext, node_ids: list[str]
