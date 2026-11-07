@@ -44,9 +44,6 @@ from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.cluster_scope import (
     DCGM_HOSTENGINE_LABEL,
     EKS_NODEGROUP_LABEL,
-    HYPERPOD_CLUSTER_LABEL,
-    HYPERPOD_INSTANCE_GROUP_LABEL,
-    INSTANCE_TYPE_LABEL,
     OWNERSHIP_LABEL,
     ClusterProvider,
     DcgmHostEngine,
@@ -55,11 +52,21 @@ from gpu_fault.cluster_scope import (
     cluster_provider,
     node_selector_source,
     ownership_node_selector,
-    selector_matches,
-    selector_ownership_value,
-    selector_requirements,
 )
 from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY
+
+# The node-group facts the zero-node proof judges HyperPod coverage on live
+# with that rule (``gpu_fault.zero_node_capacity``); their names stay
+# importable from here.
+from gpu_fault.zero_node_capacity import NodeGroupFacts as NodeGroupFacts
+from gpu_fault.zero_node_capacity import groups_for_selector as groups_for_selector
+from gpu_fault.zero_node_capacity import (
+    hyperpod_groups_for_selector as hyperpod_groups_for_selector,
+)
+from gpu_fault.zero_node_capacity import (
+    hyperpod_instance_group_facts as hyperpod_instance_group_facts,
+)
+from gpu_fault.zero_node_capacity import text_map as _text_map
 
 __all__ = [
     "NodeGroupFacts",
@@ -82,46 +89,6 @@ GROUP_KINDS: dict[str, str] = {
     ClusterProvider.HYPERPOD.value: "instance group",
     ClusterProvider.EKS_MANAGED.value: "managed node group",
 }
-
-
-@dataclass(frozen=True)
-class NodeGroupFacts:
-    """One node group as the provider API describes it, for selection and evidence."""
-
-    name: str
-    instance_types: tuple[str, ...]
-    #: The labels the group stamps on its nodes, plus the provider's own
-    #: stamped labels (node group / instance group name, cluster name,
-    #: instance type), so a recorded selector can be evaluated against a group.
-    labels: Mapping[str, str]
-    #: The ownership label value the group applies today, ``None`` when absent.
-    ownership: str | None
-    #: HyperPod only: the value declared but not yet applied (``DesiredLabels``
-    #: differs from ``CurrentLabels``); ``None`` when nothing is pending.
-    pending_ownership: str | None = None
-
-    @property
-    def unsupported_types(self) -> tuple[str, ...]:
-        """Instance types outside the GPU inventory (``ml.`` prefix ignored)."""
-
-        return tuple(
-            item
-            for item in self.instance_types
-            if item.removeprefix("ml.") not in GPU_INSTANCE_INVENTORY
-        )
-
-    @property
-    def hosts_gpu_types(self) -> bool:
-        return bool(self.instance_types) and not self.unsupported_types
-
-    def describe(self) -> str:
-        """The evidence line a refusal prints for this group."""
-
-        label = f"{OWNERSHIP_LABEL}=" + (self.ownership or "absent")
-        if self.pending_ownership is not None:
-            label += f" (desired {self.pending_ownership}, not applied yet)"
-        types = ",".join(self.instance_types) or "unknown"
-        return f"{self.name} instanceTypes={types} {label}"
 
 
 @dataclass(frozen=True)
@@ -151,12 +118,6 @@ class RecordedNodeScope:
     source: str
 
 
-def _text_map(value: object) -> dict[str, str]:
-    if not isinstance(value, Mapping):
-        return {}
-    return {str(key): str(item) for key, item in value.items()}
-
-
 def eks_nodegroup_facts(nodegroup: Mapping[str, Any]) -> NodeGroupFacts:
     """Facts of one ``eks describe-nodegroup`` ``nodegroup`` document.
 
@@ -177,42 +138,6 @@ def eks_nodegroup_facts(nodegroup: Mapping[str, Any]) -> NodeGroupFacts:
         instance_types=tuple(dict.fromkeys(types)),
         labels=labels,
         ownership=labels.get(OWNERSHIP_LABEL),
-    )
-
-
-def hyperpod_instance_group_facts(
-    group: Mapping[str, Any], *, cluster_name: str
-) -> NodeGroupFacts:
-    """Facts of one ``sagemaker describe-cluster`` ``InstanceGroups[]`` entry.
-
-    ``KubernetesConfig.CurrentLabels`` is what the group's nodes carry;
-    ``DesiredLabels`` is what ``update-cluster`` asked for and the service is
-    still reconciling (``Labels`` is the create-time spelling some documents
-    keep). Only applied labels count as ownership; a pending value is kept as
-    evidence so the refusal says "not yet" rather than "absent".
-    """
-
-    name = str(group.get("InstanceGroupName") or "")
-    instance_type = str(group.get("InstanceType") or "")
-    kubernetes = group.get("KubernetesConfig")
-    kubernetes = kubernetes if isinstance(kubernetes, Mapping) else {}
-    current = _text_map(kubernetes.get("CurrentLabels"))
-    if not current and "CurrentLabels" not in kubernetes:
-        current = _text_map(kubernetes.get("Labels"))
-    desired = _text_map(kubernetes.get("DesiredLabels"))
-    labels = dict(current)
-    labels[HYPERPOD_CLUSTER_LABEL] = cluster_name
-    labels[HYPERPOD_INSTANCE_GROUP_LABEL] = name
-    if instance_type:
-        labels[INSTANCE_TYPE_LABEL] = instance_type
-    ownership = current.get(OWNERSHIP_LABEL)
-    pending = desired.get(OWNERSHIP_LABEL)
-    return NodeGroupFacts(
-        name=name,
-        instance_types=(instance_type,) if instance_type else (),
-        labels=labels,
-        ownership=ownership,
-        pending_ownership=pending if pending != ownership else None,
     )
 
 
@@ -311,46 +236,6 @@ def resolve_node_scope(
         owned_groups=tuple(item.name for item in owned),
         evidence=tuple(facts),
     )
-
-
-def groups_for_selector(
-    facts: Sequence[NodeGroupFacts], selector: str
-) -> list[NodeGroupFacts]:
-    """The groups a recorded selector covers, for subnets and node-repair facts.
-
-    Evaluated against each group's labels (its own plus the provider-stamped
-    ones). A legacy selector that names only a label nodes gain at runtime
-    (``nvidia.com/gpu.present=true`` from GPU feature discovery) matches no
-    group's labels; such a selector falls back to the groups running a GPU
-    inventory type, which is what that default meant.
-    """
-
-    matched = [item for item in facts if selector_matches(item.labels, selector)]
-    if matched:
-        return matched
-    names_a_group = selector_ownership_value(selector) is not None or any(
-        key in {EKS_NODEGROUP_LABEL, HYPERPOD_INSTANCE_GROUP_LABEL}
-        for key, _operator, _values in selector_requirements(selector)
-    )
-    if names_a_group:
-        return []
-    return [item for item in facts if item.hosts_gpu_types]
-
-
-def hyperpod_groups_for_selector(
-    groups: Sequence[Any], *, cluster_name: str, selector: str
-) -> list[str]:
-    """The ``describe-cluster`` instance groups a HyperPod cluster's recorded
-    selector covers; an empty selector is the legacy cluster-name label, which
-    covers every group of the cluster."""
-
-    facts = [
-        hyperpod_instance_group_facts(group, cluster_name=cluster_name)
-        for group in groups
-        if isinstance(group, Mapping)
-    ]
-    effective = selector or f"{HYPERPOD_CLUSTER_LABEL}={cluster_name}"
-    return [item.name for item in groups_for_selector(facts, effective)]
 
 
 def dcgm_hostengine_remedy(*, cluster: str, group: str) -> str:

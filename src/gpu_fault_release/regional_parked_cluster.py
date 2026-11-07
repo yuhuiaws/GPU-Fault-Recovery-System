@@ -26,7 +26,9 @@ cluster is in one of two states (``state_of``):
   selector that covers no group, a NodePool that could supply the scope, a
   provider read that failed.
 
-The proof reads the documents ``regional_contexts`` already reads --
+The rule is ``gpu_fault.zero_node_capacity``; this module reads its documents
+on the deploy host. The proof reads the documents ``regional_contexts`` already
+reads --
 ``describe-nodegroup``, ``describe-cluster``, the Karpenter NodePools of the
 automatic-update advisory -- so it needs no new permission; it is asked only of
 a cluster whose node list is empty, at most once per report snapshot, and never
@@ -84,12 +86,12 @@ from __future__ import annotations
 import json
 import re
 import threading
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from typing import Any
 
+from gpu_fault import zero_node_capacity as capacity
 from gpu_fault.admin.automatic_node_updates import KARPENTER_NODEPOOLS
-from gpu_fault.admin.bootstrap_ownership import hyperpod_groups_for_selector
 from gpu_fault.cluster_scope import (
     EKS_NODEGROUP_LABEL,
     HYPERPOD_CLUSTER_LABEL,
@@ -97,11 +99,20 @@ from gpu_fault.cluster_scope import (
     INSTANCE_TYPE_LABEL,
     is_eks_managed,
     node_selector,
-    selector_ownership_value,
-    selector_requirements,
 )
 from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
-from gpu_fault.eks_node_repair import nodegroup_hosts_gpu_nodes, selected_nodegroup
+
+# The rule itself is one pure module (``gpu_fault.zero_node_capacity``); its
+# names stay importable from here.
+from gpu_fault.zero_node_capacity import EKS_MANAGED as EKS_MANAGED
+from gpu_fault.zero_node_capacity import HYPERPOD as HYPERPOD
+from gpu_fault.zero_node_capacity import PARKED as PARKED
+from gpu_fault.zero_node_capacity import UNAVAILABLE as UNAVAILABLE
+from gpu_fault.zero_node_capacity import NodePoolRead as NodePoolRead
+from gpu_fault.zero_node_capacity import eks_parked as eks_parked
+from gpu_fault.zero_node_capacity import hyperpod_parked as hyperpod_parked
+from gpu_fault.zero_node_capacity import nodepools_supplying as nodepools_supplying
+from gpu_fault.zero_node_capacity import state_of as state_of
 from gpu_fault_release import regional_release_state as release_state
 from gpu_fault_release.regional_release_config import CheckFailure, ReleaseError
 from gpu_fault_release.regional_release_diff import (
@@ -117,10 +128,6 @@ PARKED_KEY = "parked"
 #: cluster without nodes (``state``, ``provider``, ``reason``, ``groups``; the
 #: release state adds what the release skipped there).
 ZERO_NODE_KEY = "zero_node_clusters"
-#: The state of a cluster whose provider declares zero capacity.
-PARKED = "parked"
-#: The state of every other cluster without nodes (``state_of``).
-UNAVAILABLE = "unavailable"
 #: An Agent identity entry's key for a cluster without nodes (no identity).
 ZERO_NODES_IDENTITY_KEY = "zero_nodes"
 #: Collector readiness evidence: the clusters without nodes it did not wait for.
@@ -153,9 +160,6 @@ RENDER_NODE_ENV = "GPU_FAULT_ZERO_NODE_RENDER_NODE"
 RENDER_NODE_NAME = "gpu-fault-zero-node-template"
 RENDER_NODE_UID = "00000000-0000-0000-0000-000000000000"
 RENDER_NODE_ADDRESS = "0.0.0.0"
-EKS_MANAGED = "eks-managed"
-HYPERPOD = "hyperpod"
-_REASON_LIMIT = 300
 _STATE_LOCK = threading.Lock()
 
 #: ``sagemaker describe-cluster`` reduced to the cluster's binding and, per
@@ -170,8 +174,6 @@ HYPERPOD_CONTEXT_QUERY = (
     "ScheduledUpdateConfig:ScheduledUpdateConfig,AutoPatchConfig:AutoPatchConfig}}"
 )
 
-NodePoolRead = Callable[[], Mapping[str, Any] | None]
-
 
 def node_kind(target: object) -> str:
     """``GPU`` on an eks-managed cluster, ``HyperPod`` on a HyperPod one: the
@@ -182,290 +184,6 @@ def node_kind(target: object) -> str:
 
 def _mapping(value: object) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
-
-
-def _count(value: object) -> int | None:
-    return value if isinstance(value, int) and not isinstance(value, bool) else None
-
-
-def _reason(exc: BaseException) -> str:
-    text = re.sub(r"\s+", " ", str(exc)).strip() or type(exc).__name__
-    return text if len(text) <= _REASON_LIMIT else text[: _REASON_LIMIT - 3] + "..."
-
-
-def _proof(
-    provider: str, parked: bool, reason: str, groups: list[dict[str, Any]], **extra: Any
-) -> dict[str, Any]:
-    return {
-        "parked": parked,
-        "provider": provider,
-        "reason": reason,
-        "groups": groups,
-        **extra,
-    }
-
-
-# --- the provider's declared capacity --------------------------------------
-
-
-def _eks_waiting(group: Mapping[str, Any]) -> str:
-    name, status, desired = group["name"], group["status"], group["desired"]
-    if status != "ACTIVE":
-        return (
-            f"node group {name} is {status or 'of unknown status'} "
-            "(being created, updated or replaced)"
-        )
-    if desired is None:
-        return f"node group {name} reports no scalingConfig.desiredSize"
-    return (
-        f"node group {name} wants {desired} node(s) (desiredSize {desired}): "
-        "its nodes are lost or still joining"
-    )
-
-
-def eks_parked(
-    described: Mapping[str, Mapping[str, Any]],
-    *,
-    selector: str,
-    nodepools: NodePoolRead,
-) -> dict[str, Any]:
-    """The proof of an eks-managed cluster from its ``describe-nodegroup``
-    documents (name -> ``nodegroup``) and its Karpenter NodePools."""
-
-    groups = [
-        {
-            "name": str(name),
-            "status": str(group.get("status") or ""),
-            "desired": _count(_mapping(group.get("scalingConfig")).get("desiredSize")),
-            "min": _count(_mapping(group.get("scalingConfig")).get("minSize")),
-            "max": _count(_mapping(group.get("scalingConfig")).get("maxSize")),
-            # What a node of the group is born with: the installer template of
-            # a cluster without nodes is rendered from them (``render_node``).
-            "instance_types": [
-                str(item)
-                for item in (
-                    *(group.get("instanceTypes") or ()),
-                    *(
-                        (group.get("instanceType"),)
-                        if group.get("instanceType")
-                        else ()
-                    ),
-                )
-                if item
-            ],
-            "labels": {
-                str(key): str(value)
-                for key, value in _mapping(group.get("labels")).items()
-            },
-        }
-        for name, group in sorted(described.items())
-        if isinstance(group, Mapping) and nodegroup_hosts_gpu_nodes(group, selector)
-    ]
-    if not groups:
-        return _proof(
-            EKS_MANAGED,
-            False,
-            "the node selector covers no managed node group (a selector that "
-            "selects nothing, or a group not labelled for this site)",
-            groups,
-        )
-    waiting = [
-        item for item in groups if item["status"] != "ACTIVE" or item["desired"] != 0
-    ]
-    if waiting:
-        return _proof(
-            EKS_MANAGED,
-            False,
-            "; ".join(_eks_waiting(item) for item in waiting),
-            groups,
-        )
-    try:
-        document = nodepools()
-    except Exception as exc:  # noqa: BLE001 - an unreadable list proves nothing
-        return _proof(
-            EKS_MANAGED,
-            False,
-            f"the Karpenter NodePools could not be read: {_reason(exc)}",
-            groups,
-        )
-    suppliers = nodepools_supplying(document, selector)
-    if suppliers:
-        return _proof(
-            EKS_MANAGED,
-            False,
-            "Karpenter NodePool(s) "
-            + ", ".join(suppliers)
-            + " can still launch nodes the node selector selects",
-            groups,
-            nodepools=suppliers,
-        )
-    return _proof(
-        EKS_MANAGED,
-        True,
-        "every managed node group the node selector covers is ACTIVE at "
-        "desiredSize 0 and no Karpenter NodePool can launch a node it selects",
-        groups,
-        proven_by=[
-            "eks:DescribeNodegroup status and scalingConfig",
-            "Karpenter NodePools (" + ("absent" if document is None else "none") + ")",
-        ],
-    )
-
-
-def _requirement_values(
-    requirements: Sequence[Mapping[str, Any]], key: str
-) -> frozenset[str] | None:
-    """The values a NodePool's ``requirements`` may give ``key`` on a node:
-    ``None`` when none sets it, ``frozenset({"*"})`` for any value."""
-
-    produced: set[str] = set()
-    found = False
-    for item in requirements:
-        if str(item.get("key") or "") != key:
-            continue
-        operator = str(item.get("operator") or "")
-        if operator == "In":
-            found = True
-            produced.update(str(value) for value in item.get("values") or ())
-        elif operator in {"Exists", "Gt", "Lt"}:
-            return frozenset({"*"})
-    return frozenset(produced) if found else None
-
-
-def _could_select(
-    labels: Mapping[str, str],
-    requirements: Sequence[Mapping[str, Any]],
-    selector: str,
-) -> bool:
-    """Whether a node a NodePool launches could satisfy ``selector``: its
-    template labels, or a requirement that puts the key on the node."""
-
-    for key, operator, values in selector_requirements(selector):
-        if key in labels:
-            value = labels[key]
-            if (
-                (operator == "in" and value not in values)
-                or (operator == "notin" and value in values)
-                or operator == "absent"
-            ):
-                return False
-            continue
-        produced = _requirement_values(requirements, key)
-        if operator in {"in", "exists"} and (
-            produced is None
-            or (operator == "in" and "*" not in produced and not produced & values)
-        ):
-            return False
-    return True
-
-
-def nodepools_supplying(document: Mapping[str, Any] | None, selector: str) -> list[str]:
-    """The Karpenter NodePools that could launch a node ``selector`` selects.
-
-    A selector that names the ownership label or a node group is judged
-    against each NodePool's template labels and requirements (a requirement
-    ``<key> In [...]`` or ``Exists`` puts the label on the node too). Any other
-    selector names labels a node gains at runtime (``nvidia.com/gpu.present``),
-    which no template predicts, so every NodePool could supply it. ``None`` is
-    a cluster without the Karpenter CRD.
-    """
-
-    if document is None:
-        return []
-    predictable = selector_ownership_value(selector) is not None or bool(
-        selected_nodegroup(selector)
-    )
-    found = []
-    for item in document.get("items") or ():
-        if not isinstance(item, Mapping):
-            continue
-        template = _mapping(_mapping(item.get("spec")).get("template"))
-        labels = {
-            str(key): str(value)
-            for key, value in _mapping(
-                _mapping(template.get("metadata")).get("labels")
-            ).items()
-        }
-        requirements = [
-            requirement
-            for requirement in _mapping(template.get("spec")).get("requirements") or ()
-            if isinstance(requirement, Mapping)
-        ]
-        if not predictable or _could_select(labels, requirements, selector):
-            found.append(str(_mapping(item.get("metadata")).get("name") or "<unnamed>"))
-    return sorted(found)
-
-
-def _hyperpod_waiting(group: Mapping[str, Any]) -> str:
-    name, status = group["name"], group["status"]
-    target, current = group["target"], group["current"]
-    if status != "InService":
-        return f"instance group {name} is {status or 'of unknown status'}"
-    if target is None or current is None:
-        return f"instance group {name} reports no TargetCount/CurrentCount"
-    if target:
-        return (
-            f"instance group {name} wants {target} instance(s) (TargetCount {target}, "
-            f"CurrentCount {current}): its nodes are lost or still joining"
-        )
-    return f"instance group {name} still has {current} instance(s) at TargetCount 0"
-
-
-def hyperpod_parked(
-    groups: Sequence[Any], *, cluster_name: str, selector: str
-) -> dict[str, Any]:
-    """The proof of a HyperPod cluster from its ``describe-cluster`` instance
-    groups (``HYPERPOD_CONTEXT_QUERY``)."""
-
-    covered = set(
-        hyperpod_groups_for_selector(
-            groups, cluster_name=cluster_name, selector=selector
-        )
-    )
-    entries = [
-        {
-            "name": str(group.get("InstanceGroupName") or ""),
-            "status": str(group.get("Status") or ""),
-            "target": _count(group.get("TargetCount")),
-            "current": _count(group.get("CurrentCount")),
-            "instance_types": (
-                [str(group["InstanceType"])] if group.get("InstanceType") else []
-            ),
-            "labels": {
-                str(key): str(value)
-                for key, value in _mapping(
-                    _mapping(group.get("KubernetesConfig")).get("CurrentLabels")
-                ).items()
-            },
-        }
-        for group in groups
-        if isinstance(group, Mapping)
-        and str(group.get("InstanceGroupName") or "") in covered
-    ]
-    if not entries:
-        return _proof(
-            HYPERPOD, False, "the node selector covers no instance group", entries
-        )
-    waiting = [
-        item
-        for item in entries
-        if item["status"] != "InService" or item["target"] != 0 or item["current"] != 0
-    ]
-    if waiting:
-        return _proof(
-            HYPERPOD,
-            False,
-            "; ".join(_hyperpod_waiting(item) for item in waiting),
-            entries,
-        )
-    return _proof(
-        HYPERPOD,
-        True,
-        "every instance group the node selector covers is InService at "
-        "TargetCount 0 and CurrentCount 0",
-        entries,
-        proven_by=["sagemaker:DescribeCluster InstanceGroups"],
-    )
 
 
 # --- the reads -------------------------------------------------------------
@@ -547,29 +265,23 @@ def provider_proof(
     eks-managed cluster, ``groups`` for a HyperPod one) or read here; never
     raises: a provider that cannot be read proves nothing."""
 
-    eks = is_eks_managed(target)
+    provider = EKS_MANAGED if is_eks_managed(target) else HYPERPOD
     try:
         selector = node_selector(target)
-        if eks:
-            return eks_parked(
-                _described_nodegroups(release, target)
-                if described is None
-                else described,
-                selector=selector,
-                nodepools=lambda: read_karpenter_nodepools(release, target),
-            )
-        return hyperpod_parked(
-            _instance_groups(release, target) if groups is None else groups,
-            cluster_name=str(target.hyperpod_cluster_name or ""),
-            selector=selector,
-        )
     except Exception as exc:  # noqa: BLE001 - recorded as the reason, never raised
-        return _proof(
-            EKS_MANAGED if eks else HYPERPOD,
-            False,
-            f"the provider's node capacity could not be read: {_reason(exc)}",
-            [],
-        )
+        return capacity.unreadable(provider, exc)
+    return capacity.capacity_proof(
+        provider,
+        selector=selector,
+        cluster_name=str(target.hyperpod_cluster_name or ""),
+        nodegroups=lambda: (
+            _described_nodegroups(release, target) if described is None else described
+        ),
+        instance_groups=lambda: (
+            _instance_groups(release, target) if groups is None else groups
+        ),
+        nodepools=lambda: read_karpenter_nodepools(release, target),
+    )
 
 
 def read_parked(release: Any, target: Any) -> dict[str, Any]:
@@ -678,12 +390,6 @@ def zero_nodes_failure(message: str, proof: Mapping[str, Any] | None) -> str:
     if not isinstance(proof, Mapping) or proof.get("parked") is True:
         return message
     return f"{message}; not parked: {proof.get('reason')}"
-
-
-def state_of(proof: Mapping[str, Any]) -> str:
-    """``parked`` for a proof of declared zero capacity, else ``unavailable``."""
-
-    return PARKED if proof.get("parked") is True else UNAVAILABLE
 
 
 def gating(release: Any) -> bool:

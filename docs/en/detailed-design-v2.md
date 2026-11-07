@@ -4473,8 +4473,10 @@ from the `-config-core` the capture recorded (`cpu_role_config_maps`), so the CP
 rolls each once; a snapshot short of an entry per cluster still refuses), the resume and `sync-state` all carry the entry.
 A release is refused at its deploy preflight (`zero_node_gpu_clusters`) only when it could not finish: a Reconciler roll
 over a cluster whose groups declare no GPU instance type the installer knows. Zero nodes on every GPU cluster refuse
-nothing. The proof reads only what `regional_contexts` already reads; the
-departed-node cleanup itself does not consult it. It never opens a read snapshot (`regional_release_state.read_snapshot`):
+nothing. The rule is one pure module, `src/gpu_fault/zero_node_capacity.py`: it judges the provider documents handed to
+it (`capacity_proof`; the node-group facts HyperPod coverage is judged on live there too), and the release engine's
+`regional_parked_cluster` and `admin/bootstrap_ownership` keep their names for it as re-exports, so no second copy can drift.
+The proof reads only what `regional_contexts` already reads; the departed-node cleanup itself does not consult it. It never opens a read snapshot (`regional_release_state.read_snapshot`):
 the snapshot's cache lives on the release object every thread shares, and a release step -- the candidate preflight, the
 cluster rollout -- runs its clusters in parallel threads whose node safety reads must stay fresh (`gpu_node_items`
 refuses a fresh read while a snapshot is open). Inside a snapshot its caller opened -- `status`, a release's capture of
@@ -4487,7 +4489,8 @@ Code basis: `src/gpu_fault/departed_node_cleanup.py::DepartedNodeCleanup.run_onc
 For the behaviour coverage see `tests/departed_nodes/` (both providers end to end on the in-memory store and on
 PostgreSQL, every refusal, the single writer, the resumed restart), `tests/execution/test_cluster_executor_node_inventory.py`,
 `tests/regional/test_departed_node_status.py`, `tests/admin/test_admin_config_departed_node_cleanup.py`,
-`tests/regional/test_parked_gpu_cluster_proof.py`, `tests/regional/test_parked_gpu_cluster_release.py`,
+`tests/regional/test_parked_gpu_cluster_proof.py`, `tests/regional/test_zero_node_capacity_shared.py`,
+`tests/regional/test_parked_gpu_cluster_release.py`,
 `tests/regional/test_zero_node_release_waves.py`, `tests/regional/test_zero_node_snapshot_concurrency.py` (the
 candidate preflight of a parked and a populated cluster in parallel threads), `tests/regional/test_zero_node_deploy_engine.py`
 (a DATA_PLANE_COMPATIBLE release with Agent waves through the real `RegionalRelease`, its thread pools and report
