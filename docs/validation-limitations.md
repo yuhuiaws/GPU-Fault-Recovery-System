@@ -3259,6 +3259,44 @@ real host collector over a fake sysfs with one of two functions unbound (no
 collection error, `efa_inventory_mismatch=1` DRIVER_UNBOUND, traffic withheld)
 and with both held (complete traffic on the second tick).
 
+`post_repair_isolation_lifted` (b265) reuses `post_repair_failure`'s chain to
+open the reboot-after rung, then lifts only the cordon of the case node once --
+after that successor's QUARANTINE has SUCCEEDED and before its RESTART_NODE
+submits to the provider -- so the node lifecycle adapter refuses the reboot
+before any provider call (`spec.unschedulable is not true`,
+`adapters/hyperpod/lifecycle._observe_isolation`). R23 carried that refusal as a
+bare `safety_rejection` and climbed to REPLACE_NODE, which with a healthy warm
+spare could fail the node over though no reboot ever ran; R24 (82f7b77) marks it
+`isolation_not_observed=NOT_ISOLATED` and the classifier
+(`failure_outcome.lifecycle_isolation_refusals` -> `escalation._classify`,
+`CONTAINMENT_STAGE`) opens exactly one `workflow-support-after` at stage
+`containment_or_release` -- FREEZE_EVIDENCE, MARK_UNSCHEDULABLE, QUARANTINE (the
+isolation put back), ESCALATE_SUPPORT (one ticket) -- whose reason names the
+cordon (`RESTART_NODE not submitted, isolation not observed: spec.unschedulable
+is not true`), with no REPLACE_NODE, no reboot (boot id unchanged) and no warm
+spare. The window between the successor's QUARANTINE and its RESTART_NODE's
+isolation read is bounded by the GPU-cluster executor's claim of the reboot
+remote command (tens of milliseconds to a couple of seconds; the recorded
+QUARANTINE and RESTART_NODE are about 0.03 s apart and the provider submission
+follows the dispatch by about 10 s), so the lift is a race and the two misses
+are INCONCLUSIVE, never FAIL: a lift that landed before QUARANTINE succeeded and
+made QUARANTINE fail its own verification (the pre-existing containment path, not
+82f7b77), and a RESTART_NODE that submitted (and rebooted) before the lift (the
+`post_repair_failure` reboot exit, graded clean across the boot by the same
+reboot-aware `release`). The variant is generation-gated
+(`require_isolation_refusal_generation`, a read-only probe in an API Pod that
+imports `failure_outcome`/`escalation` and checks the classifier marker): without
+82f7b77 it is `NOT_RUN(CAPABILITY_ABSENT)` and the node is not touched. Because it
+reuses `EfaDriverFixture` and the `post_repair_failure` settle/cleanup but
+`general_live_efa_driver` owns exactly the two bind negatives, it lives in
+`general_live_efa_isolation_lifted.py`, registered as its own category module;
+its grading (`general_live_efa_escalation.isolation_refusal_errors`,
+`containment_release_handoff_errors`, `refused_restart_step`,
+`warm_spare_touched`) reads only the product's records, and
+`tests/regional/test_general_live_efa_isolation_lifted.py` pins the trigger
+window, the one-shot cordon-only lift, PASS / FAIL / both INCONCLUSIVE races, the
+generation gate and the reboot-aware cleanup of a lost-late race.
+
 A sixth deferral reason, `COVERED_BY_REGIONAL: <case ids>`, names GF-REGIONAL
 cases whose catalog verdict is a live PASS with the very injection and
 assertions the variant would make, so the variant gets no fixture of its own

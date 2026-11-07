@@ -187,6 +187,7 @@ class FakeRegional:
         self._release_id = release_id
         self.cpu_python_responder = cpu_python
         self._run_output = run_output
+        self.kubectl_calls: list[tuple[str, ...]] = []
 
     def evidence_identity(self, **_: Any) -> dict[str, str]:
         return {"release_id": self._release_id, "cluster_id": self.settings.cluster_id}
@@ -196,6 +197,13 @@ class FakeRegional:
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
         return dict(self.node_snapshot_value)
+
+    def kubectl(self, plane: str, *arguments: str, **_: Any) -> str:
+        """Record a mutating kubectl call (e.g. the cordon lift's node patch)
+        and answer empty; a test asserts the recorded arguments."""
+
+        self.kubectl_calls.append((plane, *arguments))
+        return ""
 
     def node_metadata(self, node: str) -> dict[str, Any]:
         return dict(self._node_metadata)

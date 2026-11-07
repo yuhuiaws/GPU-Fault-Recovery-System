@@ -53,7 +53,7 @@ rows:
   - number: 13
     cases: [GF-GENERAL-LIVE-013]
     proof_modes: [native, live-replay, vendor-lab]
-    variants: [pci_missing, driver_unbound, link_inactive, excess_device, unknown_inventory, unreadable_state, bind_failure, post_repair_failure]
+    variants: [pci_missing, driver_unbound, link_inactive, excess_device, unknown_inventory, unreadable_state, bind_failure, post_repair_failure, post_repair_isolation_lifted]
   - number: 14
     cases: [GF-GENERAL-LIVE-014]
     proof_modes: [native, live-replay]

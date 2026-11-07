@@ -598,7 +598,8 @@ summary/两轮triage/Fabric/bundle范围单独比对工作流参数；summary目
 ### GF-GENERAL-LIVE-013
 
 必测：`pci_missing`、`driver_unbound`、`link_inactive`、`excess_device`、
-`unknown_inventory`、`unreadable_state`、`bind_failure`、`post_repair_failure`。
+`unknown_inventory`、`unreadable_state`、`bind_failure`、`post_repair_failure`、
+`post_repair_isolation_lifted`。
 准备专用节点、PCI/BDF allowlist和独立rebind保底。只允许对测试数据功能做经审批的
 定向解绑；这只能证明DRIVER_UNBOUND，不能冒充PCI_DEVICE_MISSING。
 分别核对missing的reboot链、unbound的定向bind+plugin+snapshot+验证、
@@ -3240,6 +3241,34 @@ bundle 保守，却判 "did not request process state capture"，是 oracle 把 
   一个（无 collection error、`efa_inventory_mismatch=1` DRIVER_UNBOUND、流量扣住）与全部持有（第二拍流量完整）。
   `int/r13c-live26` 上的 harness 判定（S49）把扣住的移交当产品路径、只判 `post_repair_failure_observed` 失败；
   本版发布后变体的链会到达 reboot 梯级，同一判定器的 `post_repair_verdict` 读到 `observed`。
+- 013 `post_repair_isolation_lifted`（`native`，`risk H`，`X`，`--approve EFA_DRIVER_UNBIND
+  NODE_REBOOT`，两个集群，模块 `general_live_efa_isolation_lifted.py`；`general_live_efa_driver.py`
+  只拥有两个 bind 负向分支，故该变体单独成模块并注册进 `CATEGORY_MODULES`，不改 `src/`、`deploy/`）：
+  整条复用 `post_repair_failure` 的链——trap 在产品修复后快照上再次解绑该功能，使 `VALIDATE_FABRIC`
+  在新鲜证据上 FAILED，升级器开出唯一 `workflow-reboot-after`（FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、
+  QUARANTINE、RESTART_NODE、各验证、RESTORE_SCHEDULING）。在该后继的 QUARANTINE 已 SUCCEEDED 之后、其
+  RESTART_NODE 向 provider 提交之前，夹具**只**解除该节点的 cordon（`spec.unschedulable=false`，等价于
+  `kubectl uncordon`，不触碰隔离 taint、incident 注解、fencing token）。节点生命周期适配器在 RESTART_NODE
+  读节点时即在任何 provider 调用之前拒绝，因为 `spec.unschedulable is not true`
+  （`adapters/hyperpod/lifecycle._observe_isolation` -> `_isolation_problems`）。R23（今日在线）把该拒绝
+  当作 bare `safety_rejection` 并升级到 REPLACE_NODE——在有健康 warm spare 时可能在从未重启的情况下把节点
+  替换掉；R24（b265，82f7b77）将其标为 `isolation_not_observed=NOT_ISOLATED`，分类器
+  （`failure_outcome.lifecycle_isolation_refusals` -> `escalation._classify` 的 `CONTAINMENT_STAGE`）以失败
+  containment 步骤同样的交接回应：`containment_or_release`——FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、QUARANTINE
+  （把隔离放回去）、ESCALATE_SUPPORT（恰一张工单），无梯级。工单原因点名问题：`RESTART_NODE not submitted,
+  isolation not observed: spec.unschedulable is not true`。无 REPLACE_NODE、无重启、不动 warm spare。
+  QUARANTINE 与 RESTART_NODE 的隔离读之间只有极小窗口（受 GPU 集群 executor 领取 reboot 远程命令的时延限制，
+  约数十毫秒到一两秒；记录文件所示 QUARANTINE 与 RESTART_NODE 相隔约 0.03 s，provider 提交则在派发后约 10 s）。
+  因此这是一个竞态，两种落空都记 INCONCLUSIVE、绝不 FAIL：lift 落在 QUARANTINE 成功之前使 QUARANTINE 自身验证
+  失败（这是已有的 containment 路径，不是 82f7b77）；RESTART_NODE 在 lift 之前已提交并重启（重启是
+  `post_repair_failure` 的出口，由同一套重启感知清理按新 boot id 与产品自己的开机后库存判定）。变体受产品代际
+  门禁：在线控制面没有 82f7b77 时记 NOT_RUN（`require_isolation_refusal_generation`，在 API Pod 内只读探测
+  `failure_outcome`/`escalation` 的分类器标记，与设备插件、XID twin 的代际门禁同法）。判定器
+  （`general_live_efa_escalation.py` 新增 `isolation_refusal_errors`、`containment_release_handoff_errors`、
+  `refused_restart_step`、`warm_spare_touched`）只读产品记录；清理走 `release`（重启竞态下的重启感知关窗）与
+  `hand_back`（节点被 support-after 重新隔离时走产品 validated restore）。
+  `tests/regional/test_general_live_efa_isolation_lifted.py` 以假时间线钉住触发窗口、一次性、仅解 cordon、
+  PASS/FAIL/两种 INCONCLUSIVE 竞态、代际门禁与迟到竞态后的重启感知清理。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
 令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`KERNEL_COLLECTOR_SOURCE_REPLAY`（内核采集器

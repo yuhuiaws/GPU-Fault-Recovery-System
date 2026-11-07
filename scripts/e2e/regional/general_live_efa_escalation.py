@@ -35,6 +35,7 @@ import re
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
+    containment_missing,
     node_residual_isolation,
     unsettled_workflows,
     workflow_open,
@@ -96,6 +97,34 @@ JUDGED_BY_PROBE = "probe"
 SUPPORT_SUCCESSOR_PREFIX = "workflow-support" + ESCALATION_SEPARATOR
 SUPPORT_HANDOFF_CHAIN = ("FREEZE_EVIDENCE", "ESCALATE_SUPPORT")
 VALIDATIONS = frozenset({"VALIDATE_GPU", "VALIDATE_HOST", VALIDATE_STEP})
+ESCALATE_SUPPORT = "ESCALATE_SUPPORT"
+MARK_UNSCHEDULABLE = "MARK_UNSCHEDULABLE"
+#: b265 (82f7b77): what the node lifecycle adapter writes when it refuses a
+#: RESTART_NODE / REPLACE_NODE *before any provider call* because the scheduler
+#: does not show the node isolated by this incident right now
+#: (``adapters/hyperpod/lifecycle.isolation_refusal`` ->
+#: ``failure_outcome.LIFECYCLE_ISOLATION_DETAIL``). ``NOT_ISOLATED``: the node
+#: was read and its cordon / quarantine taint / incident / fencing annotation
+#: is not this workflow's; ``UNOBSERVABLE``: no Kubernetes node resolves, or
+#: the adapter has no client. A pre-82f7b77 refusal carries neither (only
+#: ``safety_rejection``) and climbs to REPLACE_NODE instead.
+LIFECYCLE_ISOLATION_DETAIL = "isolation_not_observed"
+ISOLATION_NOT_ISOLATED = "NOT_ISOLATED"
+ISOLATION_UNOBSERVABLE = "UNOBSERVABLE"
+#: The hand-off stage the classifier
+#: (``failure_outcome.lifecycle_isolation_refusals`` -> ``escalation._classify``,
+#: ``CONTAINMENT_STAGE``) gives a record whose every FAILED RESTART_NODE /
+#: REPLACE_NODE is a NOT_ISOLATED refusal: the isolation is put back and the
+#: node handed over, no rung. Its ``workflow-support-after-<record>`` successor
+#: plans this chain (``escalation._escalation_operations``: the ``else`` branch
+#: with ``next_operation=ESCALATE_SUPPORT``).
+CONTAINMENT_OR_RELEASE_STAGE = "containment_or_release"
+CONTAINMENT_RELEASE_SUCCESSOR_CHAIN = (
+    "FREEZE_EVIDENCE",
+    MARK_UNSCHEDULABLE,
+    QUARANTINE,
+    ESCALATE_SUPPORT,
+)
 #: ``post_repair_verdict`` values: the step looked and found the fault, or a
 #: bound failed it before it observed anything (the product withholds the
 #: reboot it asked for, ``validation_evidence.withheld_escalation``).
@@ -611,6 +640,227 @@ def handoff_shape_errors(observed: dict[str, Any], pair: Chain | None) -> list[s
     return errors
 
 
+# --------------------------------------------------------------------------- #
+# b265: a reboot refused for want of observed isolation is handed over, not
+# climbed (GF-GENERAL-LIVE-013 ``post_repair_isolation_lifted``).
+# --------------------------------------------------------------------------- #
+def isolation_refusal_detail(step: dict[str, Any]) -> str:
+    """The b265 refusal kind on a FAILED RESTART_NODE / REPLACE_NODE step
+    (``LIFECYCLE_ISOLATION_DETAIL`` -> NOT_ISOLATED or UNOBSERVABLE), or ``""``.
+
+    The lifecycle adapter writes it alongside ``safety_rejection`` and no
+    ``submitted_nodes`` / ``observed_isolation``; a pre-82f7b77 refusal carries
+    only ``safety_rejection`` and the record climbs to REPLACE_NODE, so the
+    marker is the proof the deployed engine is the one this variant grades.
+    """
+
+    details = step.get("details") or {}
+    value = details.get(LIFECYCLE_ISOLATION_DETAIL)
+    return (
+        str(value) if value in (ISOLATION_NOT_ISOLATED, ISOLATION_UNOBSERVABLE) else ""
+    )
+
+
+def refused_restart_step(workflow: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A reboot successor's FAILED RESTART_NODE that b265 marked a
+    NOT_ISOLATED refusal, or ``None``."""
+
+    if workflow is None:
+        return None
+    for item in executions(workflow, RESTART_NODE):
+        if (
+            item.get("status") == "FAILED"
+            and isolation_refusal_detail(item) == ISOLATION_NOT_ISOLATED
+        ):
+            return item
+    return None
+
+
+def handoff_stage(observed: dict[str, Any], incident_id: str) -> str:
+    """The stage the classifier recorded for a hand-off incident: the
+    ``<stage>`` of its reason ``<stage> remediation failed; ...``
+    (``escalation.emit``), or ``""``."""
+
+    for item in observed.get("incidents") or []:
+        if str(item.get("incident_id")) == incident_id:
+            for reason in item.get("reasons") or []:
+                text = str(reason)
+                if " remediation failed" in text:
+                    return text.split(" remediation failed", 1)[0]
+    return ""
+
+
+def incident_reason_text(observed: dict[str, Any], incident_id: str) -> str:
+    for item in observed.get("incidents") or []:
+        if str(item.get("incident_id")) == incident_id:
+            return " ".join(str(reason) for reason in item.get("reasons") or [])
+    return ""
+
+
+def replace_node_workflows(observed: dict[str, Any]) -> list[str]:
+    """Every workflow of the read that plans REPLACE_NODE: none is allowed in
+    an isolation-refusal lineage (the ladder takes no rung)."""
+
+    return [
+        str(item.get("request_id"))
+        for item in observed.get("workflows") or []
+        if REPLACE_NODE in operations(item)
+    ]
+
+
+def warm_spare_touched(observed: dict[str, Any]) -> list[str]:
+    """Signs a warm spare was engaged anywhere in the read: a step that
+    activated spare nodes, or a workflow that planned REPLACE_NODE. An
+    isolation refusal must reach neither (no reboot, no replacement)."""
+
+    touched: list[str] = []
+    for workflow in observed.get("workflows") or []:
+        request_id = str(workflow.get("request_id"))
+        if REPLACE_NODE in operations(workflow):
+            touched.append(f"{request_id} plans REPLACE_NODE")
+        for item in workflow.get("step_executions") or []:
+            spares = (item.get("details") or {}).get("activated_spare_nodes")
+            if spares:
+                touched.append(
+                    f"{request_id}/{item.get('operation')} activated spare(s) {spares}"
+                )
+    return list(dict.fromkeys(touched))
+
+
+def isolation_refusal_errors(
+    observed: dict[str, Any],
+    pair: Chain | None,
+    refused_step: dict[str, Any] | None,
+) -> list[str]:
+    """The reboot rung refused the reboot for want of observed isolation (b265).
+
+    Its RESTART_NODE is FAILED carrying ``isolation_not_observed=NOT_ISOLATED``
+    and ``safety_rejection``, it submitted no provider action and recorded no
+    ``observed_isolation``, and its ``node_failures`` name the problem; no
+    RESTART_NODE ever SUCCEEDED (no reboot), and no workflow plans REPLACE_NODE
+    (the ladder handed over instead of climbing).
+    """
+
+    if pair is None:
+        return ["no efa_inventory_mismatch incident with a workflow to grade"]
+    if refused_step is None:
+        return [
+            "no reboot-after RESTART_NODE failed with the isolation-not-observed "
+            "marker (b265): the reboot was not refused for want of observed isolation"
+        ]
+    details = refused_step.get("details") or {}
+    errors: list[str] = []
+    if not details.get("safety_rejection"):
+        errors.append("the RESTART_NODE refusal does not carry safety_rejection")
+    if details.get("submitted_nodes"):
+        errors.append(
+            f"the refused RESTART_NODE submitted a provider action: "
+            f"{details.get('submitted_nodes')}"
+        )
+    if details.get("observed_isolation"):
+        errors.append(
+            "the refused RESTART_NODE recorded observed_isolation (it did not refuse "
+            "before acting)"
+        )
+    failures = details.get("node_failures") or {}
+    text = " ".join(
+        str(entry)
+        for values in failures.values()
+        for entry in (values if isinstance(values, list) else [values])
+    )
+    if "isolation not observed" not in text:
+        errors.append(
+            f"the RESTART_NODE node_failures do not name the isolation problem: "
+            f"{text[:160] or 'none'}"
+        )
+    succeeded = [
+        item
+        for item in node_executions(observed, RESTART_NODE)
+        if item.get("status") == "SUCCEEDED"
+    ]
+    if succeeded:
+        errors.append(
+            f"a RESTART_NODE SUCCEEDED ({len(succeeded)}): the node was rebooted "
+            "after all"
+        )
+    replacements = replace_node_workflows(observed)
+    if replacements:
+        errors.append(
+            f"REPLACE_NODE planned by {replacements}: the ladder climbed instead of "
+            "handing the node over"
+        )
+    return errors
+
+
+def containment_release_handoff_errors(
+    observed: dict[str, Any],
+    reboot_after: dict[str, Any] | None,
+    node: dict[str, Any],
+) -> list[str]:
+    """The containment-or-release hand-off b265 opens for the refused reboot.
+
+    Exactly one ``workflow-support-after-<reboot-after>`` successor at stage
+    ``containment_or_release`` planning FREEZE_EVIDENCE, MARK_UNSCHEDULABLE,
+    QUARANTINE, ESCALATE_SUPPORT; SUCCEEDED; exactly one ticket; no rung; the
+    node re-isolated (its cordon, the support incident's quarantine taint and
+    its incident annotation back, ``containment_missing`` empty); and the
+    reason names the cordon problem.
+    """
+
+    if reboot_after is None:
+        return ["no reboot-after successor to hand off from"]
+    request_id = str(reboot_after.get("request_id"))
+    supports = support_successors(observed, request_id)
+    if len(supports) != 1:
+        return [
+            f"{len(supports)} support-after successors of the refused reboot "
+            f"(expected exactly one): {[item.get('request_id') for item in supports]}"
+        ]
+    support = supports[0]
+    support_incident = str(support.get("incident_id"))
+    errors: list[str] = []
+    stage = handoff_stage(observed, support_incident)
+    if stage != CONTAINMENT_OR_RELEASE_STAGE:
+        errors.append(
+            f"the hand-off stage is {stage or 'unknown'}, expected "
+            f"{CONTAINMENT_OR_RELEASE_STAGE}"
+        )
+    steps = operations(support)
+    if not subsequence(CONTAINMENT_RELEASE_SUCCESSOR_CHAIN, steps):
+        errors.append(
+            f"the hand-off plans {steps}, not "
+            f"{list(CONTAINMENT_RELEASE_SUCCESSOR_CHAIN)}"
+        )
+    if REPLACE_NODE in steps or RESTART_NODE in steps:
+        errors.append(f"the hand-off plans a rung: {steps}")
+    tickets = [
+        item
+        for item in executions(support, ESCALATE_SUPPORT)
+        if item.get("status") == "SUCCEEDED"
+    ]
+    if len(tickets) != 1:
+        errors.append(
+            f"{len(tickets)} ESCALATE_SUPPORT tickets SUCCEEDED (expected exactly one)"
+        )
+    if str(support.get("status") or "") != "SUCCEEDED":
+        errors.append(
+            f"the hand-off ended {support.get('status') or 'unknown'}, expected "
+            "SUCCEEDED (the ticket went out)"
+        )
+    missing = containment_missing(node, support_incident)
+    if missing:
+        errors.append(
+            f"the hand-off did not re-isolate the node for {support_incident}: "
+            + "; ".join(missing)
+        )
+    reason = incident_reason_text(observed, support_incident)
+    if "unschedulable" not in reason and "cordon" not in reason:
+        errors.append(
+            f"the hand-off reason does not name the cordon: {reason[:200] or 'none'}"
+        )
+    return errors
+
+
 def node_result(
     observed: dict[str, Any],
     workflow: dict[str, Any] | None,
@@ -710,11 +960,18 @@ def escalation_record(
 
 
 __all__ = [
+    "CONTAINMENT_OR_RELEASE_STAGE",
+    "CONTAINMENT_RELEASE_SUCCESSOR_CHAIN",
     "EFA_METRIC",
+    "ESCALATE_SUPPORT",
     "ESCALATION_SEPARATOR",
+    "ISOLATION_NOT_ISOLATED",
     "ISOLATION_OPERATIONS",
+    "ISOLATION_UNOBSERVABLE",
     "JUDGED_BY_PROBE",
     "JUDGED_BY_PRODUCT_RECORD",
+    "LIFECYCLE_ISOLATION_DETAIL",
+    "MARK_UNSCHEDULABLE",
     "OBSERVED",
     "RECORDED_DETAIL_KEYS",
     "SUPPORT_HANDOFF_CHAIN",
@@ -732,22 +989,30 @@ __all__ = [
     "STOP_WORKLOADS",
     "VALIDATE_STEP",
     "Chain",
+    "containment_release_handoff_errors",
     "efa_chain",
     "escalation_record",
     "escalation_shape_errors",
     "exit_errors",
     "handoff_shape_errors",
+    "handoff_stage",
+    "incident_reason_text",
     "incident_state",
     "isolation_errors",
+    "isolation_refusal_detail",
+    "isolation_refusal_errors",
     "ladder_stopped",
     "node_executions",
     "node_result",
     "post_repair_verdict",
     "reboot_planned_errors",
     "reboot_successors",
+    "refused_restart_step",
+    "replace_node_workflows",
     "successors_of",
     "support_successors",
     "terminal_steps",
     "trap_fired_errors",
     "trap_record",
+    "warm_spare_touched",
 ]
