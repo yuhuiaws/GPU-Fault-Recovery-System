@@ -137,6 +137,10 @@ class EngineRelease(rollout.RegionalRelease):
     def _restore_secret(self, *_args: Any, **kwargs: Any) -> None:
         self.effects.append(("restore-secret", kwargs))
 
+    def _verify_rollback_registry_head(self) -> dict[str, Any]:
+        self.effects.append(("verify-registry-head", None))
+        return {}
+
     def _validate_rollback(self, _previous: Any, **kwargs: Any) -> None:
         self.effects.append(("verify-rollback", kwargs))
 

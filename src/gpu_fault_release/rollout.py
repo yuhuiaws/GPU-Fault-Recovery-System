@@ -232,6 +232,7 @@ from gpu_fault_release.regional_release_registry import (
     update_registry,
     write_registry,
 )
+from gpu_fault_release.regional_release_registry_head import verify_registry_head
 from gpu_fault_release.regional_release_rendering import (
     DATAPLANE_ADOT_DEPLOYMENT,
     DEFAULT_DCGM_EXPORTER_IMAGE,
@@ -667,6 +668,7 @@ class RegionalRelease(RegistryDrainContext):
     _publish_staged_registry = publish_staged_registry
     _publish_restored_registry = publish_restored_registry
     _complete_registry_restore = complete_registry_restore
+    _verify_rollback_registry_head = verify_registry_head
     _stamp_gpu_deployments = stamp_gpu_deployments
     _template_bundle = template_bundle
     _update_registry = update_registry

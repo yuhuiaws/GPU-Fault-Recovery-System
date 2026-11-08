@@ -4,7 +4,7 @@ import hashlib
 import json
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -271,49 +271,162 @@ def durable_registrations(
             RegionalClusterRegistration.model_validate(item)
             for item in current_registrations(release, {})
         ]
-        by_id = {item.cluster_id: item for item in configured}
-        if len(by_id) != len(configured) or set(by_id) != set(status.cluster_states):
-            raise ReleaseError("regional registry membership differs from its Secret")
-        durable: list[RegionalClusterRegistration] = []
-        for source in _request(
-            release, "GET", "/v1/regional/clusters", response_list=True
-        ):
-            item = dict(source)
-            candidate = by_id[item["cluster_id"]]
-            # The API redacts digests. Restore them only from the CPU Secret
-            # (or the caller's retiring candidate); the full revision digest
-            # below proves the actual bytes agree.
-            for field in ("token_sha256", "retiring_token_sha256"):
-                digest = getattr(candidate, field)
-                present = item.pop(f"{field}_present")
-                length = item.pop(f"{field}_length")
-                supplied = (retiring_digests or {}).get(str(item["cluster_id"]))
-                if field == "retiring_token_sha256" and digest is None and supplied:
-                    if present is True:
-                        digest = supplied
-                        candidate = candidate.model_copy(update={field: supplied})
-                        by_id[candidate.cluster_id] = candidate
-                if (
-                    type(present) is not bool
-                    or type(length) is not int
-                    or present != bool(digest)
-                    or length != len(digest or "")
-                ):
-                    raise ReleaseError("regional registry credential identity differs")
-                item[field] = digest
-            durable.append(RegionalClusterRegistration.model_validate(item))
-        if (
-            len(durable) != len(by_id)
-            or {item.cluster_id: item.lifecycle_state for item in durable}
-            != status.cluster_states
-            or regional_registry_content_sha256(durable) != status.content_sha256
-            or regional_registry_config_sha256(durable)
-            != regional_registry_config_sha256(list(by_id.values()))
-        ):
-            raise ReleaseError("regional registry snapshot identity differs")
+        durable = _durable_head(
+            status,
+            configured,
+            lambda: _request(
+                release, "GET", "/v1/regional/clusters", response_list=True
+            ),
+            retiring_digests or {},
+        )
         return status, durable
     except (KeyError, TypeError, ValueError):
         raise ReleaseError("regional registry lifecycle evidence is invalid") from None
+
+
+def _durable_head(
+    status: RegionalRegistryStatus,
+    configured: list[RegionalClusterRegistration],
+    rows: Callable[[], list[dict[str, Any]]],
+    retiring_digests: Mapping[str, str],
+) -> list[RegionalClusterRegistration]:
+    """The head's registrations ``rows`` lists, proven to be the Secret's.
+
+    ``durable_registrations``' comparison of the head with ``configured`` (the
+    Secret); ``rows`` is read only once the membership agrees.
+    """
+
+    by_id = {item.cluster_id: item for item in configured}
+    if len(by_id) != len(configured) or set(by_id) != set(status.cluster_states):
+        raise ReleaseError("regional registry membership differs from its Secret")
+    durable: list[RegionalClusterRegistration] = []
+    for source in rows():
+        cluster_id = source["cluster_id"]
+        registration, by_id[cluster_id] = _head_registration(
+            source, by_id[cluster_id], retiring_digests.get(str(cluster_id))
+        )
+        durable.append(registration)
+    if (
+        len(durable) != len(by_id)
+        or {item.cluster_id: item.lifecycle_state for item in durable}
+        != status.cluster_states
+        or regional_registry_content_sha256(durable) != status.content_sha256
+        or regional_registry_config_sha256(durable)
+        != regional_registry_config_sha256(list(by_id.values()))
+    ):
+        raise ReleaseError("regional registry snapshot identity differs")
+    return durable
+
+
+def _head_registration(
+    source: Mapping[str, Any],
+    candidate: RegionalClusterRegistration,
+    supplied: str | None,
+) -> tuple[RegionalClusterRegistration, RegionalClusterRegistration]:
+    """One redacted head row with its digests restored, and its Secret entry.
+
+    The API redacts digests. They are restored only from ``candidate`` -- the
+    cluster's CPU Secret entry -- or ``supplied``, the retiring digest a caller
+    knows for the cluster; the full revision digest proves the actual bytes
+    agree. Returns the head's registration and ``candidate`` as it proved it
+    (carrying ``supplied`` when the head holds that retiring digest); raises
+    when the row's credential presence or length is not the candidate's.
+    """
+
+    item = dict(source)
+    for field in ("token_sha256", "retiring_token_sha256"):
+        digest = getattr(candidate, field)
+        present = item.pop(f"{field}_present")
+        length = item.pop(f"{field}_length")
+        if field == "retiring_token_sha256" and digest is None and supplied:
+            if present is True:
+                digest = supplied
+                candidate = candidate.model_copy(update={field: supplied})
+        if (
+            type(present) is not bool
+            or type(length) is not int
+            or present != bool(digest)
+            or length != len(digest or "")
+        ):
+            raise ReleaseError("regional registry credential identity differs")
+        item[field] = digest
+    return RegionalClusterRegistration.model_validate(item), candidate
+
+
+def registry_head_drift(
+    release: Any,
+    *,
+    retiring_digests: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Whether the durable registry head the control plane serves is the Secret.
+
+    The deploy host's ``secret_drift`` (``RegionalRegistryRuntime``): the head
+    is the CPU Secret when ``durable_registrations`` reconstructs it from the
+    Secret -- membership, credential identity, the revision's content digest
+    and the configured view (``regional_registry_config_sha256``) agree.
+    ``matches`` with the head's generation and content digest, or not with
+    ``reason`` (``durable_registrations``' refusal) and ``clusters``: each
+    cluster on which the two differ, judged by the same comparison one cluster
+    at a time -- one the head or the Secret lacks, one whose credential
+    presence or length differs, one whose configured view (identity,
+    namespaces, CIDRs, provider, Runtime Profile pins) differs. A difference
+    the redacted head cannot attribute (a token digest of the same length)
+    names no cluster. A read that fails raises: nothing was compared.
+    """
+
+    supplied = dict(retiring_digests or {})
+    status_document = _request(release, "GET", "/v1/regional/registry/status")
+    secret = current_registrations(release, {})
+    rows = _request(release, "GET", "/v1/regional/clusters", response_list=True)
+    try:
+        status = RegionalRegistryStatus.model_validate(status_document)
+        configured = [
+            RegionalClusterRegistration.model_validate(item) for item in secret
+        ]
+    except (KeyError, TypeError, ValueError):
+        raise ReleaseError("regional registry lifecycle evidence is invalid") from None
+    try:
+        _durable_head(status, configured, lambda: rows, supplied)
+    except (ReleaseError, KeyError, TypeError, ValueError) as exc:
+        reason = (
+            str(exc)
+            if isinstance(exc, ReleaseError)
+            else "regional registry lifecycle evidence is invalid"
+        )
+        return {
+            "matches": False,
+            "reason": reason,
+            "clusters": _drifting_clusters(configured, rows, supplied),
+        }
+    return {
+        "matches": True,
+        "generation": status.generation,
+        "content_sha256": status.content_sha256,
+    }
+
+
+def _drifting_clusters(
+    configured: list[RegionalClusterRegistration],
+    rows: list[dict[str, Any]],
+    retiring_digests: Mapping[str, str],
+) -> list[str]:
+    secret = {item.cluster_id: item for item in configured}
+    head = {str(row.get("cluster_id")): row for row in rows}
+    drifting = []
+    for cluster_id in sorted(set(secret) | set(head)):
+        try:
+            registration, candidate = _head_registration(
+                head[cluster_id], secret[cluster_id], retiring_digests.get(cluster_id)
+            )
+        except (ReleaseError, KeyError, TypeError, ValueError):
+            # One side lacks the cluster, or its credential identity differs.
+            drifting.append(cluster_id)
+            continue
+        if regional_registry_config_sha256([registration]) != (
+            regional_registry_config_sha256([candidate])
+        ):
+            drifting.append(cluster_id)
+    return drifting
 
 
 def _lifecycle_registry_request(

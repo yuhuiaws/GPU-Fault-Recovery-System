@@ -113,6 +113,7 @@ from gpu_fault_release.regional_release_rollback_context import (
 from gpu_fault_release.regional_release_rollback_context import (
     rollback_target_arguments as _rollback_target_arguments,
 )
+from gpu_fault_release.regional_release_registry_head import verify_rollback
 from gpu_fault_release.regional_release_rollback_restart import RollbackRestartPlan
 from gpu_fault_release.regional_release_rollout_cleanup import (
     # Re-exported for the same reason, and bound as module globals rather than
@@ -1498,15 +1499,14 @@ def _verify_and_complete_rollback(
     timing: dict[str, Any],
     run_phase: RollbackPhaseRunner,
 ) -> None:
+    # The registry head the control plane serves must be the restored Secret
+    # before the restored site is judged by it, on every run of the phase
+    # (``regional_release_registry_head``); a dry run compares nothing.
     run_phase(
         "verify",
         "rollback-verifying",
         "rollback-verified",
-        lambda: self._validate_rollback(
-            previous,
-            restore_cpu=compensation.restores_cpu,
-            cluster_components=compensation.cluster_components,
-        ),
+        lambda: verify_rollback(self, previous, compensation),
     )
     complete_rollback(
         self,

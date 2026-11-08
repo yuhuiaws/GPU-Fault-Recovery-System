@@ -675,6 +675,14 @@ def _bind(
     method("_template_bundle", lambda _target, _template: "previous-bundle")
     method("_agent_heartbeats_converged", lambda target, **_k: True)
     monkeypatch.setattr(VALIDATION, "_validate_cpu_rollback", lambda *_a, **_k: None)
+    # The durable registry head the rollback compares with the Secret: this
+    # site has no registry API (test_manual_rollback_engine compares for real).
+    monkeypatch.setattr(
+        release,
+        "_verify_rollback_registry_head",
+        lambda: deploy.record("verify-registry-head") or {},
+        raising=False,
+    )
 
     # The rollback's CPU side: the controller stage keeps its one zero-node
     # question -- the Agent pins it restores, from the clusters with live

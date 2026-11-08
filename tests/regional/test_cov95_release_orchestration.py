@@ -220,7 +220,12 @@ def test_cpu_rollback_replays_captured_config_and_preserves_restore_flags(
         < names.index("complete-restored")
         < names.index("roles")
     )
-    assert names.index("verify-rollback") < names.index("delete-backups")
+    # The verify phase compares the registry head with the Secret first.
+    assert (
+        names.index("verify-registry-head")
+        < names.index("verify-rollback")
+        < names.index("delete-backups")
+    )
 
 
 def test_cpu_apply_grants_release_metadata_reads_before_rendering_roles(

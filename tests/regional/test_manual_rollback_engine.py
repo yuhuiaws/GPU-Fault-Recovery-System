@@ -16,7 +16,10 @@ administrator's alignment after it (``align_rolled_back_management``:
 Only what leaves the process is scripted, as there. The registry Secret is
 emulated (``create --dry-run`` renders, ``apply`` persists, ``get`` reads) and
 every publish lands in a control-plane store whose ``FleetRegistry`` is the
-one that holds each cluster's Agents to their pins.
+one that holds each cluster's Agents to their pins; the site starts with the
+previous release's registry as that head, and the registry API the
+rollback's verification reads (the head's status and redacted clusters)
+answers from it.
 """
 
 from __future__ import annotations
@@ -41,7 +44,16 @@ from gpu_fault.fleet import (
     FleetRegistry,
     SignedAgentHeartbeat,
 )
-from gpu_fault.regional import RegionalClusterRegistration, RegionalRegistryRevision
+from gpu_fault.regional import (
+    RegionalClusterRegistration,
+    RegionalRegistryRevision,
+    RegionalRegistryStatus,
+)
+from gpu_fault.regional_registry import (
+    configured_regional_registrations,
+    regional_registry_config_sha256,
+    regional_registry_document_sha256,
+)
 from gpu_fault.store import InMemoryStore
 from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault_release import regional_deployment_inventory as inventory
@@ -66,6 +78,7 @@ from gpu_fault_release.regional_release_orchestration import (
 from gpu_fault_release.regional_release_orchestration import (
     _stage_rollback_controller as stage_rollback_controller,
 )
+from gpu_fault_release.regional_release_probes import probe_label
 from gpu_fault_release.regional_release_profile_model import cluster_runtime_profiles
 from tests.fleet._support import ARTIFACT, NOW, SECRET, heartbeat, signed
 from tests.regional._release_orchestrator_support import config_file
@@ -140,7 +153,8 @@ class Site(EngineRunner):
     workload holds a Runtime Profile a release leaves. The next
     ``failing_restore_publishes`` publishes of a rollback's registry restore
     fail before they reach the head, as an exec into the ingress Pod that
-    fails does."""
+    fails does; the next ``lost_restore_publishes`` report a converged head
+    and never reach it (``lost``: their reasons)."""
 
     def __init__(self, *, hyperpod: str) -> None:
         super().__init__(hyperpod=hyperpod)
@@ -149,6 +163,8 @@ class Site(EngineRunner):
         self.control_plane = InMemoryStore()
         self.published: list[str] = []
         self.failing_restore_publishes = 0
+        self.lost_restore_publishes = 0
+        self.lost: list[str] = []
 
     def entries(self, key: str = REGISTRY.REGISTRY_CURRENT_KEY) -> Any:
         encoded = self.registry.get(key)
@@ -177,6 +193,15 @@ class Site(EngineRunner):
             generation = store.get_regional_registry_head().generation
         except NotFoundError:
             generation = 0
+        with self.lock:
+            lost = str(payload["reason"]).endswith(RESTORED) and (
+                self.lost_restore_publishes > 0
+            )
+            self.lost_restore_publishes -= int(lost)
+            if lost:
+                self.lost.append(payload["reason"])
+        if lost:
+            return json.dumps({"generation": generation, "converged": True})
         revision = RegionalRegistryRevision.build(
             generation=generation + 1,
             registrations=[
@@ -197,6 +222,8 @@ class Site(EngineRunner):
     def run(self, arguments: list[str], **kwargs: Any) -> str:
         command = [str(item) for item in arguments]
         answer = self._registry_secret(command, kwargs.get("input_text"))
+        if answer is None:
+            answer = self._registry_api(command)
         if answer is None and "patch" in command and "configmap" in command:
             # A merge patch of a ConfigMap (the rollback's ``-config-core``).
             name = command[command.index("configmap") + 1]
@@ -209,6 +236,48 @@ class Site(EngineRunner):
         with self.lock:
             self.commands.append(command)
         return answer
+
+    def _registry_api(self, arguments: list[str]) -> str | None:
+        """The registry API reads through the ingress Pod (``registry_client``):
+        the head's status, converged, and its clusters with their token
+        digests redacted, as the API serves them."""
+
+        if "exec" not in arguments or "-c" not in arguments:
+            return None
+        index = arguments.index("-c")
+        if probe_label(arguments[index + 1]) != "<probe:registry_client>":
+            return None
+        method, path = arguments[index + 2 : index + 4]
+        assert method == "GET", arguments
+        store = self.control_plane
+        revision = store.get_regional_registry_revision(
+            store.get_regional_registry_head().generation
+        )
+        if path == "/v1/regional/registry/status":
+            return RegionalRegistryStatus(
+                generation=revision.generation,
+                content_sha256=revision.content_sha256,
+                cluster_states={
+                    item.cluster_id: item.lifecycle_state
+                    for item in revision.registrations
+                },
+                required_member_ids=[],
+                acked_member_ids=[],
+                missing_member_ids=[],
+                active_member_ids=[],
+                members=[],
+                converged=True,
+            ).model_dump_json()
+        assert path == "/v1/regional/clusters", path
+        rows = []
+        for registration in store.list_regional_clusters():
+            item = registration.model_dump(mode="json")
+            for field in ("token_sha256", "retiring_token_sha256"):
+                digest = item.pop(field) or ""
+                item[f"{field}_present"] = bool(digest)
+                item[f"{field}_length"] = len(digest)
+            rows.append(item)
+        return json.dumps(rows)
 
     def _registry_secret(self, arguments: list[str], input_text: Any) -> str | None:
         if "get" in arguments and REGISTRY.REGISTRY_SECRET in arguments:
@@ -310,6 +379,27 @@ def _registry_data(config: Any) -> dict[str, str]:
     }
 
 
+def _publish_head(site: Site, entries: list[dict[str, Any]], reason: str) -> None:
+    """Make the registry Secret ``entries`` the control plane's head, as a
+    publish before this test's releases did; ``published`` records none."""
+
+    store = site.control_plane
+    try:
+        generation = store.get_regional_registry_head().generation
+    except NotFoundError:
+        generation = 0
+    store.publish_regional_registry_revision(
+        RegionalRegistryRevision.build(
+            generation=generation + 1,
+            registrations=configured_regional_registrations(entries),
+            previous_generation=generation or None,
+            required_member_ids=[],
+            reason=reason,
+        ),
+        expected_generation=generation,
+    )
+
+
 def _previous_release(previous_config: Any) -> dict[str, Any]:
     """What the release the candidate replaces recorded: the site on eks-v1,
     gpu-a on its own hyperpod-v1, each with its Agent config digest; every
@@ -378,6 +468,8 @@ class Engine:
         )
         self.site = Site(hyperpod=hyperpod)
         self.site.registry = _registry_data(self.previous_config)
+        # The previous release published its registry: the head the site serves.
+        _publish_head(self.site, self.site.entries(), "previous release")
         # The previous release's live release metadata and role ConfigMaps.
         recorded = _previous_release(self.previous_config)
         self.site.configmaps["gpu-fault-release-metadata"] = dict(recorded["metadata"])
@@ -420,6 +512,8 @@ def _bind_engine(
     environment and container env snapshot they were handed)."""
 
     deploy = _bind(release, site, monkeypatch, store=store)
+    # The rollback's verification compares the head with the Secret for real.
+    monkeypatch.delattr(release, "_verify_rollback_registry_head", raising=False)
 
     def method(name: str, value: Any) -> None:
         monkeypatch.setattr(release, name, value, raising=False)
@@ -768,6 +862,26 @@ def _resume(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _assert_head_is_the_secret(engine: Engine, *, republished: bool = False) -> None:
+    """The head the control plane serves is the registry Secret, by the
+    comparison its Pods make (``secret_drift``: the configured view of each),
+    and the rollback's verification proved it -- publishing a restore the
+    Secret still marked as unpublished first when ``republished``."""
+
+    site = engine.site
+    secret = base64.b64decode(site.registry[REGISTRY.REGISTRY_CURRENT_KEY])
+    assert regional_registry_config_sha256(
+        site.control_plane.list_regional_clusters()
+    ) == regional_registry_document_sha256(secret)
+    verify = engine.store["rollback_timing"]["phases"]["verify"]
+    assert verify["status"] == "COMPLETED", verify
+    evidence = verify["details"]["registry_head"]
+    assert (evidence["matches_secret"], evidence["republished"]) == (True, republished)
+    assert evidence["generation"] == (
+        site.control_plane.get_regional_registry_head().generation
+    )
+
+
 def _assert_restored_registry_is_the_head(
     engine: Engine, restored: list[dict[str, Any]]
 ) -> None:
@@ -786,6 +900,7 @@ def _assert_restored_registry_is_the_head(
     }
     assert REGISTRY_RESTORED in _restart_reasons(engine.store, "controller_stage")
     assert REGISTRY_RESTORED not in _restart_reasons(engine.store, "cpu_restore")
+    _assert_head_is_the_secret(engine, republished=bool(site.lost))
 
 
 @pytest.mark.parametrize("hyperpod", SITES)
@@ -916,6 +1031,7 @@ def test_a_manual_rollback_of_a_committed_release_restores_a_clusters_registry_p
         value for value in _recorded(manual, "deployments") if value[1] is not None
     ) == [(HYPERPOD, OWN_PROFILE), (EKS, SITE_PROFILE)]
     _assert_previous_site_pins(site, manual)
+    _assert_head_is_the_secret(engine)
 
     evidence = _align(engine, tmp_path, monkeypatch)
 
@@ -979,3 +1095,122 @@ def test_a_manual_rollback_of_a_release_that_moved_no_profile_leaves_the_registr
     assert (site.registry_writes, site.published) == (writes, published) == (0, [])
     for stage in ("controller_stage", "cpu_restore"):
         assert REGISTRY_RESTORED not in _restart_reasons(engine.store, stage), stage
+    # Restored nothing, and still compared: the head is the Secret.
+    _assert_head_is_the_secret(engine)
+
+
+def _fail_forward_verification(release: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    def verify(_plan: Any) -> None:
+        raise ROLLOUT.ReleaseError("forced verification failure")
+
+    monkeypatch.setattr(release, "_validate_release_quick", verify)
+
+
+def _assert_failed_closed_on_gpu_a(
+    engine: Engine, error: BaseException, *, automatic: bool
+) -> None:
+    """The rollback did not pass: the reason names gpu-a -- not gpu-eks, whose
+    entry (parked, on the site profile) is compared and agrees -- and the
+    exit; an automatic rollback ends rollback-failed, deploy --rollback in its
+    failed verify phase."""
+
+    reason = str(error)
+    assert "rollback registry head mismatch" in reason, reason
+    assert "is not the restored registry Secret on gpu-a (" in reason, reason
+    assert EKS not in reason, reason
+    assert "rerun `gpu-fault-admin deploy --state-dir" in reason, reason
+    store = engine.store
+    assert (store.get("rollback_result") or {}).get("status") != "PASSED"
+    verify = store["rollback_timing"]["phases"]["verify"]
+    assert verify["status"] == "FAILED", verify
+    if automatic:
+        assert store["phase"] == "rollback-failed"
+        assert "rollback registry head mismatch" in store["rollback_failure"]
+    else:
+        assert store["phase"] == "rollback-verifying"
+
+
+@pytest.mark.parametrize(
+    ("automatic", "hyperpod"),
+    [
+        pytest.param(False, "nodes", id="manual-gpu-a-with-its-agent"),
+        pytest.param(False, "parked", id="manual-gpu-a-parked-too"),
+        pytest.param(True, "nodes", id="automatic-before-the-commit"),
+    ],
+)
+def test_a_rollback_whose_restore_never_reached_the_head_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, automatic: bool, hyperpod: str
+) -> None:
+    """The restore's publish reports a converged head and never reaches it:
+    the stage completes, the Secret is restored and its backup dropped, the
+    head still holds gpu-a to the candidate's own pins. The verification
+    compares the head with the Secret and fails the rollback, naming gpu-a and
+    the exit, and marks the restore unpublished again; rerunning deploy
+    resumes the rollback, which publishes it once and passes. (Before, the
+    rollback PASSED with the head on the candidate's registry.)"""
+
+    engine = Engine(tmp_path, hyperpod=hyperpod)
+    site = engine.site
+    previous_registry = site.entries()
+    if not automatic:
+        _commit(engine, monkeypatch, FULL_DIFF)
+    release = engine.process(monkeypatch)
+    site.lost_restore_publishes = 1
+
+    with pytest.raises(ROLLOUT.ReleaseError) as raised:
+        if automatic:
+            _fail_forward_verification(release, monkeypatch)
+            release.upgrade(diff=FULL_DIFF)
+        else:
+            release.rollback()
+
+    assert len(site.lost) == 1, site.published
+    _assert_failed_closed_on_gpu_a(engine, raised.value, automatic=automatic)
+    _assert_restore_pending(site, release, previous_registry)
+
+    _resume(engine, monkeypatch)
+
+    _assert_restored_registry_is_the_head(engine, previous_registry)
+
+
+def test_a_rollback_that_restored_nothing_fails_on_a_head_that_is_not_the_secret(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """New wheels only, on a site whose head already held gpu-a to other pins
+    than its registry Secret: the release stages nothing, and its rollback
+    restores and publishes nothing -- and still compares, failing on gpu-a.
+    Resumed, it publishes the Secret once and passes."""
+
+    engine = Engine(tmp_path, hyperpod="nodes", moves_profiles=False)
+    site = engine.site
+    registry = site.entries()
+    _publish_head(
+        site,
+        REGISTRY.registry_with_profile_pins(
+            registry,
+            {
+                HYPERPOD: {
+                    "version": CANDIDATE_OWN_PROFILE,
+                    "agent_config_digest": CANDIDATE_OWN_DIGEST,
+                }
+            },
+        ),
+        "a registry the Secret never got",
+    )
+    _commit(engine, monkeypatch, WHEELS_DIFF)
+    release = engine.process(monkeypatch)
+
+    with pytest.raises(ROLLOUT.ReleaseError) as raised:
+        release.rollback()
+
+    assert site.published == [], "nothing was restored or published"
+    _assert_failed_closed_on_gpu_a(engine, raised.value, automatic=False)
+    _assert_restore_pending(site, release, registry)
+
+    _resume(engine, monkeypatch)
+
+    assert _restore_publishes(site) == site.published
+    assert len(site.published) == 1, site.published
+    assert _judged_pins(site)[HYPERPOD] == (OWN_PROFILE, OWN_DIGEST)
+    assert site.entries(REGISTRY.REGISTRY_BACKUP_KEY) is None
+    _assert_head_is_the_secret(engine, republished=True)

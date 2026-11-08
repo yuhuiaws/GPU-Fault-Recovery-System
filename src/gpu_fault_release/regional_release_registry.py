@@ -306,6 +306,44 @@ def complete_registry_restore(release: RegionalRelease) -> None:
     write_registry(release, current)
 
 
+def registry_restore_pending(release: RegionalRelease) -> bool:
+    """Whether the Secret marks a registry restore whose publish has not converged.
+
+    The mark is the registry kept as its own backup: ``restore_registry_backup``
+    and ``restore_profile_pins`` leave it until the restore's publish
+    converged, and a rollback whose verification found the durable head is not
+    the restored Secret leaves it again (``keep_registry_restore_pending``). A
+    backup that is not the registry the Secret holds is a release's staged
+    backup, which only a rollback's CPU stages restore (and restart every tier
+    for): refused here.
+    """
+
+    current, backup = registry_payloads(release)
+    if backup is None:
+        return False
+    if current != backup:
+        raise ReleaseError(
+            "regional cluster registry still carries a release backup the "
+            "rollback's CPU stages did not restore"
+        )
+    return True
+
+
+def keep_registry_restore_pending(release: RegionalRelease) -> None:
+    """Mark the registry the Secret holds as a restore not yet published.
+
+    The mark ``registry_restore_pending`` reads: a resumed rollback publishes
+    the Secret once before it compares the durable head again, and join and
+    remove refuse meanwhile (``update_registry``). A dry run marks nothing.
+    """
+
+    if release.runner.dry_run:
+        return
+    current, backup = registry_payloads(release)
+    if backup is None:
+        write_registry(release, current, backup=current)
+
+
 def registry_with_profile_pins(
     registrations: list[dict[str, Any]],
     profiles: Mapping[str, Mapping[str, Any]],
