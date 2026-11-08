@@ -154,7 +154,8 @@ def print_status_report(
     without a transparency-log entry is a finding for its first
     ``UNLOGGED_ADVISORY_HOURS``, then the ``release_signature`` failing check
     (``healthy`` false, and the return value True so the command exits 1)
-    until ``backfill-transparency-log`` logs it; the pinned Sigstore trust
+    until the next deploy without the switch backfills it (or
+    ``backfill-transparency-log`` does, out of band); the pinned Sigstore trust
     root's age is the ``sigstore_trust_pin`` field, a WARN finding when old.
     """
     failing_signature = False

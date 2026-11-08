@@ -53,6 +53,10 @@ must already carry the signed ``"signing": {"transparency_log": "unlogged",
 manifest) and a key must be given -- a keyless signature is never written
 without the log. cosign then signs with the key alone and contacts no
 Sigstore service (``signing_transparency.UNLOGGED_SIGN_FLAGS``).
+
+``transparency_log_unavailable`` asks the same retry rule whether the log
+answers, with one read-only request and nothing signed: a deploy without the
+switch backfills the site's unlogged signatures only when it does.
 """
 
 from __future__ import annotations
@@ -61,6 +65,7 @@ import argparse
 import base64
 import codecs
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -93,6 +98,9 @@ FETCH_RETRY_SECONDS = 2.0
 #: outage (cosign itself already repeats each upload once).
 SIGN_ATTEMPTS = 3
 SIGN_RETRY_SECONDS = (30.0, 90.0)
+#: Rekor's log info (tree size, root hash): what the probe reads. A GET; nothing
+#: is uploaded.
+LOG_INFO_PATH = "/api/v1/log"
 _CONFLICT = re.compile(
     r"\[POST /api/v1/log/entries\]\[409\] createLogEntryConflict\b.*?"
     r"with UUID ([0-9a-f]{80}|[0-9a-f]{64})\b",
@@ -307,6 +315,59 @@ def fetch_log_entry(rekor_url: str, uuid: str) -> dict[str, Any]:
             raise SignBlobError("Rekor did not return exactly one entry")
         return values[0]
     raise SignBlobError(f"cannot read the Rekor entry ({last_error})")
+
+
+def _log_info_failure(url: str) -> str | None:
+    """Why one ``GET`` of the log's info failed, worded for the transient rule."""
+
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=FETCH_TIMEOUT_SECONDS) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        return f"transparency log {url} answered status {exc.code}"
+    except (OSError, ValueError, http.client.HTTPException) as exc:
+        cause = getattr(exc, "reason", None) or exc
+        return f"transparency log {url} did not answer ({cause})"
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict) or "treeSize" not in payload:
+        return f"transparency log {url} answered without its tree size"
+    return None
+
+
+def transparency_log_unavailable(
+    rekor_url: str = DEFAULT_REKOR_URL, *, label: str = "cosign_sign_blob"
+) -> str | None:
+    """None when the transparency log answers; otherwise its last failure.
+
+    The signing retries' rule on one read-only request, ``GET
+    <rekor>/api/v1/log``: a failure ``transient_service_failure`` calls
+    transient (5xx, 429, a timeout, a refused or reset connection) is asked
+    again, ``SIGN_ATTEMPTS`` times in all and ``SIGN_RETRY_SECONDS`` apart,
+    exactly as a signing would be; any other failure is final at once.
+    """
+
+    url = f"{rekor_url.rstrip('/')}{LOG_INFO_PATH}"
+    cause = "no attempt"
+    for attempt in range(1, SIGN_ATTEMPTS + 1):
+        failure = _log_info_failure(url)
+        if failure is None:
+            return None
+        cause = failure
+        if attempt == SIGN_ATTEMPTS or not transparency.transient_service_failure(
+            cause
+        ):
+            break
+        delay = SIGN_RETRY_SECONDS[min(attempt - 1, len(SIGN_RETRY_SECONDS) - 1)]
+        _notice(
+            f"{label}: transient Sigstore failure ({cause}); attempt "
+            f"{attempt + 1} of {SIGN_ATTEMPTS} in {delay:.0f} s\n"
+        )
+        time.sleep(delay)
+    return cause
 
 
 def _cosign_failure(stderr: str) -> str:

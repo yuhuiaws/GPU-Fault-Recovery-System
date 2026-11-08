@@ -7,7 +7,8 @@ such signature of the site there -- the same signature, never a new one -- and
 rewrites each bundle with its entry (``scripts/backfill_transparency_log.py``).
 It changes nothing on the clusters and needs only the site's public key; it
 runs under the site operation lock because it rewrites the state directory's
-signature bundles.
+signature bundles. The next deploy without the switch runs the same code path
+by itself before it deploys; this verb is that step out of band.
 """
 
 from __future__ import annotations
@@ -35,7 +36,8 @@ def add_command(
             "signature the site key made without a transparency-log entry to the "
             "public transparency log once it answers, and rewrite its bundle with "
             "the entry (the signature itself is unchanged); clears the status "
-            "finding. Changes nothing on the clusters"
+            "finding. The next deploy without that switch does the same before it "
+            "deploys; this is the out-of-band step. Changes nothing on the clusters"
         ),
     )
     add_managed_site_arguments(command)

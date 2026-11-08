@@ -76,6 +76,18 @@ def validate_reason(value: object) -> str:
     return text
 
 
+def backfill_exit(state_dir: object, *, what: str = "it") -> str:
+    """Same words as ``signing_transparency.backfill_exit``: the next deploy
+    without the switch backfills the signature first, the verb out of band."""
+
+    return (
+        f"the next deploy without {ALLOW_UNLOGGED_FLAG} backfills {what} before "
+        "deploying once the transparency log answers (and refuses while it does "
+        "not), or run gpu-fault-admin backfill-transparency-log --state-dir "
+        f"{state_dir}"
+    )
+
+
 def _timestamp(value: object) -> datetime | None:
     try:
         return datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
@@ -114,7 +126,8 @@ def release_signing_view(
     attestation was accepted (``scripts/release_deploy.py``); the bundle copy
     beside it says whether it is still without a log entry. A finding until
     ``UNLOGGED_ADVISORY_HOURS`` after the declaration, then a failing check,
-    until ``backfill-transparency-log`` puts the signature in the log.
+    until the next deploy without the switch, or ``backfill-transparency-log``
+    out of band, puts the signature in the log.
     """
 
     if not release_id or "/" in release_id:
@@ -152,9 +165,8 @@ def release_signing_view(
     field["age_hours"] = round(hours, 1) if hours is not None else None
     line = (
         f"release {release_id} is signed without a transparency-log entry "
-        f"(declared {signing.get('declared_at')}: {signing.get('reason')}); run "
-        f"gpu-fault-admin backfill-transparency-log --state-dir {state_dir} once "
-        "the transparency log answers"
+        f"(declared {signing.get('declared_at')}: {signing.get('reason')}); "
+        + backfill_exit(state_dir)
     )
     overdue = hours is None or hours >= UNLOGGED_ADVISORY_HOURS
     field["status"] = "FAIL" if overdue else "ADVISORY"
@@ -182,7 +194,9 @@ def unlogged_signatures_view(
     the rest a deploy with ``--allow-unlogged-signature`` signed -- the success
     record, the deploy-host archives, the CI receipts, other releases' copies --
     so a deploy-host-only deploy that changed no release still shows in
-    ``status`` until ``backfill-transparency-log`` logs them.
+    ``status`` until the next deploy without the switch backfills them (it
+    refuses while the log does not answer), or ``backfill-transparency-log``
+    logs them out of band.
     """
 
     candidates = [
@@ -201,16 +215,9 @@ def unlogged_signatures_view(
     if not unlogged:
         return [], []
     names = [str(path.relative_to(state_dir)) for path in unlogged]
-    refused = (
-        "; until then a deploy without --allow-unlogged-signature refuses the "
-        "unlogged source-deploy-success.json"
-        if SUCCESS_RECORD_SIGNATURE in names
-        else ""
-    )
     return names, [
         f"{len(names)} signature(s) of the site key have no transparency-log entry "
-        f"({', '.join(names)}); run gpu-fault-admin backfill-transparency-log "
-        f"--state-dir {state_dir} once the transparency log answers{refused}"
+        f"({', '.join(names)}); " + backfill_exit(state_dir, what="them")
     ]
 
 

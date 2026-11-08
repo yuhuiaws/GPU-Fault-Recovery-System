@@ -237,6 +237,10 @@ def test_the_admin_cli_mirror_spells_everything_the_same() -> None:
     assert admin_signing.PIN_RECORD == transparency.PIN_RECORD
     assert admin_signing.PIN_USE_RECORD == transparency.PIN_USE_RECORD
     assert admin_signing.PIN_AGE_WARNING_DAYS == transparency.PIN_AGE_WARNING_DAYS
+    for what in ("it", "them", "its signatures"):
+        assert admin_signing.backfill_exit(
+            "/state", what=what
+        ) == transparency.backfill_exit("/state", what=what), what
     for value in ("ok", "  padded ", "", "two\nlines", "x" * 301):
         try:
             expected: object = transparency.validate_reason(value)

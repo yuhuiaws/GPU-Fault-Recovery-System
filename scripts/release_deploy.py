@@ -34,6 +34,7 @@ from gpu_fault.admin.site import (
 )
 from gpu_fault.admin.site_s3 import node_agent_environment
 from gpu_fault.digests import SHA256_PATTERN
+from gpu_fault_release.regional_release_signing import backfill_exit
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
     quick_validation_evidence_path,
@@ -1262,8 +1263,7 @@ def signing_summary_lines(
         lines.append(
             f"release {release_id} is signed without a transparency-log entry "
             f"(declared {signing.get('declared_at')}: {signing.get('reason')}); "
-            "run gpu-fault-admin backfill-transparency-log --state-dir "
-            f"{state_dir} once the transparency log answers"
+            + backfill_exit(state_dir)
         )
     pin = signing.get("trust_pin")
     if isinstance(pin, Mapping):

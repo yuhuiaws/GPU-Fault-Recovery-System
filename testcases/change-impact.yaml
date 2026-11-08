@@ -204,6 +204,7 @@ rules:
       - tests/test_signing_transparency.py
       - tests/test_unlogged_release_signing.py
       - tests/test_unlogged_release_admin.py
+      - tests/test_unlogged_release_backfill.py
       - tests/_unlogged_signing_support.py
       - src/gpu_fault/__init__.py
     pytest:
@@ -214,6 +215,7 @@ rules:
       - tests/test_signing_transparency.py
       - tests/test_unlogged_release_signing.py
       - tests/test_unlogged_release_admin.py
+      - tests/test_unlogged_release_backfill.py
       - tests/test_release_gates.py
       - tests/test_artifact_consistency.py
       - tests/test_component_wheel_closures.py
@@ -303,6 +305,7 @@ rules:
       - tests/test_staging_deploy_dcgm_declaration.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_restore_ci_candidate.py
+      - tests/test_unlogged_release_backfill.py
       - tests/regional/test_boot020_runner.py
       - tests/regional/test_regional_release_orchestrator.py
       - tests/regional/test_regional_release_config_and_profile.py

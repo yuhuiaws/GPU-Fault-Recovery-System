@@ -52,6 +52,7 @@ if __package__:
         successful_source_live_matches,
     )
     from scripts.staging_signing import (
+        backfill_before_deploy,
         cached_unlogged_bundle,
         consent_environment,
         deploy_host_signing_refusal,
@@ -107,6 +108,7 @@ else:
         successful_source_live_matches,
     )
     from staging_signing import (
+        backfill_before_deploy,
         cached_unlogged_bundle,
         consent_environment,
         deploy_host_signing_refusal,
@@ -536,6 +538,7 @@ def record_successful_source_deploy(
     unlogged_reason: str | None = None,
     release_signing: Mapping[str, object] | None = None,
     trust_pin: Mapping[str, object] | None = None,
+    backfill: Sequence[Mapping[str, str]] = (),
 ) -> Path:
     state_path, signature_path = source_success_paths(state_dir)
     application = identities.get("application")
@@ -573,7 +576,7 @@ def record_successful_source_deploy(
             if zero_node_clusters is not None
             else {}
         ),
-        **success_record_signing(unlogged_reason, release_signing, trust_pin),
+        **success_record_signing(unlogged_reason, release_signing, trust_pin, backfill),
     }
     temporary_state = state_path.with_suffix(".tmp")
     temporary_signature = signature_path.with_suffix(".tmp")
@@ -1002,6 +1005,7 @@ def apply_source_deploy(
     live_evidence: Mapping[str, object] | None = None,
     unlogged_reason: str | None = None,
     started_at: str | None = None,
+    backfill: Sequence[Mapping[str, str]] = (),
 ) -> tuple[str, dict[str, object]]:
     """Apply ``prepared_mode`` and record the success that authorizes the next run.
 
@@ -1094,10 +1098,9 @@ def apply_source_deploy(
             else None
         ),
         unlogged_reason=unlogged_reason,
-        release_signing=(
-            release_record_signing(state_dir) if mode == "APPLICATION_RELEASE" else None
-        ),
+        release_signing=release_record_signing(state_dir, mode, backfill),
         trust_pin=trust_pin_used_since(signing.public_key, started_at),
+        backfill=backfill,
     )
     report_unlogged_deploy(state_dir, unlogged_reason)
     return mode, evidence
@@ -1278,11 +1281,11 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
         state_dir,
         repository_root=source.repository_root,
     )
-    # The site lock is taken before the first ``gpu-fault-admin status`` and held
-    # through the apply: the classification below is read from the live site, and
-    # a classification that another operation can invalidate has to be re-read,
-    # which is the 45-second call this ordering deletes.
+    # The site lock is held from the backfill and the first ``gpu-fault-admin
+    # status`` through the apply: a classification read from the live site that
+    # another operation can invalidate would cost a second 45-second read.
     with site_operation_lock(state_dir, wait=True) as lock_fd:
+        backfill = backfill_before_deploy(state_dir, signing, unlogged_reason)
         previous = load_successful_source_deploy(
             state_dir, signing=signing, allow_unlogged=bool(unlogged_reason)
         )
@@ -1386,6 +1389,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             live_evidence=live_evidence,
             unlogged_reason=unlogged_reason,
             started_at=started_at,
+            backfill=backfill,
         )
         try:
             prune_source_snapshots(
@@ -1424,7 +1428,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             "email_confirmation": email_confirmation.as_dict(),
             "live_release": live_release_block(report),
             "next_deploy": next_deploy_block(report),
-            "signing": signing_result(unlogged_reason),
+            "signing": signing_result(unlogged_reason, backfill),
         }
 
 

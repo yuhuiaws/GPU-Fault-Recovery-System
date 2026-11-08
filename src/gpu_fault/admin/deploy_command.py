@@ -161,9 +161,10 @@ def add_unlogged_signature_arguments(deploy: argparse.ArgumentParser) -> None:
             "the public Sigstore transparency log is unavailable: sign this "
             "deploy's release with the site key only, without a transparency-log "
             "entry; requires --reason. The signed attestation declares it, the "
-            "deploy summary and status name it until gpu-fault-admin "
-            "backfill-transparency-log logs the signature; for this deploy only, "
-            "never a site default"
+            "deploy summary and status name it until the signatures are logged: "
+            "the next deploy without this switch backfills them before deploying "
+            "(gpu-fault-admin backfill-transparency-log does it out of band); for "
+            "this deploy only, never a site default"
         ),
     )
     deploy.add_argument(
@@ -421,7 +422,8 @@ def refuse_rollback_options(arguments: argparse.Namespace) -> None:
                 "--supersede-failed-transaction",
                 getattr(arguments, "supersede_failed_transaction", False),
             ),
-            # A rollback signs nothing and verifies no signature.
+            # A rollback signs nothing and verifies no signature, so it never
+            # backfills one either: that is the next normal deploy's first step.
             (
                 ALLOW_UNLOGGED_FLAG,
                 getattr(arguments, "allow_unlogged_signature", False),

@@ -303,6 +303,20 @@ UNLOGGED_RELEASE_REFUSAL_HINT = (
 )
 
 
+def backfill_exit(state_dir: object, *, what: str = "it") -> str:
+    """How a signature without a log entry gets one, as the deploy summary and
+    ``status`` say it: the next deploy without the switch backfills it first
+    (``staging_signing.backfill_before_deploy``), the verb does it out of band.
+    ``gpu_fault_release.regional_release_signing`` spells the same words."""
+
+    return (
+        f"the next deploy without {ALLOW_UNLOGGED_FLAG} backfills {what} before "
+        "deploying once the transparency log answers (and refuses while it does "
+        "not), or run gpu-fault-admin backfill-transparency-log --state-dir "
+        f"{state_dir}"
+    )
+
+
 def consented_reason(environment: Mapping[str, str]) -> str:
     """The reason the deploy hop handed down, required by an explicit flag."""
 

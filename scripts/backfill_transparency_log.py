@@ -19,6 +19,11 @@ archives and the CI candidate receipts. A bundle that already has a log entry
 is left alone, so the command can run any number of times. Afterwards the
 release's ``gpu-fault-admin status`` finding (or failing check) is gone: status
 reads the record's bundle copy.
+
+A deploy without ``--allow-unlogged-signature`` runs this same code path
+first, in its own process under the site lock it holds
+(``staging_signing.backfill_before_deploy``); the verb is the same step out
+of band.
 """
 
 from __future__ import annotations
@@ -34,6 +39,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +59,29 @@ _UUID = re.compile(r"([0-9a-f]{80}|[0-9a-f]{64})")
 
 class BackfillError(RuntimeError):
     pass
+
+
+#: What a bundle's backfill can fail with; it is reported, the next one runs.
+FAILURES = (
+    BackfillError,
+    cosign_sign_blob.SignBlobError,
+    OSError,
+    KeyError,
+    TypeError,
+    ValueError,
+)
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """One bundle's result: ``backfilled`` (with its log entry and when),
+    ``already_logged``, ``skipped`` or ``failed`` (with the error)."""
+
+    bundle: Path
+    outcome: str
+    log_entry: str | None = None
+    at: str | None = None
+    error: str | None = None
 
 
 def _sha256_file(path: Path) -> str:
@@ -174,11 +204,26 @@ def backfill(
 ) -> str:
     """``backfilled``, ``already_logged`` or ``skipped`` for one bundle."""
 
+    return backfill_with_entry(
+        artifact, bundle, public_key=public_key, cosign=cosign, rekor_url=rekor_url
+    )[0]
+
+
+def backfill_with_entry(
+    artifact: Path,
+    bundle: Path,
+    *,
+    public_key: Path,
+    cosign: str = "cosign",
+    rekor_url: str = cosign_sign_blob.DEFAULT_REKOR_URL,
+) -> tuple[str, str | None]:
+    """``backfill`` and the log entry's UUID when it wrote one."""
+
     state = transparency.bundle_transparency(bundle)
     if state == transparency.LOGGED:
-        return "already_logged"
+        return "already_logged", None
     if state != transparency.UNLOGGED:
-        return "skipped"
+        return "skipped", None
     if not artifact.is_file():
         raise BackfillError(f"{artifact.name} is missing")
     value = json.loads(bundle.read_bytes())
@@ -248,7 +293,42 @@ def backfill(
         file=sys.stderr,
         flush=True,
     )
-    return "backfilled"
+    return "backfilled", uuid
+
+
+def backfill_bundles(
+    pairs: Iterable[tuple[Path, Path]],
+    *,
+    public_key: Path,
+    cosign: str = "cosign",
+    rekor_url: str = cosign_sign_blob.DEFAULT_REKOR_URL,
+) -> list[Outcome]:
+    """Each ``(artifact, bundle)`` in turn; a failure is reported and the next
+    one runs. Every replacement is its own atomic rename, so a bundle that
+    failed is untouched and one that succeeded keeps its entry."""
+
+    outcomes: list[Outcome] = []
+    for artifact, bundle in pairs:
+        try:
+            outcome, uuid = backfill_with_entry(
+                artifact,
+                bundle,
+                public_key=public_key,
+                cosign=cosign,
+                rekor_url=rekor_url,
+            )
+        except FAILURES as exc:
+            outcomes.append(Outcome(bundle, "failed", error=str(exc)))
+            continue
+        outcomes.append(
+            Outcome(
+                bundle,
+                outcome,
+                log_entry=uuid,
+                at=transparency.utc_timestamp() if uuid is not None else None,
+            )
+        )
+    return outcomes
 
 
 def main(arguments: list[str] | None = None) -> int:
@@ -271,26 +351,17 @@ def main(arguments: list[str] | None = None) -> int:
         "skipped": [],
         "failed": [],
     }
-    for artifact, bundle in candidates(state_dir, repository_root):
-        try:
-            outcome = backfill(
-                artifact,
-                bundle,
-                public_key=options.public_key.expanduser().resolve(),
-                cosign=options.cosign,
-                rekor_url=options.rekor_url,
-            )
-        except (
-            BackfillError,
-            cosign_sign_blob.SignBlobError,
-            OSError,
-            KeyError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            result["failed"].append({"bundle": str(bundle), "error": str(exc)})
-            continue
-        result[outcome].append(str(bundle))
+    for item in backfill_bundles(
+        candidates(state_dir, repository_root),
+        public_key=options.public_key.expanduser().resolve(),
+        cosign=options.cosign,
+        rekor_url=options.rekor_url,
+    ):
+        result[item.outcome].append(
+            {"bundle": str(item.bundle), "error": item.error}
+            if item.outcome == "failed"
+            else str(item.bundle)
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
     return 1 if result["failed"] else 0
 

@@ -15,16 +15,12 @@ signers and verifiers are ``tests/test_unlogged_release_signing.py``.
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import os
 import subprocess
-import sys
-import threading
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -53,10 +49,13 @@ from scripts.release_deploy_evidence import PreparedRelease
 from tests._unlogged_signing_support import (
     ENV,
     LOGGED_BUNDLE,
+    PUBLIC_PEM,
     REASON,
     ROOT,
     UNLOGGED_BUNDLE,
+    fake_rekor,
 )
+from tests._unlogged_signing_support import fake_cosign as _fake_cosign
 from tests._unlogged_signing_support import write_json as _write
 
 
@@ -486,89 +485,8 @@ def test_status_warns_only_about_an_old_trust_pin(tmp_path: Path) -> None:
 
 @pytest.fixture
 def rekor() -> Iterator[dict[str, Any]]:
-    state: dict[str, Any] = {"url": "", "posts": [], "entries": {}, "conflict": False}
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            state["posts"].append(json.loads(body))
-            canonical = json.dumps(json.loads(body), separators=(",", ":")).encode()
-            uuid = "108e9186e8c5677a" + hashlib.sha256(b"\x00" + canonical).hexdigest()
-            entry = {
-                "body": base64.b64encode(canonical).decode(),
-                "integratedTime": 1793189892,
-                "logID": "c0" * 32,
-                "logIndex": 7,
-                "verification": {
-                    "inclusionProof": {
-                        "checkpoint": "rekor - 1\n2\nroot\n",
-                        "hashes": ["ab" * 32],
-                        "logIndex": 6,
-                        "rootHash": "ef" * 32,
-                        "treeSize": 8,
-                    },
-                    "signedEntryTimestamp": "MEUCIQ==",
-                },
-            }
-            state["entries"][uuid] = entry
-            if state["conflict"]:
-                payload = {"code": 409, "message": f"exists with UUID {uuid}"}
-                self.send_response(409)
-                self.send_header("Location", f"/api/v1/log/entries/{uuid}")
-            else:
-                payload = {uuid: entry}
-                self.send_response(201)
-            data = json.dumps(payload).encode()
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def do_GET(self) -> None:
-            uuid = self.path.rsplit("/", 1)[-1]
-            data = json.dumps({uuid: state["entries"][uuid]}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-
-        def log_message(self, *_arguments: object) -> None:
-            return
-
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    state["url"] = f"http://127.0.0.1:{server.server_address[1]}"
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
+    with fake_rekor() as state:
         yield state
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join(timeout=5)
-
-
-PUBLIC_PEM = """-----BEGIN PUBLIC KEY-----
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEESFXE3kS1dflKaBQx+IWJbgs3xXM
-jME6AXcluBD9Ej5GBq7VS0tjJDXOoMNq3W71kVapUjOkWTbxblbx0+ZHtQ==
------END PUBLIC KEY-----
-"""
-
-
-def _fake_cosign(tmp_path: Path, *, offline_ok: bool = True) -> Path:
-    path = tmp_path / "cosign"
-    path.write_text(
-        f"#!{sys.executable}\n"
-        "import sys\n"
-        "argv = sys.argv[1:]\n"
-        f"offline_ok = {offline_ok!r}\n"
-        "if '--insecure-ignore-tlog=true' in argv and not offline_ok:\n"
-        "    sys.stderr.write('invalid signature'); raise SystemExit(1)\n"
-        "raise SystemExit(0)\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o755)
-    return path
 
 
 @pytest.mark.parametrize("conflict", [False, True], ids=["fresh", "already-logged"])
@@ -874,10 +792,11 @@ def test_a_deploy_host_only_unlogged_deploy_still_shows_in_status(
     assert (
         "finding: 2 signature(s) of the site key have no transparency-log entry "
         "(source-deploy-success.sigstore.json, "
-        "deploy-host/by-content/abc/gpu-fault-deploy-host-p.sigstore.json); run "
-        f"gpu-fault-admin backfill-transparency-log --state-dir {tmp_path} once the "
-        "transparency log answers; until then a deploy without "
-        "--allow-unlogged-signature refuses the unlogged source-deploy-success.json"
+        "deploy-host/by-content/abc/gpu-fault-deploy-host-p.sigstore.json); the "
+        "next deploy without --allow-unlogged-signature backfills them before "
+        "deploying once the transparency log answers (and refuses while it does "
+        "not), or run gpu-fault-admin backfill-transparency-log --state-dir "
+        f"{tmp_path}"
     ) in header
 
     for path in (tmp_path / "source-deploy-success.sigstore.json", archive):
