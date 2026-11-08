@@ -4712,7 +4712,9 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
 # Data-plane self-check: the SA has a real role annotation, the web identity token is really injected into the Pod,
 # the wheel ConfigMap matches the control plane's required Executor pin, all three ENABLE_* are true,
 # and the Secret keys needed by the enabled adapters
-# are all present. If any item fails, the exit code is non-zero and the reason is printed.
+# are all present, and so is the node-key Secret (with a key while the node selector selects a node; a
+# cluster without nodes may keep it empty, with a printed note). If any item fails, the exit code is
+# non-zero and the reason is printed.
 GPU_FAULT_NAMESPACE="${NAMESPACE}" \
   GPU_FAULT_KUBE_CONTEXT="${GPU_EKS_CONTEXT}" \
 GPU_FAULT_CONTROL_PLANE_KUBECONFIG="${CPU_KUBECONFIG}" \
@@ -6529,7 +6531,8 @@ kubectl --context "${GPU_EKS_CONTEXT}" -n "${NAMESPACE}" \
 
 # Clean logs != usable data plane. This step checks the items that do not appear in the logs: the IRSA annotation and
 # the token actually injected into the Pod, the wheel ConfigMap versus the control plane's required Executor pin,
-# the three ENABLE_* switches, and the Secret keys needed by the enabled adapters.
+# the three ENABLE_* switches, the Secret keys needed by the enabled adapters, and the node-key Secret
+# (empty only on a cluster without nodes).
 GPU_FAULT_NAMESPACE="${NAMESPACE}" \
   GPU_FAULT_KUBE_CONTEXT="${GPU_EKS_CONTEXT}" \
   GPU_FAULT_CONTROL_PLANE_KUBECONFIG="${CPU_KUBECONFIG}" \

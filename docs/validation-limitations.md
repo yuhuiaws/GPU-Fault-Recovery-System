@@ -60,7 +60,10 @@ a parked cluster is observable. `cpu_secrets` passes an empty CPU node-key
 Secret while no GPU cluster has a node; that is proven offline only, through
 the real check, `preflight` and `status --full` over fake Kubernetes and
 provider reads: the live CPU node-key Secret holds HyperPod keys, so no live
-report has met an empty one.
+report has met an empty one. So is the data-plane executor verifier's pass of
+an empty GPU node-key Secret on a cluster whose selector selects no node,
+through the real verifier over a fake kubectl: the live clusters' GPU Secrets
+hold keys, and a cluster scaled to zero keeps those of the nodes it had.
 
 ## Xid linkage and Drain P2P recovery
 

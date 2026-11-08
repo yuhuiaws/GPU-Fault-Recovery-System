@@ -61,6 +61,18 @@ kind = positional[1]
 if kind == "pods":
     print(json.dumps({"items": world[scope].get("pods", [])}))
     sys.exit(0)
+if kind == "nodes":
+    if world.get("nodes_unreadable"):
+        sys.stderr.write("Unable to connect to the server\\n")
+        sys.exit(1)
+    key, _, value = positional[positional.index("-l") + 1].partition("=")
+    selected = [
+        node
+        for node in world[scope].get("nodes", [])
+        if node["metadata"].get("labels", {}).get(key) == value
+    ]
+    print(json.dumps({"items": selected}))
+    sys.exit(0)
 name = positional[2]
 item = world[scope].get(kind, {}).get(name)
 if item is None:
@@ -406,3 +418,99 @@ def test_no_wheel_reference_available_fails(tmp_path) -> None:
 
     assert result.returncode == 1
     assert "cannot verify the wheel ConfigMap" in result.stdout
+
+
+# --- the node-key Secret of a cluster without nodes ---------------------------
+#
+# ``join-cluster`` of a GPU cluster without nodes creates the GPU node-key
+# Secret empty; the executor's node-key sync fills it as nodes arrive. The
+# verifier refused it ("missing or empty"), so the join's verify, a deploy's
+# quick validation and ``status --full`` failed on a cluster at zero nodes.
+
+OWNERSHIP = "gpu-fault.io/control-plane=us-west-2-site-0123abcd"
+
+
+def _empty_node_keys(*, selector: str | None = OWNERSHIP, nodes=()) -> dict:
+    world = _world()
+    plane = world["data_plane"]
+    plane["secret"]["gpu-fault-node-action-keys"] = {"data": {}}
+    if selector is not None:
+        plane["secret"]["gpu-fault-regional-connection"]["data"]["node-selector"] = (
+            encoded(selector)
+        )
+    plane["nodes"] = [
+        {"metadata": {"name": name, "labels": labels}} for name, labels in nodes
+    ]
+    return world
+
+
+def test_an_empty_node_key_secret_passes_while_the_selector_selects_no_node(
+    tmp_path,
+) -> None:
+    other = {"gpu-fault.io/control-plane": "another-site"}
+    result = _run(tmp_path, _empty_node_keys(nodes=[("ip-10-0-0-9", other)]))
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (
+        "executor check note: secret gpu-fault-node-action-keys is empty and "
+        f"needs no key: the node selector {OWNERSHIP} selects no node"
+    ) in result.stdout
+    assert "executor check passed" in result.stdout
+
+
+def test_an_empty_node_key_secret_fails_while_the_selector_selects_a_node(
+    tmp_path,
+) -> None:
+    site, _, value = OWNERSHIP.partition("=")
+    world = _empty_node_keys(nodes=[("ip-10-0-0-9", {site: value})])
+
+    result = _run(tmp_path, world)
+
+    assert result.returncode == 1
+    assert (
+        "secret gpu-fault-node-action-keys is empty, but the node selector "
+        "selects a node (or the node list cannot be read)"
+    ) in result.stdout
+
+
+def test_an_empty_node_key_secret_fails_when_the_node_list_cannot_be_read(
+    tmp_path,
+) -> None:
+    result = _run(tmp_path, _empty_node_keys(nodes=()) | {"nodes_unreadable": True})
+
+    assert result.returncode == 1
+    assert "gpu-fault-node-action-keys is empty, but the node selector" in (
+        result.stdout
+    )
+
+
+def test_a_hyperpod_connection_secret_without_a_selector_reads_the_cluster_label(
+    tmp_path,
+) -> None:
+    """A connection Secret that predates ``node-selector``: the HyperPod
+    cluster-name label of ``hyperpod-cluster-name`` (``hp-a``)."""
+
+    label = {"sagemaker.amazonaws.com/cluster-name": "hp-a"}
+    without = _run(tmp_path, _empty_node_keys(selector=None))
+    with_node = _run(
+        tmp_path, _empty_node_keys(selector=None, nodes=[("hyperpod-i-1", label)])
+    )
+
+    assert without.returncode == 0, without.stdout + without.stderr
+    assert "sagemaker.amazonaws.com/cluster-name=hp-a selects no node" in (
+        without.stdout
+    )
+    assert with_node.returncode == 1
+    assert "is empty, but the node selector selects a node" in with_node.stdout
+
+
+def test_a_missing_node_key_secret_fails_even_without_nodes(tmp_path) -> None:
+    world = _empty_node_keys()
+    del world["data_plane"]["secret"]["gpu-fault-node-action-keys"]
+
+    result = _run(tmp_path, world)
+
+    assert result.returncode == 1
+    assert "secret gpu-fault-node-action-keys is missing or unreadable" in (
+        result.stdout
+    )

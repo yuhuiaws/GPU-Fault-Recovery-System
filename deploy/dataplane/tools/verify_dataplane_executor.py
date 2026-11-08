@@ -28,7 +28,13 @@ none of which appear in pod status:
   * the Secret keys those switches require exist. The HyperPod adapter
     reads GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER from an ``optional: true``
     key, so a missing key is a startup crash loop rather than a
-    manifest error.
+    manifest error;
+  * the node-key Secret the executor mounts exists, and holds a key
+    while the cluster's node selector selects a node. A cluster without
+    nodes has no key to hold: ``join-cluster`` creates the Secret empty
+    and the executor's node-key sync fills it as nodes arrive, so an
+    empty Secret passes, with a note, while the selector selects none.
+    A node list that cannot be read proves nothing.
 
 Exits non-zero with the reason so a deploy fails loudly.
 """
@@ -52,6 +58,9 @@ SECRET = "gpu-fault-regional-connection"
 NODE_KEYS_SECRET = "gpu-fault-node-action-keys"
 REGISTRY_SECRET = "gpu-fault-regional-clusters"
 IRSA_ANNOTATION = "eks.amazonaws.com/role-arn"
+# The node selector of a connection Secret that records none: the HyperPod
+# cluster-name label (gpu_fault.cluster_scope.node_selector).
+HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"
 # The tiers that carry the current release on the control plane. The
 # control plane also owns a gpu-fault-cluster-executor Deployment scaled
 # to zero (BOOT-004/005 keep mutation off that cluster), and it is not
@@ -204,7 +213,33 @@ def check_service_account(
     return role_arn
 
 
-def check_secret_keys(problems: list[str], container_spec: dict) -> None:
+def node_selector(connection_data: dict[str, str]) -> str:
+    """The cluster's node selector as its executor reads it: the connection
+    Secret's ``node-selector``, else the HyperPod cluster-name label; empty
+    when the Secret names neither."""
+
+    selector = _decode_secret(connection_data, "node-selector")
+    if selector:
+        return selector
+    cluster = _decode_secret(connection_data, "hyperpod-cluster-name")
+    return f"{HYPERPOD_CLUSTER_LABEL}={cluster}" if cluster else ""
+
+
+def selects_no_node(connection_data: dict[str, str]) -> str | None:
+    """The node selector when it selects no node at all; ``None`` when it
+    selects one, cannot be derived, or the node list cannot be read."""
+
+    selector = node_selector(connection_data)
+    if not selector:
+        return None
+    listing = get_json(["get", "nodes", "-l", selector])
+    items = listing.get("items") if isinstance(listing, dict) else None
+    return selector if isinstance(items, list) and not items else None
+
+
+def check_secret_keys(
+    problems: list[str], container_spec: dict, notes: list[str]
+) -> None:
     item = get_json(["get", "secret", SECRET])
     if item is None:
         problems.append(f"secret {SECRET} is missing")
@@ -244,8 +279,20 @@ def check_secret_keys(problems: list[str], container_spec: dict) -> None:
         "GPU_FAULT_ENABLE_NODE_ACTION_ADAPTER",
     ):
         node_keys = get_json(["get", "secret", NODE_KEYS_SECRET])
-        if node_keys is None or not node_keys.get("data"):
-            problems.append(f"secret {NODE_KEYS_SECRET} is missing or empty")
+        if node_keys is None:
+            problems.append(f"secret {NODE_KEYS_SECRET} is missing or unreadable")
+        elif not node_keys.get("data"):
+            selector = selects_no_node(item.get("data") or {})
+            if selector is None:
+                problems.append(
+                    f"secret {NODE_KEYS_SECRET} is empty, but the node selector "
+                    "selects a node (or the node list cannot be read)"
+                )
+            else:
+                notes.append(
+                    f"secret {NODE_KEYS_SECRET} is empty and needs no key: the "
+                    f"node selector {selector} selects no node"
+                )
         directory = env_entry(
             container_spec,
             "GPU_FAULT_NODE_ACTION_KEYS_DIR",
@@ -468,7 +515,8 @@ def main() -> int:
 
     role_arn = check_service_account(problems)
     check_flags(problems, executor)
-    check_secret_keys(problems, executor)
+    notes: list[str] = []
+    check_secret_keys(problems, executor, notes)
 
     wheel = artifact_configmap(pod_spec)
     if wheel is None:
@@ -493,6 +541,8 @@ def main() -> int:
         print(f"executor check failed: {problem}")
     if problems:
         return 1
+    for note in notes:
+        print(f"executor check note: {note}")
     print(
         f"executor check passed: {running} Running pods on {wheel}, "
         f"assuming {role_arn}, node action + HyperPod + spare failover "
