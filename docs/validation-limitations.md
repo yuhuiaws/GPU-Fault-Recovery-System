@@ -5706,3 +5706,57 @@ target's nodes during the removal).
   losing the instance. Plan B (`--window none`) depends on a real external
   departure (a node-group roll) happening to cover a verb's verify, so it only
   holds in that opportunistic window.
+
+## Node lifecycle steps re-claimed after a hold or a retryable error (batch 272)
+
+The regional executor replays a re-claimed command's recorded details as a
+WAITING record `remote/<command id>` (`cluster_executor/dispatch.py`), and the
+node lifecycle adapter (HyperPod and plain EKS) used to resume any such record
+as a submitted reboot. A RESTART_NODE whose first claim stopped before the
+provider call -- a fleet-fence, barrier or lease-guard hold, or a retryable
+Kubernetes or control-plane error -- then skipped the ownership guard,
+`_observe_isolation` and the submission: no provider call and WAITING every
+cycle, for one wasted cycle when the replayed record was empty (a lone
+retryable error, whose keys are stripped on replay) and until the workflow
+execution deadline when a hold's keys kept it non-empty. The control plane then
+judged the step an unknown outcome and parked the workflow `NEEDS_OPERATOR`,
+the node cordoned and never rebooted (a fence- or barrier-shaped record, a known
+no-start, failed instead and climbed to the `replace-after` rung). A
+REPLACE_NODE (warm spare) replayed after such a stop ran its failover through
+the confirmation path without reading the faulty node's isolation, without the
+preflight and without revoking the faulty node's Agent.
+`adapters/hyperpod/lifecycle.replayed_operation_started` now resumes a remote
+record only on evidence: for a reboot the step's own `submission_idempotency_key`,
+or else a record in the write-ahead provider-submission ledger; for a
+replacement its own continuation state. Without it the re-claim runs the first
+claim's path again.
+
+- Proven locally: `tests/execution/test_lifecycle_replayed_hold.py` drives the
+  executor's real dispatch layer, the real lifecycle adapter and the real
+  HyperPod and EKS providers over fake SageMaker, EC2 and EKS clients, with the
+  ledger in a memory store. After each first-claim stop (the fence and
+  lease-guard holds produced by the dispatch itself, the barrier hold's record
+  shape, a Kubernetes 503, a control-plane 503 at the ledger after the Agent's
+  revocation, and a hold followed by a 503) the re-claim runs the ownership
+  guard, the isolation read and the revocation and submits once; its polls never
+  resubmit. A reboot submitted and then held, a submission whose reply was lost
+  (the ledger says SUBMITTED, the record does not) and a reservation of UNKNOWN
+  outcome resume without a second provider call; a failed ledger lookup resumes
+  and is asked again on the next claim; an isolation lifted during the hold gets
+  the b265 refusal (`isolation_not_observed=NOT_ISOLATED`,
+  `provider_submission_record=none`); a held warm-spare replacement reads the
+  faulty node's isolation first and, once isolated, fails over with the Agent
+  revoked.
+- Not live-verified: no lifecycle-step replay after a hold appears in the live
+  case evidence. The fleet fence and the barrier never hold a lifecycle step of
+  today's plans: every plan cordons first, `fleet_preflight_reason` lets a
+  workflow with a completed destructive step finish, and the barrier holds only
+  RESET_GPU and RESET_ALL_GPUS_NVSWITCHES. The lease-guard hold is posted for a
+  shutdown that lands between the lease admission and the adapter call. The
+  realistic trigger is a retryable error in the first claim's calls before the
+  submission (the Node read, the provider preflight, the Agent revocation, the
+  ledger read or reservation).
+- Kept: a ledger record without the step's own submission evidence (a
+  reservation INTENDED or UNKNOWN, or a submission whose reply was lost) is
+  polled, never resubmitted; the control plane parks such a step as an unknown
+  outcome at the deadline for the operator's confirmation.

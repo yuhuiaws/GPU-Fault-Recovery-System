@@ -3969,6 +3969,20 @@ After the three gates, exactly one local Adapter must `supports(step)`; zero or 
 `result_details` already present in the command is replayed as a prior WAITING `WorkflowStepExecution`,
 with `adapter_operation_id` taken as `remote/{command_id}`, so that a waiting-type step can continue across rounds.
 
+The replayed record says only that the command was claimed again, not that the adapter acted: the fleet-fence,
+barrier and lease-guard holds answer WAITING before the adapter runs, and a retryable error (a Kubernetes or
+control-plane 503, a transport failure) cuts the adapter short before the submission (its error keys are stripped
+on replay). So the node lifecycle adapter (`HyperPodLifecycleStepAdapter`, shared by HyperPod and plain EKS)
+resumes a `remote/` record as an operation it started only on evidence
+(`adapters/hyperpod/lifecycle.replayed_operation_started`). A `RESTART_NODE` goes by the step's own
+`submission_idempotency_key` in the record, or else by the provider-submission ledger -- write-ahead (the
+reservation precedes BatchRebootClusterNodes / RebootInstances), so only its proven "no record for the step" sends
+the step back through the first claim's path: the ownership guard, `_observe_isolation` (an isolation lifted during
+the hold gets the §2.9 hand-off), the preflight, the Agent revocation, then the submission; a record in any state, a
+failed lookup or no durable ledger keeps polling, and nothing is submitted twice. A `REPLACE_NODE` submits nothing
+to the provider: its evidence is its own continuation state (`activated_spare_nodes`, `provider_baselines`,
+`requires_external_confirmation`; a failover still pending goes by its `spare_failover_pending` branch).
+
 `confirm_cluster_name` is taken from `GPU_FAULT_HYPERPOD_CLUSTER` in the executor's own environment,
 never read from the command -- reading it from the command would let the request confirm itself, and the gate would never fail (see §2.14).
 

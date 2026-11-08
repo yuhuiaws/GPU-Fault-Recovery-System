@@ -9,6 +9,7 @@ from gpu_fault.adapters.kubernetes.stop_ownership import (
     require_mutation_ownership,
 )
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,6 +39,7 @@ from gpu_fault.fleet import (
 from gpu_fault.hyperpod import (
     HyperPodAdapterError,
     HyperPodWorkflowDispatcher,
+    hyperpod_submission_idempotency_key,
 )
 from gpu_fault.hyperpod_spares import (
     ACTIVATION_NOT_SPECIFIED,
@@ -126,6 +128,65 @@ def isolation_refusal(
             "node_failures": {node: [reason] for node, reason in reasons.items()},
         },
     )
+
+
+#: The operation id of a WAITING record that names a remote command, not an
+#: operation of this adapter: the record the regional executor's dispatch
+#: replays for a re-claimed command (``cluster_executor/dispatch.py``, and
+#: ``batching._workflow_view`` for a compound run) and the control plane's own
+#: record of a remote step (``regional.RegionalRemoteWorkflowAdapter``).
+_REMOTE_RECORD_PREFIX = "remote/"
+#: What a REPLACE_NODE's own WAITING keeps of a replacement it started (a
+#: failover still pending is resumed before this question is asked).
+_REPLACEMENT_STATE_KEYS = (
+    "activated_spare_nodes",
+    "provider_baselines",
+    "requires_external_confirmation",
+)
+
+
+def replayed_operation_started(
+    context: WorkflowStepContext,
+    previous: WorkflowStepExecution,
+    submission_record_state: Callable[[WorkflowStepContext], str | None],
+) -> bool:
+    """Whether the WAITING record a step resumes names an operation it started.
+
+    A record of this adapter's own (an in-process provider operation id) does.
+    A remote one names a command, and the regional executor replays one for
+    every re-claimed command that has any recorded details -- also when the
+    first claim stopped before the provider call: the fleet-fence, barrier or
+    lease-guard hold (``CommandDispatch``) posts WAITING without the adapter
+    running, and a retryable error (a Kubernetes or control-plane 503, a
+    transport failure) posts WAITING with the adapter's run cut short. Read as
+    a submitted reboot, such a replay skipped the ownership guard, the
+    isolation read (``_observe_isolation``) and the submission: no provider
+    call and WAITING again -- one cycle more for a lone retryable error, whose
+    keys the replay strips, every cycle to the workflow deadline once a hold's
+    keys were on the record -- and a REPLACE_NODE ran its warm-spare failover
+    without the isolation read or the preflight.
+
+    So a remote record is resumed only on evidence. A reboot: the step's own
+    submission key, which the adapter records only once the submission ledger
+    holds the step's reservation, or else that ledger itself -- write-ahead
+    (``ProviderSubmissionLedger.reserve`` precedes BatchRebootClusterNodes and
+    RebootInstances), so only its proven "none" sends the step back through
+    the first claim's path; a record in any state, a failed lookup or no
+    durable ledger resumes (never a second submission). A replacement submits
+    nothing to the provider: the evidence is its own continuation state.
+    """
+
+    if not str(previous.adapter_operation_id or "").startswith(_REMOTE_RECORD_PREFIX):
+        return True
+    details = previous.details
+    if context.step.operation is WorkflowOperation.RESTART_NODE:
+        key = hyperpod_submission_idempotency_key(
+            context.workflow.request_id, context.step_index, context.step.operation
+        )
+        if details.get("submission_idempotency_key") == key:
+            return True
+        return submission_record_state(context) != "none"
+    return any(details.get(name) for name in _REPLACEMENT_STATE_KEYS)
 
 
 class HyperPodLifecycleStepAdapter(
@@ -655,7 +716,13 @@ class HyperPodLifecycleStepAdapter(
                 ),
                 state=previous.details,
             )
-        if previous and previous.adapter_operation_id:
+        if (
+            previous
+            and previous.adapter_operation_id
+            and replayed_operation_started(
+                context, previous, self._submission_record_state
+            )
+        ):
             base_details = {
                 **previous.details,
                 **self._reassert_isolation(context, previous.details),
