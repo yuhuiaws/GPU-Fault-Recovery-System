@@ -2140,6 +2140,16 @@ in `scripts/signing_transparency.py` (standard library only: the deploy-host set
 venv exists); the admin CLI uses the same constants from `gpu_fault_release.regional_release_signing` (a `GPU_FAULT_*` literal
 under `src/gpu_fault` would enter `env-inventory.json`, which every component wheel ships), and a test pins the two equal.
 
+A deploy without the switch calls `staging_signing.backfill_before_deploy` under the site lock it holds, right before
+`load_successful_source_deploy` verifies the previous success record. It keeps the `backfill_transparency_log.candidates` bundles
+that have no log entry; with none it returns at once. Otherwise `cosign_sign_blob.transparency_log_unavailable` -- the signing
+retries' rule (`SIGN_ATTEMPTS`, `SIGN_RETRY_SECONDS`, `transient_service_failure`) applied to one read-only `GET
+<rekor>/api/v1/log` -- says whether the log answers, and `backfill_transparency_log.backfill_bundles`, the loop the verb's
+`main` runs too, logs them in process. A probe failure or any failed bundle raises `StagingDeployError` (exit status 2) naming
+the switch and the verb. The entries `{bundle, log_entry, at}` go to `record_successful_source_deploy` as `backfilled_signatures`
+(beside `signing`, which `payload_declaration` keeps strict) and, for an application release, through `release_record_signing`,
+which first adds them to the release record as `signing.backfilled`.
+
 The image-set descriptor schema v3 must record the control-plane/executor wheel SHAs and module digests separately,
 plus the node offline dependency inventory SHA; each image records its full image input and its SHA.
 The three builds run with at most 3 lanes, share the same immutable ECR repository and add no AWS resources. Image reuse still verifies

@@ -20,7 +20,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Approve a pending Profile plan | The same `deploy --state-dir ... --approve-profile-plan <plan_sha256> --reference ...`; there is no separate approval verb | [Runtime Profile Change Approval](administrator-profile-change-approval.md) |
 | The registration cluster left the site and deploy refuses with `registration cluster ... is not among the managed GPU clusters` | Run the refusal's `deploy --state-dir ... --registration-cluster <remaining cluster of that provider> --reference ...` (moves the anchor, then continues the same deploy) | §5.0.4 |
 | Release across schema versions | `deploy --state-dir ... --accept-schema-change` (takes an Aurora snapshot first; `--accept-schema-change-without-snapshot` skips the snapshot) | §4.7 |
-| Deploy while the public Sigstore transparency log is down (the deploy stops with `the Sigstore services did not accept the signature ... after 3 attempts`) | `deploy --state-dir ... --allow-unlogged-signature --reason "<why>"` signs with the site key only; once the log answers, `gpu-fault-admin backfill-transparency-log --state-dir ...` logs the same signatures | [§4.11](#411-signing-a-release-while-the-public-sigstore-services-are-down) |
+| Deploy while the public Sigstore transparency log is down (the deploy stops with `the Sigstore services did not accept the signature ... after 3 attempts`) | `deploy --state-dir ... --allow-unlogged-signature --reason "<why>"` signs with the site key only; once the log answers, the next `deploy` without the switch logs the same signatures before it deploys (`gpu-fault-admin backfill-transparency-log --state-dir ...` does it out of band) | [§4.11](#411-signing-a-release-while-the-public-sigstore-services-are-down) |
 | Join a GPU cluster | `deploy --state-dir ... --gpu-cluster-arn <all managed ARNs> --gpu-cluster-arn <new ARN>` (the given set must be the managed set or a superset of it; the extra ARNs are the joins; giving fewer is refused with `site manages GPU clusters the command omits ... use remove-cluster`; when there are code changes release first, then join), or the join-only `gpu-fault-admin join-cluster --state-dir ... --gpu-cluster-arn <new ARN>` (does not trigger a site release; already managed ARNs return `ALREADY_MANAGED`) | REG-8.1.5, §5 |
 | Remove a GPU cluster | `gpu-fault-admin remove-cluster --state-dir ... --gpu-cluster-arn <ARN> --confirm REMOVE_GPU_CLUSTER` | REG-8.1.6, REG-12, §5 |
 | Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`, for the CPU control-plane cluster's groups too, where one window takes the whole control plane down for minutes) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only (the CPU control-plane cluster's ARN selects every group of it; `--rolling --rollback-alarm <alarm>` keeps the schedule and makes it roll one instance at a time, rolled back on CloudWatch alarms -- printed as ordered steps, because the service deletes and re-creates a schedule rather than changing it) and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
@@ -1463,8 +1463,9 @@ gpu-fault-admin deploy --state-dir /secure/gpu-fault \
 
 **What the switch does.** It is for this one deploy: it is never a site default, the rerun line a stopped deploy prints repeats it,
 and an exported variable cannot turn it on (every hop of the deploy drops an inherited value and passes its own on the command
-line). `--reason` is required: one line of printable text, at most 300 characters. `--rollback` takes neither flag; a rollback
-signs and verifies nothing.
+line). `--reason` is required: one line of printable text, at most 300 characters. `--rollback` takes neither flag (`deploy
+--rollback takes no other deploy option; remove --allow-unlogged-signature, --reason`) and backfills nothing: a rollback signs and
+verifies no signature, so the site key's unlogged signatures wait for the next deploy without the switch or the manual command.
 
 - The release is signed with the site key only, without a transparency-log entry; cosign contacts no Sigstore service for it.
 - Every payload the deploy signs carries the declaration `"signing": {"transparency_log": "unlogged", "reason": ...,
@@ -1476,30 +1477,52 @@ signs and verifies nothing.
 
 **Where it shows.**
 
-- The deploy prints `release-deploy: release <id> is signed without a transparency-log entry (declared <time>: <reason>); run
-  gpu-fault-admin backfill-transparency-log ...` and `staging-deploy: this deploy signed WITHOUT a transparency-log entry ...`.
+- The deploy prints `release-deploy: release <id> is signed without a transparency-log entry (declared <time>: <reason>); the
+  next deploy without --allow-unlogged-signature backfills it before deploying once the transparency log answers (and refuses
+  while it does not), or run gpu-fault-admin backfill-transparency-log ...` and `staging-deploy: this deploy signed WITHOUT a
+  transparency-log entry ...`.
 - `<state-dir>/release-deploy/<release_id>/state.json` records `signing`: `transparency_log` (`logged` or `unlogged`), `reason`,
   `declared_at`, `approval`, `attestation_sha256` and `trusted_root` (`tuf`, `pinned`, or `none` for a key-only check without a
   log entry); a copy of the attestation and its bundle is kept beside it.
-  `source-deploy-success.json` records the deploy's `signing` and the release's `release_signing`.
+  `source-deploy-success.json` records the deploy's `signing` and the release's `release_signing`; what a deploy without the
+  switch backfilled first is `backfilled_signatures` there and `signing.backfilled` in its release record (below).
 - `gpu-fault-admin status` adds `finding: release <id> is signed without a transparency-log entry ...` and the JSON field
   `release_signing` with `status: ADVISORY`. 72 hours after `declared_at` it becomes the failing check `release_signature`
   (`healthy: NO`, exit status 1) until the backfill. That check never stops a deploy: the deploy reads the engine's own verdict, so
-  the next deploy -- one way out of it -- is not blocked by it.
+  the next deploy -- the way out of it -- is not blocked by it.
 - The site key's other signatures without a log entry -- the success record, deploy-host archives, CI receipts; all that a
   deploy-host-only deploy with the switch signs, since it changes no release -- are one finding, `<n> signature(s) of the site
-  key have no transparency-log entry (...); run gpu-fault-admin backfill-transparency-log ...`, and the JSON field
-  `unlogged_signatures`; never a failing check.
+  key have no transparency-log entry (...); the next deploy without --allow-unlogged-signature backfills them before deploying
+  ...`, and the JSON field `unlogged_signatures`; never a failing check.
 
 **While the release runs.** `config`, a deploy-host-only deploy and the other commands that verify the release the site already
 runs accept its attestation without a log entry only when the cluster's own release record (the release state the release engine
 writes with your cluster credentials) names this release and its delivery digest as the committed live release; a holder of the
-signing key alone cannot write that record. Anything else needs the switch again: a deploy that would reuse the unlogged release
-artefacts of the same commit builds and signs them again, a cached unlogged deploy-host archive or CI receipt is rebuilt or ignored
-and signed normally, and the next deploy refuses the unlogged success record of this one until the backfill (or until it carries
-the switch itself).
+signing key alone cannot write that record. Anything else needs the switch again. A deploy without it backfills the site key's
+unlogged signatures first (below), so it meets them logged; the verifiers keep their rules all the same: a deploy that would reuse
+unlogged release artefacts of the same commit builds and signs them again, a cached unlogged deploy-host archive or CI receipt is
+rebuilt or ignored and signed normally, and an unlogged success record is refused.
 
-**Backfill once the log answers.**
+**The next deploy backfills first.** A deploy without `--allow-unlogged-signature` begins, under the site lock it holds and before
+it verifies the previous success record, by looking for the site key's signatures without a log entry -- the bundles
+`backfill-transparency-log` reads. With none it asks nothing. Otherwise it asks whether the transparency log answers, by the
+signing retries' rule (a read of the log's own info, three requests 30 s and then 90 s apart while the failure is transient;
+nothing is uploaded), and when it does it runs the backfill's own code path in its own process: one line per bundle,
+`backfill-transparency-log: <bundle> now carries log entry <uuid>`, then `deploy: backfilled <n> unlogged signature(s) into the
+transparency log before deploying`, and the deploy goes on; the previous success record then verifies with the log.
+`source-deploy-success.json` lists the entries as `backfilled_signatures` (`bundle`, `log_entry`, `at`; beside `signing`, which
+stays the signed declaration), and so does the record of the release the deploy runs, as `signing.backfilled`.
+
+When the log does not answer, or any bundle cannot be backfilled, the deploy refuses with exit status 2 before anything else:
+`<n> signature(s) of the site key have no transparency-log entry (...) and the transparency log does not answer (...)`, or, after
+one `<bundle> was not backfilled: <error>` line per failure, `<k> of <n> signature(s) of the site key without a transparency-log
+entry could not be backfilled (...)`. Both name the exits: rerun the deploy once the log answers, run `gpu-fault-admin
+backfill-transparency-log --state-dir ...`, or deploy now with `--allow-unlogged-signature --reason "<why>"`. Each bundle is
+replaced by its own atomic rename after a verification that requires the entry, so a bundle that was backfilled keeps its entry, a
+failed one is untouched, and a rerun uploads only what is still unlogged (a signature the log already holds is answered 409 and its
+entry is reused). A deploy with the switch backfills nothing, and neither does `deploy --rollback`.
+
+**Backfill out of band.** The same step without a deploy, once the log answers:
 
 ```bash
 /secure/gpu-fault/deployer-venv/bin/gpu-fault-admin backfill-transparency-log --state-dir /secure/gpu-fault
@@ -1525,10 +1548,10 @@ failing check) once the pin is older than 30 days. Without a pin, or with a pin 
 SHA-256, a TUF outage fails exactly as before.
 
 **Residual risk** (details in [Security and Parameters Reference §4](security-and-parameters-reference.md#4-release-and-runtime-profile)):
-until the backfill an unlogged signature leaves no public audit trail; whoever holds the signing key **and** the operator's
-deploy-host or cluster credentials can do what the switch does, as they could deploy without it; `declared_at` is the signer's own
-clock; the pin is only as fresh as its last online run, so a key revocation published through TUF after the pin is not seen until
-TUF answers again.
+until the backfill -- which the next deploy without the switch makes by itself -- an unlogged signature leaves no public audit
+trail; whoever holds the signing key **and** the operator's deploy-host or cluster credentials can do what the switch does, as
+they could deploy without it; `declared_at` is the signer's own clock; the pin is only as fresh as its last online run, so a key
+revocation published through TUF after the pin is not seen until TUF answers again.
 
 ## 5. Joining and Removing GPU Clusters
 

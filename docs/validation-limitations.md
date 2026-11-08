@@ -689,7 +689,14 @@ deploy summary lines, the status finding and its failing check after 72 hours (w
 that names the site key's other unlogged signatures after a deploy-host-only deploy, the exits each refusal names, the backfill
 (a fresh upload, an entry that already exists, a signature the site key did not make), the pin refresh (SHA-256 against the TUF
 targets metadata, no lower TUF version, the previous pin kept) and the fallback, which only the three TUF-fetch forms trigger.
-None of these tests signs, uploads or reaches a network.
+`tests/test_unlogged_release_backfill.py` covers the backfill a deploy without the switch makes before it deploys: the probe of
+the log (an answer, a transient failure retried as a signing would be, a refused connection, any other answer final at once), the
+in-process backfill under the lock and before the previous success record is verified (which then verifies with the log), the
+lines it prints, the records (`backfilled_signatures` beside the strict declaration, `signing.backfilled` in the release record),
+the refusal with exit status 2 when the log does not answer (nothing uploaded or rewritten) or a bundle fails (the others keep
+their entry, the failed one is untouched), the rerun that uploads only what is still unlogged and reuses an entry the log
+already holds, the verb's unchanged summary over the same code path, and `deploy --rollback`, which neither takes the switch nor
+backfills. None of these tests signs, uploads or reaches a network.
 
 The cosign behaviour the switch and the pin rely on was checked once offline with cosign v3.1.2, inside a network namespace
 without any interface, an empty home directory and throwaway keys: `cosign sign-blob --key --use-signing-config=false
@@ -701,12 +708,18 @@ of the TUF-verified trust root verified a real logged release bundle offline and
 transparency log; a logged `cosign sign-blob --signing-config --trusted-root` with the pinned copies made no TUF request (its first
 network request went to the timestamp authority).
 
-Not verified live: a deploy during a real transparency-log or TUF outage; a backfill against the public transparency log (the
-uploaded `hashedrekord` 0.0.1 entry and the bundle rebuilt from the answer use the mapping the 409 recovery already uses, tested
-against a fake log only); the pin's source, cosign v3's default TUF cache under the home directory (a cosign that keeps its
-cache elsewhere never refreshes the pin: a pin left from before is used with its age shown, and without one the command fails as
-before when TUF does not answer); a later cosign without the
-deprecated `--tlog-upload` flag (the switch then fails closed, the wrapper's command is pinned by a test).
+Verified live once, on a deploy-host-only deploy: with the switch, the deploy-host archive and the success record were signed
+without a log entry and declared it, and `status` named both; the next deploy without the switch refused the unlogged success
+record (exit status 2) and left it untouched; `backfill-transparency-log` then logged both against the public transparency log,
+left the already logged signatures alone and cleared the finding; and the next deploy without the switch verified them with the
+log. That run predates the automatic backfill; a deploy without the switch now backfills those signatures itself instead of
+refusing.
+
+Not verified live: the automatic backfill of a deploy without the switch (hermetic tests only); the unlogged release attestation
+and CI receipt, which only an application release signs; a deploy during a real transparency-log or TUF outage; the pin's source,
+cosign v3's default TUF cache under the home directory (a cosign that keeps its cache elsewhere never refreshes the pin: a pin left
+from before is used with its age shown, and without one the command fails as before when TUF does not answer); a later cosign
+without the deprecated `--tlog-upload` flag (the switch then fails closed, the wrapper's command is pinned by a test).
 
 ## Optional HMA ingestion retirement
 

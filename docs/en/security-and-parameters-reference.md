@@ -341,15 +341,20 @@ cluster registry records must not be reused to bypass these gates.
   that release and delivery digest as committed and live. A bundle without a log entry and without the declaration, a
   tampered declaration (the signature breaks) and a keyless signature without its entry are refused; the signature is then
   checked offline with the site public key. `status` reports the unlogged release, and 72 hours after `declared_at` fails the
-  `release_signature` check until `gpu-fault-admin backfill-transparency-log` uploads the same signature to the log.
+  `release_signature` check until the same signature is in the log. The next deploy without the switch puts it there before
+  anything else, under the site lock: only the site public key, the signature and the artifact digest are uploaded, nothing is
+  signed again, and a bundle is replaced only after a verification that requires its new entry; while the log does not answer,
+  or when a signature cannot be logged, that deploy refuses (exit status 2) and names the switch and `gpu-fault-admin
+  backfill-transparency-log`, the same step out of band. `deploy --rollback` neither takes the switch nor backfills.
 - The pinned Sigstore trust root. Every default cosign verification and signing first reads the Sigstore TUF repository.
   After each online run the deploy host keeps, under `<state-dir>/release-signing/`, the trust root and signing
   configuration that cosign's TUF client verified (SHA-256 checked against the cached TUF targets metadata, never a lower TUF
   metadata version, the previous pin kept). It is used only when the live TUF fetch fails, for that command alone, and is
   recorded in the release record; a pin whose files do not match their recorded SHA-256 is no pin. `status` warns when it is
   older than 30 days; it never fails a check.
-- Residual risk of the unlogged mode and the pin, stated plainly: until the backfill an unlogged signature leaves no public
-  audit trail, so a forged release signed with a stolen key in that window would not be visible in the public log either --
+- Residual risk of the unlogged mode and the pin, stated plainly: until the backfill (which the next deploy without the switch
+  makes by itself) an unlogged signature leaves no public audit trail, so a forged release signed with a stolen key in that
+  window would not be visible in the public log either --
   it is accepted only by a command that carries the operator's switch, or as the release the operator's own credentials
   already rolled; whoever holds the signing key **and** the operator's deploy-host or cluster credentials can do what the
   switch does, as they could deploy without it; `declared_at` is the signer's own clock, not a trusted timestamp; the pin is

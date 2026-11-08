@@ -119,7 +119,7 @@ schema-typed `RegionalSite`:
 
 | Administrative action | Behaviour |
 |---|---|
-| `deploy` | Includes a read-only preflight (local inputs, tools, AWS, EKS/HyperPod/IAM, CPU capacity, Aurora, LBC, ACM, AMP/SNS, the archive bucket, workflow and token rotation safety and more); the first run takes bootstrap, an existing site takes upgrade; rerunning resumes; `--rollback` rolls back one step (taking no other option but `--allow-inflight-installs`); `--approve-profile-plan <sha> --reference <ref>` binds a change-ticket reference to the pending Profile plan; further options: `--config` (first deploy only), `--registration-cluster`, `--accept-schema-change[-without-snapshot]`, `--supersede-failed-transaction`, `--wait-for-email-confirmation`, `--grafana-workspace-id`/`--grafana-viewer`, and, while the public transparency log is unavailable, `--allow-unlogged-signature --reason <why>` for that one deploy (see [Administrator Operations §4.11](administrator-operations.md#411-signing-a-release-while-the-public-sigstore-services-are-down)) |
+| `deploy` | Includes a read-only preflight (local inputs, tools, AWS, EKS/HyperPod/IAM, CPU capacity, Aurora, LBC, ACM, AMP/SNS, the archive bucket, workflow and token rotation safety and more); the first run takes bootstrap, an existing site takes upgrade; rerunning resumes; `--rollback` rolls back one step (taking no other option but `--allow-inflight-installs`); `--approve-profile-plan <sha> --reference <ref>` binds a change-ticket reference to the pending Profile plan; further options: `--config` (first deploy only), `--registration-cluster`, `--accept-schema-change[-without-snapshot]`, `--supersede-failed-transaction`, `--wait-for-email-confirmation`, `--grafana-workspace-id`/`--grafana-viewer`, and, while the public transparency log is unavailable, `--allow-unlogged-signature --reason <why>` for that one deploy; a deploy without it first backfills the signatures such a deploy left without a log entry, and refuses while the log does not answer (see [Administrator Operations §4.11](administrator-operations.md#411-signing-a-release-while-the-public-sigstore-services-are-down)) |
 | `status` | Structured health report, non-zero exit code on anomalies; `--full` appends read-only verification of CPU/GPU, Profile, TLS, Agent/Collector, NLB, Aurora and alerts (the former standalone verify) |
 | `uninstall` | Uninstalls the solution according to the Aurora AWS registry (refused while the last registry sync is not recorded as a success, unless `--accept-unsynchronized-registry`); the GPU side is always kept, the CPU side is decided by parameters |
 
@@ -1292,7 +1292,9 @@ and the live release is unchanged, naming the exit `--allow-unlogged-signature -
 fails do signing and verification try once more with the site-pinned Sigstore trust root under `<state-dir>/release-signing/`.
 `make release-build UNLOGGED_SIGNATURE=1` (passed by a deploy that carries the switch; the reason reaches the attestation builder in
 the environment, never on make's command line) declares the unlogged signing in the attestation and signs with the key only. The
-rules, the records, the status finding and `backfill-transparency-log` are in [Administrator Operations
+next deploy without the switch puts those signatures into the log before anything else, once the log answers, and refuses with exit
+status 2 while it does not or when a signature cannot be logged. The rules, the records, the status finding, that automatic backfill
+and `backfill-transparency-log` (the same step out of band) are in [Administrator Operations
 §4.11](administrator-operations.md#411-signing-a-release-while-the-public-sigstore-services-are-down); the trust model and the
 residual risk in [Security and Parameters Reference §4](security-and-parameters-reference.md#4-release-and-runtime-profile).
 
