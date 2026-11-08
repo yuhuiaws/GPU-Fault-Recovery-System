@@ -5735,7 +5735,12 @@ no profile leaves the registry untouched. Either restore keeps the registry it w
 drops it only once its publish to the durable head has converged: a rollback whose publish failed stops with the Secret
 restored and the head still on the candidate's registry, and rerunning `gpu-fault-admin deploy` resumes the rollback, which
 finds that backup and publishes the restore once (join-cluster and remove-cluster refuse until then, as while a release has
-the registry staged). The previous canonical JSON is gzipped and written into
+the registry staged). The rollback's verify phase then compares that durable head with the restored Secret first -- on
+every run, a resumed rollback and one that restored nothing included, and for every cluster the registry has an entry
+for, one parked at zero nodes included; a dry run compares nothing. A head that is not the Secret fails the rollback
+closed (`rollback registry head mismatch`, naming the clusters that differ): an automatic rollback ends `rollback-failed`,
+`deploy --rollback` stops in its verify phase, and the Secret keeps the restored registry as `previous-clusters.json`
+again, so rerunning `gpu-fault-admin deploy` resumes the rollback, which publishes it once and verifies again. The previous canonical JSON is gzipped and written into
 immutable chunked ConfigMaps `gpu-fault-release-previous-<digest>-<part>`; the main release state keeps only
 the digest and chunk references; the non-sensitive role ConfigMap data actually referenced by the CPU three roles lives in that snapshot. Read,
 resume, rollback, status and management-plane alignment all transparently hydrate and verify chunk by chunk, stopping immediately on a missing chunk or digest mismatch.

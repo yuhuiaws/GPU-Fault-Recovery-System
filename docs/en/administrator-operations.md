@@ -714,7 +714,9 @@ record its Agents and Reconciler are rolled back to) and republishes the registr
 the registry as it is. If that publish fails the rollback stops with the Secret restored and the head the control plane
 serves still on the candidate's registry; the Secret keeps the restored registry as `previous-clusters.json` until a
 publish has converged, so rerunning `gpu-fault-admin deploy` resumes the rollback and publishes it once, and join-cluster
-and remove-cluster refuse until then. After the engine finishes, the command aligns the management side like an automatic rollback (changing `site.yaml` back
+and remove-cluster refuse until then. The rollback's verification compares that head with the restored Secret for every
+cluster, also when nothing was restored; a head that is not the Secret fails the rollback (`rollback registry head
+mismatch`, naming the clusters that differ) and leaves the same state with the same exit. After the engine finishes, the command aligns the management side like an automatic rollback (changing `site.yaml` back
 and `sync-state`), and `gpu-fault-admin status` then judges health by the rolled-back online version.
 The alignment restores the release-level fields (manifest, Agent config digest, Runtime Profile, images) from the
 attempt's **rollback baseline** `release-deploy/<release-id>/site.before.yaml`, which every attempt records from the
@@ -5822,7 +5824,9 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   removal: roll the Deployment that reports it (§5.0.2). During `rotate-token --keep-window` the head keeps the retiring
   digest, so this alert stays until the next registry publish after the window closes. A rollback whose registry publish
   failed leaves this drift too: the Secret is restored and still carries `previous-clusters.json`, the head is the
-  candidate's; rerun `gpu-fault-admin deploy` to finish the rollback, which publishes it.
+  candidate's; rerun `gpu-fault-admin deploy` to finish the rollback, which publishes it. So does a rollback whose
+  verification found the head is not the restored Secret (`rollback registry head mismatch`, naming the clusters), with
+  the same exit; a rollback no longer PASSES in that state.
 
 ### GpuFaultControlPlaneReplicaScrapeFailing
 
