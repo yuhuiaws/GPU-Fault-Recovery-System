@@ -3073,7 +3073,11 @@ daemonsets) for the findings; `ssm:SendCommand`/`ssm:GetCommandInvocation` for t
   `runtime_component_identity` and `read_only_verifiers` measure the Pod images and the Executor wheel ConfigMap
   against the **committed (live) release** and say so in `measured_against` ("the configured release ... has not
   committed"); a real mismatch names both the image the Pod runs and the expected one. The attribution disappears
-  once the candidate commits.
+  once the candidate commits. The same holds after an automatic rollback that PASSED (`phase=rolled-back`): the
+  release state still names the failed candidate (release id, images, Executor wheel ConfigMap) while what runs is
+  the `previous` release the rollback restored, and both checks measure against that one. They used to measure
+  against the candidate and report both checks failing on a site the rollback had restored (2026-11-08, BOOT-020
+  FULL).
 - On a mixed-provider site the upgrade's finalize judges whether the Agents reached the candidate pin **per
   cluster's own Runtime Profile**: an `eks-v1` cluster's Agents are measured against the eks-v1 Agent config
   digest and are no longer reported `pin-not-aligned` against the site's `hyperpod-v1` digest; an Agent that is
@@ -3081,7 +3085,11 @@ daemonsets) for the findings; `ssm:SendCommand`/`ssm:GetCommandInvocation` for t
   blocker record.
 - A mixed-site rollback restores the Runtime Profile per cluster: the control-plane env carries only the site
   profile version, a cluster running its own profile keeps its version and digest through the restored registry
-  registration; the previous-state snapshot records `cluster_runtime_profiles`. A transaction
+  registration; the previous-state snapshot records `cluster_runtime_profiles`. After a rollback that PASSED,
+  the release state's top-level `cluster_runtime_profiles` still names the failed candidate's; a previous-state
+  snapshot taken from that state (the next release's rollback target) reads the per-cluster profile versions and
+  Agent config digests the rollback restored from `previous` instead of recording the candidate's as live
+  (2026-11-08, BOOT-020 FULL: the HyperPod cluster's own profile was recorded as `hyperpod-v1-boot020`). A transaction
   opened earlier (no such record) reuses the candidate configuration's per-cluster overrides when its release
   diff moved no profile component, logging `rollback-cluster-profiles source=candidate-config`; otherwise it
   refuses and names the clusters whose previous pins cannot be derived.
