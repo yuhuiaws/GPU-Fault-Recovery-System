@@ -13,6 +13,7 @@ from gpu_fault.models import AdvisoryNotification, FaultIncident, RecoveryAction
 from gpu_fault.orchestration.families.health import (
     HOST_RESOURCE_POLICY_SOURCE,
     UNSETTLED_INCIDENT_STATES,
+    absorbed_by_handoff,
     host_resource_signal,
     host_resource_signal_event,
     incident_opened_by_host_resource_signal,
@@ -219,6 +220,16 @@ class NodeHealthIngestionService:
                     )
                     if notification_id is not None:
                         notifications.append(notification_id)
+            if absorbed_by_handoff(incident, finding):
+                # A re-arm the operator hand-off holding the node for this
+                # signal absorbed (families/health.py _absorb_into_open_handoff)
+                # is recorded there -- event link, marker, bounded reason --
+                # and decides nothing: the hand-off's ticket and the signal's
+                # first advisory already told the operator, so it is sent no
+                # advisory of its own. Each re-arm has a new event id, which
+                # the per-event deduplication of these mails does not fold
+                # (b277; live R28 one inventory mail per re-arm).
+                continue
             if finding.metric_name in {
                 "gpu_inventory_mismatch",
                 "efa_inventory_mismatch",

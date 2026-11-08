@@ -9493,6 +9493,9 @@ RNR/retry/CQ errors, or EFA traffic entering `SPIKE`, `DROP`, `ZERO_WARNING` or
 The email records the node, metric, device/port, current value, traffic state and baseline, job/attempt,
 diagnostic workflow and evidence references, without a large language model. Notifications are created only on health-state or traffic-state transitions;
 the deduplication key is composed of the Event ID and the template version, so continuous abnormal samples and re-submission of the same event do not send twice.
+A re-arm of the signal while an operator hand-off whose chain began with the same signal and reason still isolates the node is absorbed by
+that hand-off: it is recorded on the hand-off incident only and sends no such notification (nor `hardware-inventory-mismatch-zh-v1` or an
+operator-review notice; see "Configuring Heterogeneous Node GPU/EFA ACTIVE Inventory Checks", section 6, item 3; b277).
 `notification_ids` in the HostTelemetry API response returns the notification IDs created or matched this time.
 
 When no notification channel is configured (`GPU_FAULT_NOTIFICATION_CHANNEL=disabled`), sending is off or no dispatcher runs, notifications are still written to the Aurora outbox
@@ -12144,7 +12147,13 @@ fabricated as 0; the EFA inventory is still collected independently.
    disagrees with the listing, or a type outside the table is handled by the original rule.
 3. The notification uses the fixed `hardware-inventory-mismatch-zh-v1` template and goes out through the site's
    notification channel (the site SNS topic by default, mail when SES is chosen). The body contains the instance
-   type, expected, ACTIVE, discovered, missing/excess, node, workload and workflow.
+   type, expected, ACTIVE, discovered, missing/excess, node, workload and workflow. One per new event: a card lost
+   again after recovering mails again. The exception is a re-arm of the same signal and reason while an operator
+   hand-off still isolates the node (for example the 0 -> 1 the collector reads after the chain's own
+   `TRIGGER_HEALTH_SNAPSHOT` restarted it): it is recorded on the hand-off incident as one
+   `absorbed <metric> finding <event id> on <device|node>: recorded only, ...` reason, opens no incident and sends
+   no such notification (the hand-off's ticket and the chain's first notification already told the operator); a
+   re-arm after the hand-off released the node or was closed, another signal or another node mails as usual.
 4. A missing EFA PCI executes `RESTART_NODE`; an unbound driver executes
    `STOP_WORKLOADS -> REMEDIATE_EFA_DRIVER -> VALIDATE_FABRIC`; a port merely inactive first
    diagnoses automatically and reboots only if validation still fails; a missing Kubernetes allocatable alone restarts the target node's

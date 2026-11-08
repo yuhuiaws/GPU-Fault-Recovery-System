@@ -2450,6 +2450,32 @@ as evidence (the event is linked to that incident, and no new incident/workflow 
 a boot id the node has already left (the Agent has already heartbeated with the new boot, and the event's kernel time is earlier than that heartbeat) is only recorded as a `RECOVERED`
 incident and no action is planned. That incident is the event's own (`inc-<event_id>`): when the provider-event correlation has just associated the event with a live marker, the association becomes a reason and the marker's incident is never overwritten (overwriting it would turn the live incident `RECOVERED`, move its event link to the previous boot's line and lose its workflow pointer). When ownership cannot be decided, the original behavior is kept.
 
+Once the chain has ended in an operator hand-off, a re-arm of the same signal is absorbed by that hand-off
+(`families/health.py` `_absorb_into_open_handoff`): the node's inventory verdict counts consecutive samples in the
+collector's memory, so after the chain's own `TRIGGER_HEALTH_SNAPSHOT` restarts the host collector its first tick reads 0
+(a clear to the health signal) and the next one 1 (a new episode under a new event id). While the chain still runs, the
+reboot window or a running reboot that covers the inventory absorbs that re-arm; after the reboot rung was refused for
+want of observed isolation and handed over within a second (live, HyperPod, GF-GENERAL-LIVE-013
+post_repair_isolation_lifted) it opened a second incident, whose MARK_UNSCHEDULABLE the hand-off's isolation refused, and
+the `containment_refused` successor opened a second support ticket for the one fault. Now a metric finding (event id
+ending in `-<metric>-<device|node>`) whose node has an `ESCALATED` incident -- whose ended workflow still isolates the node
+and never readmits it (`terminal_quarantine_nodes` and `handoff_hold.record_held_nodes`) and whose escalation chain began
+with an incident of the finding's cluster, node, policy source, signal and reason -- only links its event to that
+hand-off incident and appends one bounded reason; nothing is planned and the hand-off keeps the node isolated. Another
+signal, reason or node, a hand-off that released the node or one the operator closed, opens a new incident as usual.
+
+Nor does the absorbed finding mail on its own any more (b277, `app/ingest/node_health.py`, judged by `families/health.py`
+`absorbed_by_handoff`). Ingestion used to send `hardware-inventory-mismatch-zh-v1` for every inventory finding,
+whichever incident it landed on; the template deduplicates by event ID and every re-arm has a new event id, so every
+re-arm was one more mail (live, R28, the same case): it named the hand-off incident and its `FREEZE_EVIDENCE →
+MARK_UNSCHEDULABLE → QUARANTINE → ESCALATE_SUPPORT` plan, described the fault the hand-off's ticket already holds and a
+policy action nothing would run, and left the operator nothing to do. That advisory now folds into the hand-off
+incident: no mail (nor an EFA/RDMA event or operator-review notice), and the back-reference is the event link, the
+finding's marker and the bounded reason above, which names the re-arm's event id (one builder,
+`handoff_absorption_reason`); the ticket and the advisory of the chain's first finding already told the operator. A new
+fault of another signal, reason or node, and a re-arm after the hand-off released the node or the operator closed it,
+opens its own incident and mails as before (`tests/orchestration/test_handoff_absorbed_advisory.py`).
+
 A record-only absorption (`ABSORB_RECORD_ONLY`: after the aggregation window closed, a read-only finding falls inside a
 RUNNING workflow's mutating scope -- a node-mutating step or a pending `RESTART_WORKLOAD` naming the node) only links
 the event to the incident and appends the reason: neither the incident's node/GPU scope nor the workflow's pending steps
@@ -4998,6 +5024,9 @@ The control plane first persists the marker, the incident and the workflow, then
 `hardware-inventory-mismatch-zh-v1` template. The body includes instance type, expected,
 ACTIVE, discovered, missing/excess, the consecutive abnormal count, the affected workload and the workflow
 steps, without calling a large language model. The template is deduplicated by event ID and template version.
+A re-arm of the same signal while an operator hand-off still isolates the node is absorbed by that hand-off (2.9,
+`_absorb_into_open_handoff`): it persists no incident or workflow and sends no such mail (b277); it is recorded on
+the hand-off incident only, whose ticket and the mail of the chain's first finding already told the operator.
 
 The recovery workflow when PCI is missing is:
 

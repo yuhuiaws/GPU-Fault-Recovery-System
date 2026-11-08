@@ -183,6 +183,45 @@ def handoff_holds_node(workflow: WorkflowRequest, node_id: str) -> bool:
     return node_id in quarantined and node_id in record_held_nodes(workflow)
 
 
+def handoff_absorption_reason(finding: NodeHealthFinding) -> str:
+    """The bounded reason the operator hand-off that absorbed ``finding``
+    carries (``NodeHealthIngestionService._absorb_into_open_handoff``): the
+    hand-off record's back-reference to the re-arm -- its signal, event id
+    and device -- recorded with nothing scheduled and no advisory of its own
+    (:func:`absorbed_by_handoff`)."""
+
+    return (
+        f"absorbed {finding.metric_name} finding {finding.event_id} on "
+        f"{finding.device or 'node'}: recorded only, the operator "
+        f"hand-off holds the node for this signal"
+    )
+
+
+def absorbed_by_handoff(incident: FaultIncident, finding: NodeHealthFinding) -> bool:
+    """Whether ``incident`` is the operator hand-off that absorbed ``finding``:
+    a record another event minted that carries the finding's
+    :func:`handoff_absorption_reason`, which names the finding's own event id
+    and which only the hand-off absorption writes.
+
+    Such a finding is a re-arm of the signal the hand-off's chain began with,
+    on the node the hand-off holds: the operator owns that hand-off (its
+    ticket) and was sent the signal's advisory when the chain began, and the
+    re-arm decides nothing. Ingestion sends it no advisory of its own --
+    before b277 one ``hardware-inventory-mismatch-zh-v1`` mail per re-arm
+    (live R28, GF-GENERAL-LIVE-013 post_repair_isolation_lifted), each with a
+    new event id and so past the template's per-event deduplication
+    (``app/ingest/node_health.py``). A finding that opened its own incident --
+    another signal, failure mode or node, or a re-arm once the hand-off no
+    longer holds the node -- is not one, and is advised as before.
+    """
+
+    return (
+        incident.event_id != finding.event_id
+        and metric_signal_tail(finding) is not None
+        and handoff_absorption_reason(finding) in incident.reasons
+    )
+
+
 @dataclass(frozen=True)
 class NodeHealthCallbacks:
     active_node_exclusive_workflow: Callable
@@ -1296,8 +1335,10 @@ class NodeHealthIngestionService:
         node quarantined (:func:`handoff_holds_node`) and whose escalation
         chain began with an incident of the same cluster, node, policy
         source, signal and reason. Nothing is scheduled; the hand-off keeps
-        the node isolated. A different signal, reason or node, a hand-off
-        that no longer holds the node, or one the operator closed, opens anew.
+        the node isolated, and ingestion sends the finding no advisory of its
+        own (:func:`absorbed_by_handoff`, b277). A different signal, reason or
+        node, a hand-off that no longer holds the node, or one the operator
+        closed, opens anew.
         """
 
         tail = metric_signal_tail(finding)
@@ -1325,11 +1366,7 @@ class NodeHealthIngestionService:
                 continue
             if not persist:
                 return candidate, workflow
-            reason = (
-                f"absorbed {finding.metric_name} finding {finding.event_id} on "
-                f"{finding.device or 'node'}: recorded only, the operator "
-                f"hand-off holds the node for this signal"
-            )
+            reason = handoff_absorption_reason(finding)
             updated = candidate.model_copy(
                 update={
                     "reasons": bounded_reasons([*candidate.reasons, reason]),

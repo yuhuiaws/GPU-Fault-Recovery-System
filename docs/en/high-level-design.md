@@ -1072,7 +1072,8 @@ the standard EC2 names are supported; unknown instance types must have GPU/EFA e
 
 **Decision and remediation.** After consecutive anomalies reach the threshold, the Collector reports `gpu_inventory_mismatch` or
 `efa_inventory_mismatch`. The control plane creates a CRITICAL finding and sends the fixed
-`hardware-inventory-mismatch-zh-v1` notification. A missing GPU and a missing EFA PCI device
+`hardware-inventory-mismatch-zh-v1` notification (a re-arm of the same signal while an operator hand-off still
+isolates the node is only recorded on the hand-off incident and sends none). A missing GPU and a missing EFA PCI device
 (`failure_mode=PCI_DEVICE_MISSING`) execute the node reboot chain:
 
 ```text
