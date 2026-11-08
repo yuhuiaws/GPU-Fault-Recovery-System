@@ -711,7 +711,10 @@ Secret backups needed for rollback are kept at commit until the next transaction
 find its own backups. The cluster registry's backup is the exception: the commit drops it, so the rollback re-registers
 each cluster with the per-cluster Runtime Profile pins of the `previous` snapshot (`cluster_runtime_profiles`, the same
 record its Agents and Reconciler are rolled back to) and republishes the registry; a release that moved no profile leaves
-the registry as it is. After the engine finishes, the command aligns the management side like an automatic rollback (changing `site.yaml` back
+the registry as it is. If that publish fails the rollback stops with the Secret restored and the head the control plane
+serves still on the candidate's registry; the Secret keeps the restored registry as `previous-clusters.json` until a
+publish has converged, so rerunning `gpu-fault-admin deploy` resumes the rollback and publishes it once, and join-cluster
+and remove-cluster refuse until then. After the engine finishes, the command aligns the management side like an automatic rollback (changing `site.yaml` back
 and `sync-state`), and `gpu-fault-admin status` then judges health by the rolled-back online version.
 The alignment restores the release-level fields (manifest, Agent config digest, Runtime Profile, images) from the
 attempt's **rollback baseline** `release-deploy/<release-id>/site.before.yaml`, which every attempt records from the
@@ -5817,7 +5820,9 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   join/remove (§5) for the diverging clusters, or run a release with the REGISTRY component that lands the Secret on the head.
   With `secret_source=startup-environment` and a Secret that actually matches the head, the replica predates a join or
   removal: roll the Deployment that reports it (§5.0.2). During `rotate-token --keep-window` the head keeps the retiring
-  digest, so this alert stays until the next registry publish after the window closes.
+  digest, so this alert stays until the next registry publish after the window closes. A rollback whose registry publish
+  failed leaves this drift too: the Secret is restored and still carries `previous-clusters.json`, the head is the
+  candidate's; rerun `gpu-fault-admin deploy` to finish the rollback, which publishes it.
 
 ### GpuFaultControlPlaneReplicaScrapeFailing
 
