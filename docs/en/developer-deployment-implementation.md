@@ -748,8 +748,12 @@ command writes into the release directory. Instead `reconcile_rollback_managemen
 anything, refuses a difference naming the clusters it would drop or add, refuses a missing or unreadable baseline
 instead of falling back to the current site (which carries the failed attempt's release fields), and records the
 agreeing sets with both sides' per-cluster Runtime Profile pins in
-`rollback-management/<release-id>/membership-baseline.json`. The pins are recorded, not judged: a deploy repairs a
-cluster's lost override before its release runs, and the engine restores the committed pins through the registry.
+`rollback-management/<release-id>/membership-baseline.json` -- the live side read from the restored `previous` snapshot
+when the rollback PASSED (`rollback_baseline.live_cluster_profile_pins`), since the rolled-back state's top level still
+names the failed candidate's. The pins are recorded, not judged: a deploy repairs a cluster's lost override before its
+release runs, and the engine restores the committed pins through the registry -- from its backup, or, after a commit
+dropped the backup, from the `previous` snapshot's `cluster_runtime_profiles`
+(`regional_release_rollback_context.restore_previous_registry_pins`).
 Only the read-only status baseline (`materialized_rollback_status_site`) reads the current site. The
 `site.before.yaml` of `remove-cluster` lives in that attempt's own directory (`remove-cluster/attempts/<attempt-id>/`)
 and is written before the attempt rewrites the site; it is audit evidence, never a rollback source.

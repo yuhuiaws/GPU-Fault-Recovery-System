@@ -5106,7 +5106,8 @@ targets do not select, a `GPU_FAULT_FORCE_ROLE_RESTART` that disagrees with whet
 the list. Only the named tiers get a new restart token; every other tier inherits the live `restartedAt` and the live
 `gpu-fault.io/failure-domain-map-sha256` stamp, which a rollback does not render, so its template does not change.
 `RollbackRestartPlan` (`src/gpu_fault_release/regional_release_rollback_restart.py`) names a tier from proof, and an incomplete
-proof restarts it. `registry-restored` (the cluster registry backup was restored) and `secret-changed` (the restored
+proof restarts it. `registry-restored` (the cluster registry backup was restored, or after a commit the restored release's
+per-cluster Runtime Profile pins were) and `secret-changed` (the restored
 `gpu-fault-email` data differs from the live data) restart every tier, because the Pods read both as `secretKeyRef` environment
 at start-up. `config-core-changed` restarts the tier whose `<deployment>-config-core` the Agent staging changed;
 `config-maps-changed` and `no-config-map-snapshot` the tier whose role ConfigMaps (read through `envFrom`) the restore changed or
@@ -5726,7 +5727,11 @@ When any step fails, `auto_rollback=true` restores the previous required pins, C
 Reconciler bundle/template, Node Agent artifact and the Runtime Profile version referenced by the CPU/Collector/Installer.
 Already registered profile versions are kept as immutable rollback targets and are not deleted.
 Before the CPU rollout it also saves the old registry as
-`previous-clusters.json` inside the `gpu-fault-regional-clusters` Secret. The previous canonical JSON is gzipped and written into
+`previous-clusters.json` inside the `gpu-fault-regional-clusters` Secret. The commit drops that backup, so `deploy --rollback`
+of a committed release re-registers each cluster with the per-cluster Runtime Profile pins of the `previous` snapshot's
+`cluster_runtime_profiles` -- the record its Agents and Reconciler are rolled back to -- and republishes the registry; a
+cluster that ran the site profile is registered without pins, nothing else in an entry changes, and a release that moved
+no profile leaves the registry untouched. The previous canonical JSON is gzipped and written into
 immutable chunked ConfigMaps `gpu-fault-release-previous-<digest>-<part>`; the main release state keeps only
 the digest and chunk references; the non-sensitive role ConfigMap data actually referenced by the CPU three roles lives in that snapshot. Read,
 resume, rollback, status and management-plane alignment all transparently hydrate and verify chunk by chunk, stopping immediately on a missing chunk or digest mismatch.

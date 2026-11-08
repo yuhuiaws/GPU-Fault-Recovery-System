@@ -708,7 +708,10 @@ release and `deploy` via the ordinary flow (the engine's words: `deploy the olde
 Changing only `dist/current-release.json` is useless: reusing it requires the signed attestation's `source.git_commit`
 to equal HEAD with a clean working tree, otherwise the build regenerates and overwrites it. The
 Secret backups needed for rollback are kept at commit until the next transaction commits, so the rollback of a committed release can
-find its own backups. After the engine finishes, the command aligns the management side like an automatic rollback (changing `site.yaml` back
+find its own backups. The cluster registry's backup is the exception: the commit drops it, so the rollback re-registers
+each cluster with the per-cluster Runtime Profile pins of the `previous` snapshot (`cluster_runtime_profiles`, the same
+record its Agents and Reconciler are rolled back to) and republishes the registry; a release that moved no profile leaves
+the registry as it is. After the engine finishes, the command aligns the management side like an automatic rollback (changing `site.yaml` back
 and `sync-state`), and `gpu-fault-admin status` then judges health by the rolled-back online version.
 The alignment restores the release-level fields (manifest, Agent config digest, Runtime Profile, images) from the
 attempt's **rollback baseline** `release-deploy/<release-id>/site.before.yaml`, which every attempt records from the
@@ -719,7 +722,9 @@ names the clusters it would drop or add (`rollback refused: the rollback baselin
 committed release state ... lists [...]`), and so does a missing or unreadable baseline -- the engine stays rolled back,
 `site.yaml` keeps its membership, and rerunning the same `deploy`/`config` command records a fresh baseline before it
 starts. A rollback therefore never de-registers a cluster that was joined after the release was first deployed; the
-agreeing sets are kept as `rollback-management/<release-id>/membership-baseline.json`. A cluster that an earlier
+agreeing sets are kept as `rollback-management/<release-id>/membership-baseline.json`, with both sides' per-cluster Runtime
+Profile pins -- the live side being the release the rollback restored, not the failed candidate the rolled-back state
+still names at its top level. A cluster that an earlier
 rollback did drop is re-attached as described in §5.0.3.
 
 Running only `kubectl rollout undo` does not restore the release metadata, installer bundle or node
