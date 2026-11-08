@@ -500,3 +500,82 @@ def test_pods_are_measured_against_the_live_release_when_the_site_names_a_candid
     assert "gpu-fault-api-ha Pod OCI image differs from the release" in str(
         refusal.value
     ), "a real mismatch names the Deployment and both images"
+
+
+def test_after_a_passed_rollback_pods_are_measured_against_the_restored_release() -> (
+    None
+):
+    """Live 2026-11-08 (BOOT-020 FULL): a rolled-back state still names the
+    failed candidate -- release id, Executor image, Executor wheel ConfigMap --
+    while the rollback restored ``previous``. ``status`` over the restored
+    release measured the GPU Pods with the candidate's Executor image and failed
+    ``runtime_component_identity`` on a site the rollback had restored."""
+
+    runtime_image = "registry.example/runtime@sha256:" + "3" * 64
+    previous_image = "registry.example/executor@sha256:" + "1" * 64
+    candidate_image = "registry.example/executor@sha256:" + "2" * 64
+
+    class RolledBackRelease(Release):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config.release_manifest_schema_version = 4
+            # The restored release, as the status baseline configures it.
+            self.release_id = "previous0001"
+            self.runtime_image = runtime_image
+            self.executor_image = previous_image
+            self.live_state: dict = {
+                "phase": "rolled-back",
+                "rollback_result": {"status": "PASSED"},
+                "release_id": "candidate002",
+                "runtime_image": runtime_image,
+                "executor_image": candidate_image,
+                "executor_wheel_config_map": "gpu-fault-executor-wheel-0100-candidate",
+                "previous": {
+                    "release_id": "previous0001",
+                    "runtime_image": runtime_image,
+                    "executor_image": previous_image,
+                    "clusters": {
+                        "gpu-a": {"wheel": "gpu-fault-executor-wheel-0100-previous"}
+                    },
+                },
+            }
+
+        def _load_state(self):
+            return self.live_state
+
+        def _get_json(self, arguments):
+            if "deployment" in arguments:
+                return {"spec": {"replicas": 1}}
+            selector = arguments[arguments.index("-l") + 1]
+            image = runtime_image if "--kubeconfig" in arguments else previous_image
+            return {
+                "items": [
+                    {
+                        "metadata": {"name": f"{selector.removeprefix('app=')}-pod-0"},
+                        "spec": {"containers": [{"image": image}]},
+                    }
+                ]
+            }
+
+    release = RolledBackRelease()
+    assert MODULE.live_release_images(release) is None, (
+        "the configured release is the restored one: it is the yardstick"
+    )
+    MODULE.validate_runtime_component_identity(release)
+
+    # The failed candidate configured (an engine-only flow): what runs is still
+    # the restored release, not the candidate the state names.
+    release.release_id = "candidate002"
+    release.executor_image = candidate_image
+    assert MODULE.live_release_images(release) == {
+        "release_id": "previous0001",
+        "runtime_image": runtime_image,
+        "executor_image": previous_image,
+        "executor_wheel_config_map": "gpu-fault-executor-wheel-0100-previous",
+    }
+    MODULE.validate_runtime_component_identity(release)
+
+    # An unproven rollback leaves the recorded candidate as the yardstick.
+    release.live_state["rollback_result"] = {"status": "FAILED"}
+    with pytest.raises(ReleaseError, match="Pod runs .*1111.*, expected .*2222"):
+        MODULE.validate_runtime_component_identity(release)

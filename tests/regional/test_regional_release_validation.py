@@ -242,3 +242,53 @@ def test_a_failing_verifier_says_which_release_it_measured_against() -> None:
         "the live release live00000001: the configured release candidate0001 has "
         "not committed"
     )
+
+
+def test_after_a_passed_rollback_the_verifiers_expect_the_restored_release() -> None:
+    """Live 2026-11-08 (BOOT-020 FULL): ``status`` over the restored release
+    handed the executor verifier the failed candidate's Executor wheel
+    ConfigMap -- the one the rolled-back state still names -- and failed
+    ``read_only_verifiers`` on a site the rollback had restored."""
+
+    environments: list[dict[str, str]] = []
+
+    def run(_arguments, *, env=None, **_kwargs):
+        environments.append(dict(env or {}))
+        return "{}"
+
+    live_image = "registry.example/runtime@sha256:" + "1" * 64
+    rolled_back = {
+        "phase": "rolled-back",
+        "rollback_result": {"status": "PASSED"},
+        "release_id": "candidate0001",
+        "runtime_image": "registry.example/runtime@sha256:" + "2" * 64,
+        "executor_wheel_config_map": "gpu-fault-executor-wheel-0100-candidate",
+        "previous": {
+            "release_id": "previous0001",
+            "runtime_image": live_image,
+            "clusters": {"gpu-a": {"wheel": "gpu-fault-executor-wheel-0100-previous"}},
+        },
+    }
+    restored = _release_with_live_state(run, rolled_back)
+    restored.release_id = "previous0001"
+    restored.runtime_image = live_image
+    restored.executor_wheel_cm = "gpu-fault-executor-wheel-0100-previous"
+    details = EVIDENCE.read_only_verifier_details(restored)
+    assert environments[0]["GPU_FAULT_RUNTIME_IMAGE"] == live_image
+    assert (
+        environments[1]["GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP"]
+        == "gpu-fault-executor-wheel-0100-previous"
+    ), "the executor verifier expects the restored release's wheel ConfigMap"
+    assert "measured_against" not in details, "the restored release is configured"
+
+    candidate = _release_with_live_state(run, rolled_back)
+    details = EVIDENCE.read_only_verifier_details(candidate)
+    assert environments[2]["GPU_FAULT_RUNTIME_IMAGE"] == live_image
+    assert (
+        environments[3]["GPU_FAULT_EXPECTED_WHEEL_CONFIGMAP"]
+        == "gpu-fault-executor-wheel-0100-previous"
+    )
+    assert details["measured_against"] == (
+        "measured against the live release previous0001: the configured release "
+        "candidate0001 has not committed"
+    )

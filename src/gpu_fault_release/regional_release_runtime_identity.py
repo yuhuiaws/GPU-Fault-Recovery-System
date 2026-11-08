@@ -448,6 +448,39 @@ def _read_once_more(first: Any, again: Any) -> Any:
             ) from second_error
 
 
+def _restored_previous(state: dict[str, Any]) -> dict[str, Any] | None:
+    """The ``previous`` snapshot a rollback that PASSED put back, else ``None``.
+
+    Such a state still names the failed candidate -- release id, images, the
+    Executor wheel ConfigMap -- because the admin retry path needs exactly
+    that; what runs is ``previous`` (``regional_release_state``'s rolled-back
+    truth, read here without importing it: that module imports this one).
+    """
+
+    previous = state.get("previous")
+    rollback_result = state.get("rollback_result")
+    if (
+        str(state.get("phase") or "") != "rolled-back"
+        or not isinstance(previous, dict)
+        or not isinstance(rollback_result, dict)
+        or rollback_result.get("status") != "PASSED"
+    ):
+        return None
+    return previous
+
+
+def _previous_executor_wheel(previous: dict[str, Any]) -> str | None:
+    """The one Executor wheel ConfigMap every restored cluster runs, if one."""
+
+    clusters = previous.get("clusters")
+    wheels = {
+        str(item.get("wheel") or "")
+        for item in (clusters.values() if isinstance(clusters, dict) else ())
+        if isinstance(item, dict)
+    }
+    return next(iter(wheels)) if len(wheels) == 1 and all(wheels) else None
+
+
 def live_release_images(release: Any) -> dict[str, Any] | None:
     """The committed release's images when the site's configured release is
     not the one that is live, else ``None``.
@@ -457,6 +490,12 @@ def live_release_images(release: Any) -> dict[str, Any] | None:
     names the candidate while the Pods -- correctly -- still run the committed
     release; measuring them against the candidate reported a false
     "Pod OCI image differs from the release".
+
+    After a rollback that PASSED the live release is the restored ``previous``
+    one, not the failed candidate the state still names: measured against the
+    candidate's images and Executor wheel ConfigMap, ``status`` failed
+    ``runtime_component_identity`` and ``read_only_verifiers`` on a site the
+    rollback had restored (live 2026-11-08, BOOT-020 FULL).
     """
 
     load_state = getattr(release, "_load_state", None)
@@ -466,8 +505,19 @@ def live_release_images(release: Any) -> dict[str, Any] | None:
         state = load_state() or {}
     except Exception:
         return None
-    live_id = str(state.get("release_id") or "")
-    runtime_image = str(state.get("runtime_image") or "")
+    previous = _restored_previous(state)
+    if previous is not None:
+        live_id = str(previous.get("release_id") or "")
+        runtime_image = str(
+            previous.get("runtime_image") or previous.get("live_runtime_image") or ""
+        )
+        executor_image = str(previous.get("executor_image") or "") or None
+        executor_wheel = _previous_executor_wheel(previous)
+    else:
+        live_id = str(state.get("release_id") or "")
+        runtime_image = str(state.get("runtime_image") or "")
+        executor_image = str(state.get("executor_image") or "") or None
+        executor_wheel = str(state.get("executor_wheel_config_map") or "") or None
     if (
         not live_id
         or not runtime_image
@@ -477,10 +527,8 @@ def live_release_images(release: Any) -> dict[str, Any] | None:
     return {
         "release_id": live_id,
         "runtime_image": runtime_image,
-        "executor_image": str(state.get("executor_image") or "") or None,
-        "executor_wheel_config_map": (
-            str(state.get("executor_wheel_config_map") or "") or None
-        ),
+        "executor_image": executor_image,
+        "executor_wheel_config_map": executor_wheel,
     }
 
 
