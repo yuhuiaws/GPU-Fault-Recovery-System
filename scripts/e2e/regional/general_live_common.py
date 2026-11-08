@@ -413,6 +413,7 @@ def wait_for_incident(
     timeout_seconds: float,
     metrics: Iterable[str] = (),
     name: str = "detection",
+    poll_seconds: float = STORE_POLL_SECONDS,
 ) -> dict[str, Any]:
     """Poll the product until ``metric`` minted an incident (or the deadline).
 
@@ -421,7 +422,8 @@ def wait_for_incident(
     recorded WAITING meanwhile (``chain_judgeable``), so a verdict read off
     the first snapshot that shows the incident judges a step still running
     (live 2026-10-25, 003.gpu_idle). The returned document's incidents and
-    workflows are kept in the evidence as ``<name>-chain``.
+    workflows are kept in the evidence as ``<name>-chain``. ``poll_seconds``
+    is the pause between reads (each read itself takes seconds).
     """
 
     wanted = {metric, *metrics}
@@ -443,7 +445,7 @@ def wait_for_incident(
     value = ctx.wait_until(
         accept,
         timeout_seconds=timeout_seconds,
-        poll_seconds=STORE_POLL_SECONDS,
+        poll_seconds=poll_seconds,
         name=name,
     )
     document = value if value is not None else last

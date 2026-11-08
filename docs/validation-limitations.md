@@ -3339,60 +3339,104 @@ collection error, `efa_inventory_mismatch=1` DRIVER_UNBOUND, traffic withheld)
 and with both held (complete traffic on the second tick).
 
 `post_repair_isolation_lifted` (b265) reuses `post_repair_failure`'s chain to
-open the reboot-after rung, then lifts only the cordon of the case node
-(`spec.unschedulable=false`, the equivalent of `kubectl uncordon`; the quarantine
-taint, the incident annotation and the fencing token are left untouched) so the
-node lifecycle adapter refuses the reboot before any provider call
-(`spec.unschedulable is not true`, `adapters/hyperpod/lifecycle._observe_isolation`).
-R23 carried that refusal as a bare `safety_rejection` and climbed to REPLACE_NODE,
-which with a healthy warm spare could fail the node over though no reboot ever
-ran; R24 (82f7b77) marks it `isolation_not_observed=NOT_ISOLATED` and the
-classifier (`failure_outcome.lifecycle_isolation_refusals` ->
-`escalation._classify`, `CONTAINMENT_STAGE`) opens exactly one
-`workflow-support-after` at stage `containment_or_release` -- FREEZE_EVIDENCE,
-MARK_UNSCHEDULABLE, QUARANTINE (the isolation put back), ESCALATE_SUPPORT (one
-ticket) -- whose reason names the cordon (`RESTART_NODE not submitted, isolation
-not observed: spec.unschedulable is not true`), with no REPLACE_NODE, no reboot
-(boot id unchanged) and no warm spare. The timing was established from the R23
-P13 records and the product code: on a regional cluster RESTART_NODE is a remote
-command (`regional.RegionalRemoteWorkflowAdapter`) the control plane mints ~26 ms
-after QUARANTINE and the GPU-cluster executor claims over a NOTIFY-woken 20 s
-long-poll (`app/remote_command_wakeups.py`), so the claim is sub-second and
-`_observe_isolation` -- the adapter's first action -- reads the node sub-second
-after QUARANTINE (the ~10 s to the provider submission is the DescribeCluster
-preflight that follows the read). QUARANTINE does not mutate the node (its
-MARK_UNSCHEDULABLE already set the cordon, taint and annotation; P13: its node
-resource version is unchanged before/after) and does not verify the cordon, so a
-cordon-only lift can never fail QUARANTINE. Because the window is sub-second a
-store-poll trigger (one kubectl exec, ~1-3 s) cannot win and would reboot the node
-every run, so the trigger reads the node directly and HOLDS the cordon lifted
-(`_hold_cordon_lifted`): the moment the node carries a successor incident's
-ownership annotation (the reboot-after incident, which takes the node over from
-the source EFA incident) and is cordoned, it lifts the cordon and keeps re-lifting
-(bounded by `LIFT_CAP`, cordon-only) while that same successor owns the cordoned
-node -- the successor's own QUARANTINE re-cordons a lift that landed before it --
-and stops when a different successor re-isolates the node (the support-after of
-the refused reboot: the window was met) or the node reboots (the lift lost the
-race). This relaxes the brief's literal one-shot to a bounded cordon-only hold,
-the only way to beat a sub-second window from outside the cluster; expected hit
-rate is moderate, not certain, and a miss is a clean reboot (the
-`post_repair_failure` exit, graded across the boot by `EfaDriverFixture.release`),
-never a FAIL. Both race misses are INCONCLUSIVE: a different successor never
-appears and the node reboots (observe read a cordoned node first), or QUARANTINE
-itself FAILED (a patch-retry exhaustion under the hold -- the pre-existing
-containment path, not 82f7b77). The variant is generation-gated
-(`require_isolation_refusal_generation`, a read-only probe in an API Pod that
-imports `failure_outcome`/`escalation` and checks the classifier marker): without
-82f7b77 it is `NOT_RUN(CAPABILITY_ABSENT)` and the node is not touched. Because it
-reuses `EfaDriverFixture` and the `post_repair_failure` settle/cleanup but
-`general_live_efa_driver` owns exactly the two bind negatives, it lives in
-`general_live_efa_isolation_lifted.py`, registered as its own category module;
-its grading (`general_live_efa_escalation.isolation_refusal_errors`,
+open the reboot-after rung, then lifts only the cordon of the case node inside
+that successor's isolation window (`spec.unschedulable=false`, the equivalent of
+`kubectl uncordon`; the quarantine taint, the incident annotation and the
+fencing token are never written) so the node lifecycle adapter refuses the
+reboot before any provider call (`spec.unschedulable is not true`,
+`adapters/hyperpod/lifecycle._observe_isolation`). R23 carried that refusal as a
+bare `safety_rejection` and climbed to REPLACE_NODE, which with a healthy warm
+spare could fail the node over though no reboot ever ran; R24 (82f7b77) marks it
+`isolation_not_observed=NOT_ISOLATED` and the classifier
+(`failure_outcome.lifecycle_isolation_refusals` -> `escalation._classify`,
+`CONTAINMENT_STAGE`) opens exactly one `workflow-support-after` at stage
+`containment_or_release` -- FREEZE_EVIDENCE, MARK_UNSCHEDULABLE, QUARANTINE (the
+isolation put back), ESCALATE_SUPPORT (one ticket) -- whose reason names the
+cordon (`RESTART_NODE not submitted, isolation not observed: spec.unschedulable
+is not true`), with no REPLACE_NODE, no reboot (boot id unchanged) and no warm
+spare. The window (S74, from the product code and the R24 records): between the
+successor's MARK_UNSCHEDULABLE and `_observe_isolation` the only writer of the
+cordon is that successor's QUARANTINE, and `node_operations._isolate` writes the
+whole isolation again (`_node_isolation_patch` always carries
+`spec.unschedulable: true`, read-modify-write with 409 retries) and verifies
+nothing; on an isolated node that write changes nothing on the server (the node
+resource version was the same before and after QUARANTINE in all three R24
+runs), so it raises no watch event. A lift that lands before it is undone, and
+the window's opening is invisible on the node. The window closes at the
+lifecycle adapter's node read: RESTART_NODE is minted ~20 ms after QUARANTINE's
+record and claimed within ~140 ms, and the read follows the lease renewal, the
+idle-node ownership check and the provider node resolution (HyperPod:
+ListClusterNodes plus one DescribeClusterNode per node), about 0.3-1.5 s (R24
+L72: the read preceded a lift that landed 1.47 s after the mint). Every
+`kubectl` call from the operator host costs ~1.5 s (a new process minting an
+EKS token through the exec plugin), so S72's polling hold always landed late
+(R24 L72 `NOT_PROVEN_RACE(LIFT_LATE)`). The S74 lift
+(`general_live_cordon_lift.py`) is event-driven over one pre-authenticated
+client built before anything is injected (TLS verified, the kubeconfig never
+written back): one field-selected node watch, re-listed on 410, and every write
+over the same client. It acts only on the exact successor
+`inc-reboot-after-<source workflow id>`. A first lift (the provocation) lands
+the moment the successor's MARK_UNSCHEDULABLE does, which turns QUARANTINE's
+re-isolation into a visible write; a second (the decisive one) lands the moment
+that re-cordon arrives within `T_Q_SECONDS` (5 s) of the provocation, at the
+start of the window, tens of milliseconds after QUARANTINE's write; with no
+re-cordon the provocation landed after QUARANTINE and is itself the decisive
+lift. Each lift is one JSON patch that tests the incident annotation, the
+fencing token and `spec.unschedulable == true`, then replaces
+`/spec/unschedulable` once; a failed test (the node moved) writes nothing and
+waits for the next event. An event the watch delivers between one of the hold's
+writes and that write's own echo was written before it (another writer, such as
+the node lifecycle controller's unschedulable taint) and is never decided on.
+There are at most two writes, and the hold stops for
+good on another incident (the support-after hand-off of the refused reboot, or
+anything foreign), a boot-id change, any re-cordon after the decisive lift or
+later than `T_Q_SECONDS` (only a submitted reboot's `_reassert_isolation` does
+that, and the hold never fights it), the node's release or deletion, or the end
+of the window; a successor that already holds the node when the hold arms is
+never touched (`armed_late`). The restore (the same tests, then one `add` that
+re-cordons) is registered in the cleanup stack before the first lift and runs at
+once when the hold ends with nobody known to hold the node (window, watch
+failure). Every run records each write's patch-ack latency, its echo's watch
+delivery and the decisive lift's reaction time, and reads the GPU-cluster
+executor's RESTART_NODE claim log line (read-only) as after-the-fact window
+evidence (evidence `efa-driver-cordon-hold`, `lifted-window`). Detection reads
+the store every `DETECTION_POLL_SECONDS` (2 s, not the shared 20 s) so the hold
+is armed before the successor appears (the source chain takes ~20 s). Verdicts:
+PASS as above; FAIL when the product did what the hand-off forbids (a climb to
+REPLACE_NODE, the wrong stage, a reboot after the refusal) or when the hold
+overreached (a write other than the cordon, more than two lifts, a write under
+another incident or after the hold stopped:
+`general_live_cordon_lift.overreach_errors`); otherwise INCONCLUSIVE with a
+detail that opens with a reason token read off the product's records and the
+hold's log. The lift races (`NOT_PROVEN_RACE`) are `LIFT_LATE` (RESTART_NODE's
+isolation read saw the cordon the chain left, before the decisive lift landed),
+`LIFT_UNDONE` (the provocation landed before QUARANTINE's write and the decisive
+re-lift did not beat the read, or a write put the cordon back after the decisive
+lift), `REPLAY_WITHOUT_OBSERVE` (RESTART_NODE's first run ended in an executor
+hold or retry and its replay resumed it as a submitted reboot without reading
+isolation again, b272) and `NO_RUNG` (no reboot-after rung opened); the other
+outcomes are `CONTAINMENT_FAILED` (the successor's MARK_UNSCHEDULABLE or
+QUARANTINE FAILED, which a cordon-only lift cannot cause), `RUNG_UNRESOLVED` and
+`HOLD_NOT_ARMED`. A miss is a clean reboot (the `post_repair_failure` exit,
+graded across the boot by `EfaDriverFixture.release`), never a FAIL. The variant
+is generation-gated (`require_isolation_refusal_generation`, a read-only probe
+in an API Pod that imports `failure_outcome`/`escalation` and checks the
+classifier marker): without 82f7b77 it is `NOT_RUN(CAPABILITY_ABSENT)` and the
+node is not touched. Because it reuses `EfaDriverFixture` and the
+`post_repair_failure` settle/cleanup but `general_live_efa_driver` owns exactly
+the two bind negatives, it lives in `general_live_efa_isolation_lifted.py`,
+registered as its own category module; its grading
+(`general_live_efa_escalation.isolation_refusal_errors`,
 `containment_release_handoff_errors`, `refused_restart_step`,
-`warm_spare_touched`) reads only the product's records, and
-`tests/regional/test_general_live_efa_isolation_lifted.py` pins the cordon hold,
-the cordon-only lift, PASS / FAIL / both INCONCLUSIVE races, the generation gate
-and the reboot-aware cleanup of a lost-late race.
+`warm_spare_touched`) reads only the product's records.
+`tests/regional/test_general_live_cordon_lift.py` pins the trigger (the
+provocation, the decisive re-lift inside T_Q, never a third write), every stop,
+the cordon-only JSON patches, the restore, the latency record, the executor's
+claim lines and the overreach check over a fake Node;
+`tests/regional/test_general_live_efa_isolation_lifted.py` pins PASS / FAIL,
+every reason token and the evidence it is read off, the overreach FAIL, the R24
+L72 records graded `LIFT_LATE`, the generation gate, the window evidence and the
+whole variant over fakes.
 
 A sixth deferral reason, `COVERED_BY_REGIONAL: <case ids>`, names GF-REGIONAL
 cases whose catalog verdict is a live PASS with the very injection and
