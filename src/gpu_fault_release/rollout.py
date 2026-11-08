@@ -220,6 +220,7 @@ from gpu_fault_release.regional_release_progress import (
 )
 from gpu_fault_release.regional_release_registry import (
     commit_registry_update,
+    complete_registry_restore,
     desired_registry,
     initialize_registry,
     registry,
@@ -665,6 +666,7 @@ class RegionalRelease(RegistryDrainContext):
     _stage_registry = stage_registry
     _publish_staged_registry = publish_staged_registry
     _publish_restored_registry = publish_restored_registry
+    _complete_registry_restore = complete_registry_restore
     _stamp_gpu_deployments = stamp_gpu_deployments
     _template_bundle = template_bundle
     _update_registry = update_registry

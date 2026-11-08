@@ -51,6 +51,7 @@ from gpu_fault_release import regional_release_registry as REGISTRY
 from gpu_fault_release import regional_release_rollback_context as ROLLBACK_CONTEXT
 from gpu_fault_release import regional_release_state as STATE
 from gpu_fault_release import rollout as ROLLOUT
+from gpu_fault_release.regional_admin_commands import run_resume
 from gpu_fault_release.regional_release_diff import (
     ReleaseChangeKind,
     ReleaseComponent,
@@ -105,6 +106,8 @@ PREVIOUS_DELIVERY = "d" * 64
 PROFILE_ENV = "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"
 DIGEST_ENV = "GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST"
 REGISTRY_RESTORED = "registry-restored"
+#: How a publish of a rollback's registry restore ends its reason.
+RESTORED = "registry restored by rollback"
 FULL_DIFF = ReleaseDiff(
     kind=ReleaseChangeKind.FULL,
     changed=frozenset(
@@ -134,7 +137,10 @@ class Site(EngineRunner):
     (``registry``: its data), ConfigMap merge patches applied to
     ``configmaps``, and the control plane's registry store every publish lands
     in (``control_plane``; ``published``: the reasons); no workflow or
-    workload holds a Runtime Profile a release leaves."""
+    workload holds a Runtime Profile a release leaves. The next
+    ``failing_restore_publishes`` publishes of a rollback's registry restore
+    fail before they reach the head, as an exec into the ingress Pod that
+    fails does."""
 
     def __init__(self, *, hyperpod: str) -> None:
         super().__init__(hyperpod=hyperpod)
@@ -142,6 +148,7 @@ class Site(EngineRunner):
         self.registry_writes = 0
         self.control_plane = InMemoryStore()
         self.published: list[str] = []
+        self.failing_restore_publishes = 0
 
     def entries(self, key: str = REGISTRY.REGISTRY_CURRENT_KEY) -> Any:
         encoded = self.registry.get(key)
@@ -158,6 +165,13 @@ class Site(EngineRunner):
         """The registry API: the revision the release sends becomes the head."""
 
         payload = request["payload"]
+        with self.lock:
+            failing = str(payload["reason"]).endswith(RESTORED) and (
+                self.failing_restore_publishes > 0
+            )
+            self.failing_restore_publishes -= int(failing)
+        if failing:
+            raise ROLLOUT.ReleaseError("a registry revision publish failed")
         store = self.control_plane
         try:
             generation = store.get_regional_registry_head().generation
@@ -197,6 +211,20 @@ class Site(EngineRunner):
         return answer
 
     def _registry_secret(self, arguments: list[str], input_text: Any) -> str | None:
+        if "get" in arguments and REGISTRY.REGISTRY_SECRET in arguments:
+            # join-cluster and remove-cluster read it to patch it.
+            with self.lock:
+                data, version = dict(self.registry), self.registry_writes
+            return json.dumps(
+                {
+                    "kind": "Secret",
+                    "metadata": {
+                        "name": REGISTRY.REGISTRY_SECRET,
+                        "resourceVersion": str(version + 1),
+                    },
+                    "data": data,
+                }
+            )
         if "create" in arguments and REGISTRY.REGISTRY_SECRET in arguments:
             data = {
                 key: base64.b64encode(Path(path).read_bytes()).decode()
@@ -699,6 +727,138 @@ def _own_pins(profiles: Mapping[str, Any]) -> dict[str, tuple[str, str]]:
     }
 
 
+def _restore_publishes(site: Site) -> list[str]:
+    """The reasons of the publishes of a rollback's registry restore that
+    reached the head."""
+
+    return [reason for reason in site.published if reason.endswith(RESTORED)]
+
+
+def _assert_restore_pending(
+    site: Site, release: Any, restored: list[dict[str, Any]]
+) -> None:
+    """What a rollback whose registry publish failed leaves behind: the Secret
+    holds the restored registry and keeps it as its backup -- the durable mark
+    of a restore whose publish has not converged -- while the head still holds
+    gpu-a to the candidate's own pins, and join-cluster and remove-cluster
+    refuse to touch the registry until the rollback has finished."""
+
+    assert site.entries() == restored
+    assert site.entries(REGISTRY.REGISTRY_BACKUP_KEY) == restored, (
+        "the restore keeps its backup until its publish converged"
+    )
+    assert _restore_publishes(site) == []
+    assert _judged_pins(site)[HYPERPOD] == (CANDIDATE_OWN_PROFILE, CANDIDATE_OWN_DIGEST)
+    target = next(item for item in release.config.clusters if item.cluster_id == EKS)
+    for remove in (False, True):
+        with pytest.raises(ROLLOUT.ReleaseError, match="unfinished release backup"):
+            REGISTRY.update_registry(release, target, remove=remove)
+    assert site.entries(REGISTRY.REGISTRY_BACKUP_KEY) == restored
+
+
+def _resume(engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+    """What rerunning ``gpu-fault-admin deploy`` does with an unfinished
+    rollback, in a new process: the engine's resume finishes it."""
+
+    run_resume(engine.process(monkeypatch))
+    store = engine.store
+    assert (store["phase"], store["rollback_result"]["status"]) == (
+        "rolled-back",
+        "PASSED",
+    )
+
+
+def _assert_restored_registry_is_the_head(
+    engine: Engine, restored: list[dict[str, Any]]
+) -> None:
+    """The rollback's end: the restored registry in the Secret without a
+    backup, published once, the head the control plane judges gpu-a's Agents
+    by; the controller stage restarted every tier onto it and the CPU restore
+    found nothing left to restore."""
+
+    site = engine.site
+    assert site.entries() == restored
+    assert site.entries(REGISTRY.REGISTRY_BACKUP_KEY) is None
+    assert len(_restore_publishes(site)) == 1, site.published
+    assert _judged_pins(site) == {
+        HYPERPOD: (OWN_PROFILE, OWN_DIGEST),
+        EKS: (SITE_PROFILE, SITE_DIGEST),
+    }
+    assert REGISTRY_RESTORED in _restart_reasons(engine.store, "controller_stage")
+    assert REGISTRY_RESTORED not in _restart_reasons(engine.store, "cpu_restore")
+
+
+@pytest.mark.parametrize("hyperpod", SITES)
+def test_a_manual_rollback_whose_registry_publish_failed_publishes_it_on_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hyperpod: str
+) -> None:
+    """The rollback re-registered gpu-a with its previous pins and the publish
+    that makes them the head failed, failing the controller stage. The pins
+    were written as their own backup, so the resumed rollback finds the
+    restore still unpublished, publishes it once and only then drops the
+    backup. (Without it the resume found the pins already registered and
+    never published them: the head kept the candidate's.)"""
+
+    engine = Engine(tmp_path, hyperpod=hyperpod)
+    site = engine.site
+    previous_registry = site.entries()
+    _commit(engine, monkeypatch, FULL_DIFF)
+    site.failing_restore_publishes = 1
+
+    release = engine.process(monkeypatch)
+    with pytest.raises(ROLLOUT.ReleaseError, match="registry revision publish failed"):
+        release.rollback()
+
+    assert engine.store["phase"] == "rollback-controller-staging"
+    _assert_restore_pending(site, release, previous_registry)
+
+    _resume(engine, monkeypatch)
+
+    _assert_restored_registry_is_the_head(engine, previous_registry)
+
+
+@pytest.mark.parametrize(
+    "failing",
+    [
+        pytest.param(0, id="published-at-once"),
+        pytest.param(1, id="publish-failed-then-resumed"),
+    ],
+)
+def test_an_automatic_rollback_publishes_the_restored_registry_backup_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failing: int
+) -> None:
+    """Before the commit: the release fails its verification after staging and
+    publishing the candidate's registry, and the automatic rollback restores
+    the backup. Its publish lands at once, and nothing publishes it again; or
+    it fails, failing the rollback, and the backup -- kept until the publish
+    converged -- brings the resumed rollback to publish it once."""
+
+    engine = Engine(tmp_path, hyperpod="nodes")
+    site = engine.site
+    previous_registry = site.entries()
+    site.failing_restore_publishes = failing
+    release = engine.process(monkeypatch)
+
+    def verify(_plan: Any) -> None:
+        raise ROLLOUT.ReleaseError("forced verification failure")
+
+    monkeypatch.setattr(release, "_validate_release_quick", verify)
+    with pytest.raises(
+        ROLLOUT.ReleaseError,
+        match="automatic rollback also failed" if failing else "forced verification",
+    ):
+        release.upgrade(diff=FULL_DIFF)
+    assert site.published[0].endswith("registry staged"), site.published
+
+    if failing:
+        assert engine.store["phase"] == "rollback-failed"
+        _assert_restore_pending(site, release, previous_registry)
+        _resume(engine, monkeypatch)
+
+    assert engine.store["rollback_result"]["status"] == "PASSED"
+    _assert_restored_registry_is_the_head(engine, previous_registry)
+
+
 @pytest.mark.parametrize("hyperpod", SITES)
 def test_a_manual_rollback_of_a_committed_release_restores_a_clusters_registry_pins(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hyperpod: str
@@ -723,7 +883,10 @@ def test_a_manual_rollback_of_a_committed_release_restores_a_clusters_registry_p
     # digest again, gpu-eks with none; no backup left behind.
     assert site.entries() == previous_registry
     assert site.entries(REGISTRY.REGISTRY_BACKUP_KEY) is None
-    assert site.published[-1].endswith("registry restored by rollback"), site.published
+    assert _restore_publishes(site) == [site.published[-1]], (
+        "the controller stage published the restore once; the CPU restore found "
+        "nothing left to publish"
+    )
     # The pins the control plane judges by: the head the rollback published.
     assert _judged_pins(site) == {
         HYPERPOD: (OWN_PROFILE, OWN_DIGEST),

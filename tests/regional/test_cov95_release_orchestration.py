@@ -214,7 +214,12 @@ def test_cpu_rollback_replays_captured_config_and_preserves_restore_flags(
     )
     assert release.environments[-1]["GPU_FAULT_FORCE_ROLE_RESTART"] == "true"
     names = [name for name, _details in release.effects]
-    assert names.index("publish-restored") < names.index("roles")
+    # The restore is completed (its backup dropped) only after its publish.
+    assert (
+        names.index("publish-restored")
+        < names.index("complete-restored")
+        < names.index("roles")
+    )
     assert names.index("verify-rollback") < names.index("delete-backups")
 
 

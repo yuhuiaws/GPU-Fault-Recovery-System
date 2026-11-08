@@ -243,7 +243,8 @@ def test_profile_pins_are_the_recorded_release_s_and_nothing_else_moves(
 
 def test_a_committed_registry_gets_the_previous_pins_back_once(tmp_path: Path) -> None:
     """The commit dropped the backup; the previous release's per-cluster pins
-    are written without one, and a second stage finds nothing to do."""
+    are written as their own backup until the rollback completes the restore
+    after its publish, and a later stage finds nothing to do."""
 
     committed, previous = _committed_registry(tmp_path)
     secret = RegistrySecret({REGISTRY_MODULE.REGISTRY_CURRENT_KEY: committed})
@@ -252,11 +253,129 @@ def test_a_committed_registry_gets_the_previous_pins_back_once(tmp_path: Path) -
     assert REGISTRY_MODULE.restore_registry_backup(release) is False
     assert REGISTRY_MODULE.restore_profile_pins(release, PREVIOUS_PROFILES) is True
     assert secret.payload(REGISTRY_MODULE.REGISTRY_CURRENT_KEY) == previous
-    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) is None
+    # Changed on purpose: the pins used to be written without a backup, so a
+    # rollback whose publish failed found them registered when resumed and
+    # never published them. The backup marks the restore as unpublished.
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) == previous
     assert secret.applies == 1
 
     assert REGISTRY_MODULE.restore_profile_pins(release, PREVIOUS_PROFILES) is False
-    assert secret.applies == 1, "restored pins are not rewritten"
+    REGISTRY_MODULE.complete_registry_restore(release)
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_CURRENT_KEY) == previous
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) is None
+    assert secret.applies == 2
+
+    assert REGISTRY_MODULE.restore_registry_backup(release) is False
+    assert REGISTRY_MODULE.restore_profile_pins(release, PREVIOUS_PROFILES) is False
+    assert secret.applies == 2, "restored pins are not rewritten"
+
+
+def _refuses_join_and_remove(tmp_path: Path, secret: RegistrySecret) -> None:
+    """join-cluster and remove-cluster patch the registry; neither touches it
+    while it has a backup (the existing rule, a pending restore included)."""
+
+    target = cluster_target(tmp_path, cidrs=("10.0.9.0/24",), cluster_id="gpu-z")
+    before = copy.deepcopy(secret.data)
+    for remove in (False, True):
+        with pytest.raises(
+            REGISTRY_MODULE.ReleaseError, match="unfinished release backup"
+        ):
+            REGISTRY_MODULE.update_registry(
+                registry_release(secret), target, remove=remove
+            )
+    assert secret.data == before
+
+
+def test_a_restored_backup_stays_until_the_restore_is_completed(tmp_path: Path) -> None:
+    """The rollback restores a staged registry's backup and keeps it beside
+    the registry it restored -- the mark of a restore whose publish has not
+    converged. A rerun (the resumed rollback after a failed publish) finds the
+    restore still pending without writing again; completing it, after the
+    publish, drops the backup, and nothing is left to restore."""
+
+    original = REGISTRY_MODULE.registry_entry(
+        cluster_target(tmp_path, cidrs=("10.0.0.0/24",), cluster_id="gpu-a")
+    )
+    staged = REGISTRY_MODULE.registry_entry(
+        cluster_target(tmp_path, cidrs=("10.0.1.0/24",), cluster_id="gpu-b")
+    )
+    secret = RegistrySecret(
+        {
+            REGISTRY_MODULE.REGISTRY_CURRENT_KEY: [staged],
+            REGISTRY_MODULE.REGISTRY_BACKUP_KEY: [original],
+        }
+    )
+    release = registry_release(secret)
+
+    assert REGISTRY_MODULE.restore_registry_backup(release) is True
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_CURRENT_KEY) == [original]
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) == [original]
+    assert secret.applies == 1
+
+    assert REGISTRY_MODULE.restore_registry_backup(release) is True, (
+        "a resumed rollback finds the restore still to publish"
+    )
+    assert REGISTRY_MODULE.restore_profile_pins(release, PREVIOUS_PROFILES) is False
+    assert secret.applies == 1, "the restored registry is not written again"
+    _refuses_join_and_remove(tmp_path, secret)
+
+    REGISTRY_MODULE.complete_registry_restore(release)
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_CURRENT_KEY) == [original]
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) is None
+    assert secret.applies == 2
+    assert REGISTRY_MODULE.restore_registry_backup(release) is False
+    REGISTRY_MODULE.complete_registry_restore(release)
+    assert secret.applies == 2, "a completed restore has nothing to drop"
+
+
+def test_restored_pins_pending_their_publish_are_restored_from_their_backup(
+    tmp_path: Path,
+) -> None:
+    """The pins a committed release's rollback wrote are pending as their own
+    backup: the resumed rollback restores them from there, and join-cluster
+    and remove-cluster refuse until the restore is completed."""
+
+    committed, previous = _committed_registry(tmp_path)
+    secret = RegistrySecret({REGISTRY_MODULE.REGISTRY_CURRENT_KEY: committed})
+    release = registry_release(secret)
+    assert REGISTRY_MODULE.restore_profile_pins(release, PREVIOUS_PROFILES) is True
+
+    assert REGISTRY_MODULE.restore_registry_backup(release) is True
+    assert secret.applies == 1
+    _refuses_join_and_remove(tmp_path, secret)
+
+    REGISTRY_MODULE.complete_registry_restore(release)
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_CURRENT_KEY) == previous
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) is None
+
+
+def test_a_restore_is_completed_only_over_the_registry_it_wrote(tmp_path: Path) -> None:
+    """A registry that changed after the restore keeps the backup: the
+    rollback stops, and resumed it restores the backup again. A dry run
+    completes nothing."""
+
+    committed, previous = _committed_registry(tmp_path)
+    secret = RegistrySecret(
+        {
+            REGISTRY_MODULE.REGISTRY_CURRENT_KEY: committed,
+            REGISTRY_MODULE.REGISTRY_BACKUP_KEY: previous,
+        }
+    )
+    release = registry_release(secret)
+
+    with pytest.raises(
+        REGISTRY_MODULE.ReleaseError, match="changed while the rollback"
+    ):
+        REGISTRY_MODULE.complete_registry_restore(release)
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) == previous
+    assert secret.applies == 0
+
+    assert REGISTRY_MODULE.restore_registry_backup(release) is True
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_CURRENT_KEY) == previous
+    secret.dry_run = True
+    REGISTRY_MODULE.complete_registry_restore(release)
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) == previous
+    assert secret.applies == 1
 
 
 def test_profile_pins_leave_a_registry_alone_that_has_a_backup_or_its_pins(

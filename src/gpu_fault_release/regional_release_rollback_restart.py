@@ -11,7 +11,8 @@ A tier is restarted only when the rollback changes something its containers
 read once, at start-up, or when that cannot be proven otherwise:
 
 * the cluster registry was restored -- its backup, or after a commit the
-  restored release's per-cluster pins -- or the email Secret restore wrote
+  restored release's per-cluster pins, or a restore an earlier run of the
+  stage wrote and could not publish -- or the email Secret restore wrote
   different data (both reach every tier as ``secretKeyRef`` env);
 * the tier's role ConfigMaps (``envFrom``) were changed by the restore, or
   its ``-config-core`` by the controller patch;
@@ -359,6 +360,14 @@ class RollbackRestartPlan:
         (``_restore_previous_registry_pins``). Every tier reads both through
         ``secretKeyRef`` env at start-up, so a registry restore, or a Secret
         restore that writes different data, restarts every tier.
+
+        Either restore keeps the registry it wrote as its backup until the
+        publish to the durable head the control plane serves has converged;
+        only then is the backup dropped (``_complete_registry_restore``). A
+        stage whose publish failed is rerun by the resumed rollback, finds that
+        backup, publishes it once and restarts every tier, which the failed
+        run never got to; a stage after a converged publish finds nothing left
+        to restore and publishes nothing.
         """
 
         release = self.release
@@ -375,6 +384,7 @@ class RollbackRestartPlan:
             release._restore_previous_registry_pins(self.previous)
         ):
             release._publish_restored_registry()
+            release._complete_registry_restore()
             self.force("registry-restored")
 
     def patch_controller_config(self, config: Mapping[str, str]) -> None:

@@ -221,6 +221,11 @@ def test_rollback_uses_previous_executor_and_node_pins(
     )
     monkeypatch.setattr(
         release,
+        "_complete_registry_restore",
+        lambda: restore_calls.append("complete-registry"),
+    )
+    monkeypatch.setattr(
+        release,
         "_restore_cpu_role_config_maps",
         lambda snapshots: restore_calls.append(("config-maps", snapshots)) or True,
     )
@@ -314,11 +319,16 @@ def test_rollback_uses_previous_executor_and_node_pins(
         "the gate ran for real against the runner's clear snapshot and its "
         "verdict rode into the rollback's state"
     )
+    # The order changed on purpose: each stage completes the restore -- drops
+    # the backup -- only after its publish, so a publish that fails leaves the
+    # backup for the resumed rollback to publish from.
     assert restore_calls == [
         "registry",
         "publish-registry",
+        "complete-registry",
         "registry",
         "publish-registry",
+        "complete-registry",
         ("config-maps", previous["cpu_role_config_maps"]),
     ], "a restored registry backup must be republished to the durable head"
     cpu_applies = [

@@ -172,10 +172,14 @@ class Site:
         }
         self.template_env = copy.deepcopy(self.container_env)
         self.baseline = RESTART.cpu_restart_baseline(self.deployments, self.captured_at)
+        #: Whether the registry has a backup: a staged release's, or the mark
+        #: of a restore whose publish has not converged.
         self.registry_backup = False
         #: Whether the registry, its backup dropped by a commit, registers a
         #: pin of the candidate's that the rollback puts back.
         self.registry_pins = False
+        #: How many of the next registry publishes fail.
+        self.failing_publishes = 0
         self.unreadable: set[str] = set()
         self.calls: list[str] = []
         self.applies = 0
@@ -225,18 +229,31 @@ class Site:
         return dict(self.secrets[backup])
 
     def restore_registry_backup(self) -> bool:
+        """The backup back as the registry; the backup itself stays until
+        the restore is completed."""
+
         self.calls.append("restore registry")
-        restored, self.registry_backup = self.registry_backup, False
-        return restored
+        return self.registry_backup
 
     def restore_previous_registry_pins(self, previous: Mapping[str, Any]) -> bool:
+        """The previous pins registered, and kept as the registry's backup
+        until the restore is completed."""
+
         assert previous, "the pins come from the restored release's snapshot"
         self.calls.append("restore registry pins")
         restored, self.registry_pins = self.registry_pins, False
+        self.registry_backup = self.registry_backup or restored
         return restored
 
     def publish_restored_registry(self) -> None:
         self.calls.append("publish registry")
+        if self.failing_publishes:
+            self.failing_publishes -= 1
+            raise ReleaseError("a registry revision publish failed")
+
+    def complete_registry_restore(self) -> None:
+        self.calls.append("complete registry restore")
+        self.registry_backup = False
 
     def restore_role_config_maps(self, snapshots: object) -> bool:
         self.calls.append("restore config-maps")
@@ -371,6 +388,7 @@ class Site:
                     self.restore_previous_registry_pins
                 ),
                 "_publish_restored_registry": self.publish_restored_registry,
+                "_complete_registry_restore": self.complete_registry_restore,
                 "_restore_cpu_role_config_maps": self.restore_role_config_maps,
                 **stubs,
             }
@@ -496,6 +514,25 @@ def test_a_generation_bump_alone_proves_nothing_either_way() -> None:
     assert arguments["force_restart_roles"] == []
 
 
+#: The registry steps of a stage, as ``Site`` records them.
+REGISTRY_CALLS = (
+    "restore registry",
+    "restore registry pins",
+    "publish registry",
+    "complete registry restore",
+)
+#: Each registry restore as a ``Site`` flag: a staged release's backup, or
+#: the previous release's per-cluster pins once a commit dropped it.
+REGISTRY_RESTORES = [
+    pytest.param("registry_backup", id="backup"),
+    pytest.param("registry_pins", id="pins-after-a-commit"),
+]
+
+
+def _registry_calls(calls: list[str]) -> list[str]:
+    return [call for call in calls if call in REGISTRY_CALLS]
+
+
 def test_a_registry_restore_restarts_every_tier() -> None:
     site = Site()
     site.registry_backup = True
@@ -504,8 +541,16 @@ def test_a_registry_restore_restarts_every_tier() -> None:
 
     assert arguments["force_restart_roles"] == EVERY_TIER
     assert _restarted(evidence) == {role: ["registry-restored"] for role in EVERY_TIER}
-    assert site.calls.index("restore registry") < site.calls.index("publish registry")
-    assert "restore registry pins" not in site.calls, "the backup is the registry"
+    # The order changed on purpose: the backup used to go with the restore
+    # write, before the publish. It is dropped only once the publish
+    # converged, so a publish that fails leaves the restore for the resumed
+    # stage to publish (test_a_registry_restore_whose_publish_failed_...).
+    assert _registry_calls(site.calls) == [
+        "restore registry",
+        "publish registry",
+        "complete registry restore",
+    ], "the backup is the registry; its pins are not looked at"
+    assert not site.registry_backup, "the published restore is completed"
 
 
 def test_previous_registry_pins_restored_after_a_commit_restart_every_tier() -> None:
@@ -520,11 +565,63 @@ def test_previous_registry_pins_restored_after_a_commit_restart_every_tier() -> 
 
     assert arguments["force_restart_roles"] == EVERY_TIER
     assert _restarted(evidence) == {role: ["registry-restored"] for role in EVERY_TIER}
-    assert (
-        site.calls.index("restore registry")
-        < site.calls.index("restore registry pins")
-        < site.calls.index("publish registry")
-    ), site.calls
+    # Completed after the publish, like a restored backup (see above).
+    assert _registry_calls(site.calls) == [
+        "restore registry",
+        "restore registry pins",
+        "publish registry",
+        "complete registry restore",
+    ], site.calls
+    assert not site.registry_backup, "the published restore is completed"
+
+
+@pytest.mark.parametrize("restore", REGISTRY_RESTORES)
+def test_a_registry_restore_whose_publish_failed_is_published_by_the_resumed_stage(
+    restore: str,
+) -> None:
+    """The restore's publish fails, and with it the stage, before its apply.
+    The restore kept its backup, so the stage the resumed rollback reruns (a
+    new plan) finds it, writes nothing, publishes it once, drops the backup
+    only then and restarts every tier, which the failed run never did."""
+
+    site = Site()
+    setattr(site, restore, True)
+    site.failing_publishes = 1
+
+    with pytest.raises(ReleaseError, match="publish failed"):
+        _stage(site)
+    assert site.registry_backup, "the restore keeps its backup until it is published"
+    assert "complete registry restore" not in site.calls
+    failed = len(site.calls)
+
+    arguments, evidence = _stage(site)
+
+    assert _registry_calls(site.calls[failed:]) == [
+        "restore registry",
+        "publish registry",
+        "complete registry restore",
+    ], "the resumed stage publishes the pending restore once"
+    assert not site.registry_backup, "the published restore is completed"
+    assert arguments["force_restart_roles"] == EVERY_TIER
+    assert _restarted(evidence) == {role: ["registry-restored"] for role in EVERY_TIER}
+
+
+@pytest.mark.parametrize("restore", REGISTRY_RESTORES)
+def test_a_published_registry_restore_is_not_published_again(restore: str) -> None:
+    """The controller stage's publish converged; the CPU restore after it
+    finds nothing left to restore, publishes nothing and restarts no tier for
+    the registry."""
+
+    site = Site()
+    setattr(site, restore, True)
+    _stage(site)
+    published = len(site.calls)
+
+    arguments, evidence = _stage(site, restore_config_maps=True)
+
+    assert "publish registry" not in site.calls[published:]
+    assert arguments["force_restart_roles"] == []
+    assert _restarted(evidence) == {}
 
 
 def test_a_secret_restore_that_changes_the_data_restarts_every_tier(

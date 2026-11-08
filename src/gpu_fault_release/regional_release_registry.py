@@ -261,11 +261,49 @@ def commit_registry_update(release: RegionalRelease) -> None:
 
 
 def restore_registry_backup(release: RegionalRelease) -> bool:
-    _current, backup = registry_payloads(release)
+    """Put the backup back as the registry; whether a restore awaits its publish.
+
+    The backup stays beside the registry it restored until
+    ``complete_registry_restore`` drops it, which the rollback does only once
+    the restore's publish converged. Dropping it with the restore write left a
+    rollback whose publish failed with nothing to find when resumed: the
+    registry looked restored, it was never published, and the control plane
+    kept serving the candidate's from the durable head. Now the resumed
+    rollback finds the backup -- the registry already restored, nothing to
+    write -- and publishes it. ``restore_profile_pins`` leaves the same mark.
+    While it is there join and remove refuse (``update_registry``), as they
+    do while a release has the registry staged.
+    """
+
+    current, backup = registry_payloads(release)
     if backup is None:
         return False
-    write_registry(release, backup)
+    if current != backup:
+        write_registry(release, backup, backup=backup)
     return True
+
+
+def complete_registry_restore(release: RegionalRelease) -> None:
+    """Drop the backup a rollback's registry restore kept, once its publish
+    converged (``restore_registry_backup``).
+
+    Only a registry that is still the one the restore wrote is completed:
+    nothing writes the registry while the backup is there, so a different one
+    keeps the backup, and the rollback stops; resumed, it restores and
+    publishes the backup again.
+    """
+
+    if release.runner.dry_run:
+        return
+    current, backup = registry_payloads(release)
+    if backup is None:
+        return
+    if current != backup:
+        raise ReleaseError(
+            "regional cluster registry changed while the rollback published its "
+            "restore; the backup is kept for a resumed rollback to restore again"
+        )
+    write_registry(release, current)
 
 
 def registry_with_profile_pins(
@@ -312,7 +350,14 @@ def restore_profile_pins(
     deploy. ``profiles`` -- the restored release's -- gives the pins instead.
     Returns whether the registry was rewritten: never while a backup is there
     to restore, nor when the pins are already the registered ones (a release
-    that moved no profile, or a stage that restored them already).
+    that moved no profile, or a stage that restored and published them
+    already).
+
+    The restored registry is written as its own backup, the mark
+    ``restore_registry_backup`` leaves too, until the rollback has published it
+    (``complete_registry_restore``). A rollback whose publish failed otherwise
+    found the pins registered when resumed and never published them; with
+    the mark the resumed rollback restores from that backup and publishes.
     """
 
     current, backup = registry_payloads(release)
@@ -321,7 +366,7 @@ def restore_profile_pins(
     restored = registry_with_profile_pins(current, profiles)
     if restored == current:
         return False
-    write_registry(release, restored)
+    write_registry(release, restored, backup=restored)
     return True
 
 

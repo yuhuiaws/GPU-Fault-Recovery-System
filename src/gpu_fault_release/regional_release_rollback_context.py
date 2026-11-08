@@ -147,7 +147,9 @@ def restore_previous_registry_pins(release: Any, previous: Mapping[str, Any]) ->
     The pins are the ones ``rollback_target`` rolls the cluster's Agents and
     Reconciler back to (``previous_cluster_runtime_profiles``), so the control
     plane judges the restored Agents by what they run. A release that moved no
-    profile finds them registered already and changes nothing.
+    profile finds them registered already and changes nothing. The restored
+    registry is its own backup until the rollback published it, so a resumed
+    rollback whose publish failed publishes it from there.
     """
 
     return restore_profile_pins(

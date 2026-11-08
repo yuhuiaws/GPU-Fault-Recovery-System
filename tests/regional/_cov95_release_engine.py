@@ -131,6 +131,9 @@ class EngineRelease(rollout.RegionalRelease):
     def _publish_restored_registry(self) -> None:
         self.effects.append(("publish-restored", None))
 
+    def _complete_registry_restore(self) -> None:
+        self.effects.append(("complete-restored", None))
+
     def _restore_secret(self, *_args: Any, **kwargs: Any) -> None:
         self.effects.append(("restore-secret", kwargs))
 
