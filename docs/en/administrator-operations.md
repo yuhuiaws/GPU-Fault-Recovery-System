@@ -3989,6 +3989,19 @@ at zero GPU nodes`, or `<id> data plane Deployments and executor are healthy; no
 `regional_contexts` still judges the context, the provider facts, `/readyz`, the executor IAM and the retired collectors; only
 the Agent-endpoint CIDR coverage has no node to cover.
 
+**The node-key Secret while no GPU cluster has a node.** `cpu_secrets` (`preflight`, `verify`, `status --full`) requires the
+CPU `gpu-fault-node-action-keys` Secret to exist, and to hold a key while any GPU cluster of the site has a node. When no GPU
+cluster has one -- every cluster's selector selects none, parked or unavailable, by the proof above -- an empty Secret passes:
+a site whose last keyed cluster was removed, or whose first cluster joined without nodes, has no node key to mirror. The
+check's summary then ends `; gpu-fault-node-action-keys is empty and needs no key: no GPU cluster has a node (<id>: parked,
+<id>: unavailable)`, the line `details.node_action_keys_not_needed` keeps. Only an empty Secret asks for the proof, inside the
+report's snapshot. Everything else still fails: a Secret that is missing or cannot be read; a read that does not return it as
+itself (another name or namespace, no UID, a deletion under way: `gpu-fault-node-action-keys is empty and was not read back
+as the live Secret in <namespace>`); an empty Secret while a cluster selects a node or its node list cannot be read
+(`gpu-fault-node-action-keys is empty, but GPU cluster <id> selects a node (or its node list cannot be read)`). A first deploy
+whose GPU clusters all have zero nodes is still refused: no node-key Secret exists yet -- only the key helper creates them,
+and it runs only for a cluster with nodes -- and a missing Secret fails.
+
 **Deploys while a cluster has no nodes.** Every release kind proceeds -- `NOOP`, `CONTROL_PLANE_ONLY`,
 `DATA_PLANE_COMPATIBLE`, `FULL`, with or without Agent waves -- whichever the state. On that cluster:
 

@@ -56,7 +56,11 @@ scaled to zero can be observed, never the unavailable one, which needs lost
 capacity. `GpuFaultGpuClusterUnavailable` is therefore proven with promtool
 over synthetic executor series (both replicas, one replica, a window too
 short, parked, capacity returning, two clusters); live, only its silence over
-a parked cluster is observable.
+a parked cluster is observable. `cpu_secrets` passes an empty CPU node-key
+Secret while no GPU cluster has a node; that is proven offline only, through
+the real check, `preflight` and `status --full` over fake Kubernetes and
+provider reads: the live CPU node-key Secret holds HyperPod keys, so no live
+report has met an empty one.
 
 ## Xid linkage and Drain P2P recovery
 

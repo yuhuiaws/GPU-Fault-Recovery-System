@@ -69,7 +69,7 @@ from gpu_fault_release.regional_release_runtime_identity import (
 from gpu_fault_release.regional_release_state import aws_json
 from gpu_fault_release.regional_release_workflow_safety import workflow_safety_snapshot
 from gpu_fault_release.regional_runtime_profile import verify_runtime_profile_check
-from gpu_fault_release.regional_secret_checks import CPU_SECRET_NAMES, cpu_secret_shapes
+from gpu_fault_release.regional_secret_checks import CPU_SECRET_NAMES, cpu_secrets_check
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
     quick_validation_evidence as _quick_validation_evidence,
@@ -347,14 +347,14 @@ def _secret(release: RegionalRelease, name: str) -> dict[str, Any]:
 
 
 def check_cpu_secrets(release: Any) -> CheckValue:
+    # Each read fails on a missing Secret; the node-key one may be empty while
+    # no GPU cluster has a node (regional_secret_checks.cpu_secrets_check).
     return CheckValue(
-        "required CPU secrets exist without exposing their values",
-        cpu_secret_shapes(
+        *cpu_secrets_check(
+            release,
             [_secret(release, name) for name in CPU_SECRET_NAMES],
             context=release._cpu(),
-            namespace=release.config.namespace,
-            requires_node_keys=bool(release.config.clusters),
-        ),
+        )
     )
 
 
