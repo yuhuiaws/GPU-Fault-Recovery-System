@@ -241,6 +241,9 @@ from gpu_fault_release.regional_release_rendering import (
     stamp_gpu_deployments,
 )
 from gpu_fault_release.regional_release_reporting import build_release_plan
+from gpu_fault_release.regional_release_rollback_context import (
+    restore_previous_registry_pins,
+)
 from gpu_fault_release.regional_release_rollback_restart import ROLE_RESTART_VARIABLES
 from gpu_fault_release.regional_release_resume_validation import (
     validate_resume_checkpoint,
@@ -656,6 +659,7 @@ class RegionalRelease(RegistryDrainContext):
     _read_snapshot = read_snapshot
     _require_cpu_secrets = require_cpu_secrets
     _restore_registry_backup = restore_registry_backup
+    _restore_previous_registry_pins = restore_previous_registry_pins
     _save_state = save_state
     _cleanup_previous_snapshots = cleanup_previous_snapshots
     _stage_registry = stage_registry

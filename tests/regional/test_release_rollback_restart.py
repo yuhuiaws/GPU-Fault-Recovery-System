@@ -173,6 +173,9 @@ class Site:
         self.template_env = copy.deepcopy(self.container_env)
         self.baseline = RESTART.cpu_restart_baseline(self.deployments, self.captured_at)
         self.registry_backup = False
+        #: Whether the registry, its backup dropped by a commit, registers a
+        #: pin of the candidate's that the rollback puts back.
+        self.registry_pins = False
         self.unreadable: set[str] = set()
         self.calls: list[str] = []
         self.applies = 0
@@ -224,6 +227,12 @@ class Site:
     def restore_registry_backup(self) -> bool:
         self.calls.append("restore registry")
         restored, self.registry_backup = self.registry_backup, False
+        return restored
+
+    def restore_previous_registry_pins(self, previous: Mapping[str, Any]) -> bool:
+        assert previous, "the pins come from the restored release's snapshot"
+        self.calls.append("restore registry pins")
+        restored, self.registry_pins = self.registry_pins, False
         return restored
 
     def publish_restored_registry(self) -> None:
@@ -358,6 +367,9 @@ class Site:
                 "_config_maps_data": self.config_maps_data,
                 "_restore_secret": self.restore_secret,
                 "_restore_registry_backup": self.restore_registry_backup,
+                "_restore_previous_registry_pins": (
+                    self.restore_previous_registry_pins
+                ),
                 "_publish_restored_registry": self.publish_restored_registry,
                 "_restore_cpu_role_config_maps": self.restore_role_config_maps,
                 **stubs,
@@ -493,6 +505,26 @@ def test_a_registry_restore_restarts_every_tier() -> None:
     assert arguments["force_restart_roles"] == EVERY_TIER
     assert _restarted(evidence) == {role: ["registry-restored"] for role in EVERY_TIER}
     assert site.calls.index("restore registry") < site.calls.index("publish registry")
+    assert "restore registry pins" not in site.calls, "the backup is the registry"
+
+
+def test_previous_registry_pins_restored_after_a_commit_restart_every_tier() -> None:
+    """A committed release left no registry backup; the rollback put the
+    previous release's per-cluster pins back, which every tier reads at
+    start-up like a restored backup."""
+
+    site = Site()
+    site.registry_pins = True
+
+    arguments, evidence = _stage(site)
+
+    assert arguments["force_restart_roles"] == EVERY_TIER
+    assert _restarted(evidence) == {role: ["registry-restored"] for role in EVERY_TIER}
+    assert (
+        site.calls.index("restore registry")
+        < site.calls.index("restore registry pins")
+        < site.calls.index("publish registry")
+    ), site.calls
 
 
 def test_a_secret_restore_that_changes_the_data_restarts_every_tier(

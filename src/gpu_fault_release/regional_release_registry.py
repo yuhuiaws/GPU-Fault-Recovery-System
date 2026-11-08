@@ -5,6 +5,7 @@ import hashlib
 import ipaddress
 import json
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -18,6 +19,8 @@ from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resourc
 REGISTRY_SECRET = "gpu-fault-regional-clusters"
 REGISTRY_CURRENT_KEY = "clusters.json"
 REGISTRY_BACKUP_KEY = "previous-clusters.json"
+#: The per-cluster Runtime Profile pins of a registration (``_cluster_profile_pins``).
+PROFILE_PIN_KEYS = ("runtime_profile_version", "agent_config_digest")
 
 
 def _cluster_profile_pins(target: ClusterTarget) -> dict[str, str]:
@@ -262,6 +265,63 @@ def restore_registry_backup(release: RegionalRelease) -> bool:
     if backup is None:
         return False
     write_registry(release, backup)
+    return True
+
+
+def registry_with_profile_pins(
+    registrations: list[dict[str, Any]],
+    profiles: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """``registrations`` with each cluster's Runtime Profile pins from ``profiles``.
+
+    ``profiles`` is a release's ``cluster_runtime_profiles`` record --
+    ``{cluster_id: {version, agent_config_digest, ...}}`` for the clusters that
+    ran their own profile. Such a cluster's entry carries that version and
+    Agent config digest, as ``registry_entry`` registered it; every other
+    cluster ran the site profile and carries none. Nothing else changes:
+    membership is not a rollback's to change (``clusters`` is
+    non-transactional) and a rotated token stays rotated.
+    """
+
+    restored = []
+    for registration in registrations:
+        entry = {
+            key: value
+            for key, value in registration.items()
+            if key not in PROFILE_PIN_KEYS
+        }
+        profile = profiles.get(str(registration.get("cluster_id")))
+        if isinstance(profile, Mapping):
+            entry["runtime_profile_version"] = str(profile.get("version") or "")
+            entry["agent_config_digest"] = str(profile.get("agent_config_digest") or "")
+        restored.append(entry)
+    return restored
+
+
+def restore_profile_pins(
+    release: RegionalRelease,
+    profiles: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """Register each cluster with the pins of ``profiles`` when no backup can.
+
+    The commit drops the registry backup (``commit_registry_update``), so a
+    ``deploy --rollback`` of a committed release has nothing for
+    ``restore_registry_backup`` to put back: a cluster whose own Runtime
+    Profile the release moved stayed registered with the candidate's pins, and
+    the control plane judged its rolled-back Agents by them until the next
+    deploy. ``profiles`` -- the restored release's -- gives the pins instead.
+    Returns whether the registry was rewritten: never while a backup is there
+    to restore, nor when the pins are already the registered ones (a release
+    that moved no profile, or a stage that restored them already).
+    """
+
+    current, backup = registry_payloads(release)
+    if backup is not None:
+        return False
+    restored = registry_with_profile_pins(current, profiles)
+    if restored == current:
+        return False
+    write_registry(release, restored)
     return True
 
 

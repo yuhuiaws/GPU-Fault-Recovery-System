@@ -10,7 +10,8 @@ pin runtime and the digest it serves is reported on ``/healthz``.
 A tier is restarted only when the rollback changes something its containers
 read once, at start-up, or when that cannot be proven otherwise:
 
-* the cluster registry was restored, or the email Secret restore wrote
+* the cluster registry was restored -- its backup, or after a commit the
+  restored release's per-cluster pins -- or the email Secret restore wrote
   different data (both reach every tier as ``secretKeyRef`` env);
 * the tier's role ConfigMaps (``envFrom``) were changed by the restore, or
   its ``-config-core`` by the controller patch;
@@ -353,9 +354,11 @@ class RollbackRestartPlan:
     def restore_secret_and_registry(self) -> None:
         """Restore the email Secret and the cluster registry, as both stages do.
 
-        Every tier reads both through ``secretKeyRef`` env at start-up, so a
-        registry restore, or a Secret restore that writes different data,
-        restarts every tier.
+        The registry comes back from its backup or, once a commit dropped the
+        backup, with the restored release's per-cluster Runtime Profile pins
+        (``_restore_previous_registry_pins``). Every tier reads both through
+        ``secretKeyRef`` env at start-up, so a registry restore, or a Secret
+        restore that writes different data, restarts every tier.
         """
 
         release = self.release
@@ -368,7 +371,9 @@ class RollbackRestartPlan:
             )
             if live is not None and live != restored:
                 self.force("secret-changed")
-        if release._restore_registry_backup():
+        if release._restore_registry_backup() or (
+            release._restore_previous_registry_pins(self.previous)
+        ):
             release._publish_restored_registry()
             self.force("registry-restored")
 

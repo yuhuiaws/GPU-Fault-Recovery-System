@@ -485,6 +485,8 @@ def _restore_fake(
         _save_state=lambda phase, **updates: saved.append((phase, updates)),
         _restore_secret=lambda *_a, **_k: mutations.append("secret"),
         _restore_registry_backup=lambda: mutations.append("registry"),
+        # Nor does the registry miss a per-cluster pin the rollback puts back.
+        _restore_previous_registry_pins=lambda _previous: False,
         _restore_cpu_role_config_maps=lambda snapshots: (
             mutations.append("config-maps") or bool(snapshots)
         ),

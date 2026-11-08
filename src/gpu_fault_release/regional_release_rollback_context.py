@@ -4,7 +4,7 @@ import copy
 import json
 import os
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,7 @@ from gpu_fault_release.regional_release_legacy import (
 from gpu_fault_release.regional_release_narration import narrate_step
 from gpu_fault_release.regional_release_profile_model import cluster_runtime_profiles
 from gpu_fault_release.regional_release_progress import RollbackCompensationPlan
+from gpu_fault_release.regional_release_registry import restore_profile_pins
 from gpu_fault_release.regional_release_rendering import (
     admin_config_renderer_environment,
     control_plane_apply_evidence_environment,
@@ -136,6 +137,22 @@ def previous_cluster_runtime_profiles(
         clusters=",".join(sorted(candidate)),
     )
     return candidate
+
+
+def restore_previous_registry_pins(release: Any, previous: Mapping[str, Any]) -> bool:
+    """Register each cluster with the Runtime Profile pins of the release being
+    restored when the registry has no backup -- a commit dropped it (see
+    ``regional_release_registry.restore_profile_pins``).
+
+    The pins are the ones ``rollback_target`` rolls the cluster's Agents and
+    Reconciler back to (``previous_cluster_runtime_profiles``), so the control
+    plane judges the restored Agents by what they run. A release that moved no
+    profile finds them registered already and changes nothing.
+    """
+
+    return restore_profile_pins(
+        release, previous_cluster_runtime_profiles(release, dict(previous))
+    )
 
 
 def _started_without_any_node(release: Any, identities: dict[str, Any]) -> bool:

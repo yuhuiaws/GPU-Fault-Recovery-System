@@ -124,6 +124,10 @@ class EngineRelease(rollout.RegionalRelease):
         self.effects.append(("restore-registry", None))
         return self.registry_restored
 
+    def _restore_previous_registry_pins(self, _previous: Any) -> bool:
+        # A site without clusters registers no per-cluster pins to restore.
+        return False
+
     def _publish_restored_registry(self) -> None:
         self.effects.append(("publish-restored", None))
 

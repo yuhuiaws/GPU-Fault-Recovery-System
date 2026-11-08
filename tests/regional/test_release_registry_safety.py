@@ -186,6 +186,106 @@ def test_registry_stage_is_a_no_op_when_the_registry_already_matches(
     assert secret.applies == 0, "an unchanged registry must not be rewritten"
 
 
+#: The previous release's ``cluster_runtime_profiles``: gpu-a ran its own.
+PREVIOUS_PROFILES = {
+    "gpu-a": {
+        "version": "hyperpod-v1",
+        "agent_config_digest": "a" * 64,
+        "policy_sha256": "0" * 64,
+    }
+}
+
+
+def _own_profile(target, version: str, digest: str):
+    return replace(
+        target,
+        overrides_runtime_profile=True,
+        runtime_profile_version=version,
+        agent_config_digest=digest,
+    )
+
+
+def _committed_registry(tmp_path: Path) -> tuple[list[dict], list[dict]]:
+    """The registry a committed release left (gpu-a on the candidate's own
+    profile, gpu-b moved onto one) and the one the previous release ran."""
+
+    gpu_a = cluster_target(tmp_path, cidrs=("10.0.0.0/24",), cluster_id="gpu-a")
+    gpu_b = cluster_target(tmp_path, cidrs=("10.0.1.0/24",), cluster_id="gpu-b")
+    committed = [
+        REGISTRY_MODULE.registry_entry(
+            _own_profile(gpu_a, "hyperpod-v1-boot020", "7" * 64)
+        ),
+        REGISTRY_MODULE.registry_entry(_own_profile(gpu_b, "eks-v2", "8" * 64)),
+    ]
+    previous = [
+        REGISTRY_MODULE.registry_entry(_own_profile(gpu_a, "hyperpod-v1", "a" * 64)),
+        REGISTRY_MODULE.registry_entry(gpu_b),
+    ]
+    return committed, previous
+
+
+def test_profile_pins_are_the_recorded_release_s_and_nothing_else_moves(
+    tmp_path: Path,
+) -> None:
+    committed, previous = _committed_registry(tmp_path)
+    rotated = [dict(committed[0], token="r" * 40), committed[1]]
+
+    restored = REGISTRY_MODULE.registry_with_profile_pins(rotated, PREVIOUS_PROFILES)
+
+    assert restored[0] == dict(previous[0], token="r" * 40), (
+        "gpu-a is registered with its own previous profile, its rotated token kept"
+    )
+    assert restored[1] == previous[1], "gpu-b ran the site profile: no pins"
+    assert REGISTRY_MODULE.registry_with_profile_pins([], PREVIOUS_PROFILES) == [], (
+        "a cluster the registry does not hold is never added"
+    )
+
+
+def test_a_committed_registry_gets_the_previous_pins_back_once(tmp_path: Path) -> None:
+    """The commit dropped the backup; the previous release's per-cluster pins
+    are written without one, and a second stage finds nothing to do."""
+
+    committed, previous = _committed_registry(tmp_path)
+    secret = RegistrySecret({REGISTRY_MODULE.REGISTRY_CURRENT_KEY: committed})
+    release = registry_release(secret)
+
+    assert REGISTRY_MODULE.restore_registry_backup(release) is False
+    assert REGISTRY_MODULE.restore_profile_pins(release, PREVIOUS_PROFILES) is True
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_CURRENT_KEY) == previous
+    assert secret.payload(REGISTRY_MODULE.REGISTRY_BACKUP_KEY) is None
+    assert secret.applies == 1
+
+    assert REGISTRY_MODULE.restore_profile_pins(release, PREVIOUS_PROFILES) is False
+    assert secret.applies == 1, "restored pins are not rewritten"
+
+
+def test_profile_pins_leave_a_registry_alone_that_has_a_backup_or_its_pins(
+    tmp_path: Path,
+) -> None:
+    committed, previous = _committed_registry(tmp_path)
+    staged = RegistrySecret(
+        {
+            REGISTRY_MODULE.REGISTRY_CURRENT_KEY: committed,
+            REGISTRY_MODULE.REGISTRY_BACKUP_KEY: previous,
+        }
+    )
+    unchanged = RegistrySecret({REGISTRY_MODULE.REGISTRY_CURRENT_KEY: previous})
+
+    assert (
+        REGISTRY_MODULE.restore_profile_pins(
+            registry_release(staged), PREVIOUS_PROFILES
+        )
+        is False
+    ), "a staged registry is restored from its backup instead"
+    assert (
+        REGISTRY_MODULE.restore_profile_pins(
+            registry_release(unchanged), PREVIOUS_PROFILES
+        )
+        is False
+    ), "a release that moved no profile changes nothing"
+    assert staged.applies == unchanged.applies == 0
+
+
 def test_registry_update_retries_resource_version_conflict_without_lost_update(
     tmp_path: Path,
 ) -> None:
