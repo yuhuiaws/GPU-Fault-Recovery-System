@@ -8352,6 +8352,24 @@ incident/workflow）；内核日志事件若携带 节点已离开的 boot id（
 marker 的 incident（覆盖会让活动 incident 变为
 <code>RECOVERED</code>、事件链接移到旧 boot 的日志行、workflow
 指针丢失）。归属无法判定时保持原行为。</p>
+<p>链已结束于运维交接时同一信号的重新激活由该交接吸收（<code>families/health.py</code>
+<code>_absorb_into_open_handoff</code>）：节点的清单判定靠采集器内存中的连续样本计数，链自己的
+<code>TRIGGER_HEALTH_SNAPSHOT</code> 重启主机采集器后第一个 tick 读
+0（对健康信号即清除）、下一个 tick 读 1 （新 episode、新 event
+id）。链仍在跑时这次重新激活被 reboot 窗口或覆盖清单的在跑 reboot 吸收；
+reboot
+梯级因未观察到隔离被拒并在一秒内交接（live，HyperPod，GF-GENERAL-LIVE-013
+post_repair_isolation_lifted）后，它曾新开第二个 incident，其
+MARK_UNSCHEDULABLE 被交接的隔离拒绝， <code>containment_refused</code>
+后继为同一故障开出第二张支持工单。现在：一条度量 finding（event id 以
+<code>-&lt;metric&gt;-&lt;device|node&gt;</code> 结尾）若其节点上有
+<code>ESCALATED</code> incident，其已结束的 workflow 仍把该节点
+隔离且从不重新放行（<code>terminal_quarantine_nodes</code> 且
+<code>handoff_hold.record_held_nodes</code>），且其升级链的 起点
+incident 与 finding 同集群、同节点、同 policy
+source、同信号、同原因，则只把事件链接到该交接 incident
+并追加一条有界原因，不规划任何动作，节点仍由交接隔离。其他信号、原因或节点，已放行节点或
+已被运维关闭的交接，仍照常新开 incident。</p>
 <p>仅记录型吸收（<code>ABSORB_RECORD_ONLY</code>：聚合窗口关闭后，一条只读
 finding 落在某 RUNNING workflow 正在变更的
 范围内——节点级变更步骤或待执行的 <code>RESTART_WORKLOAD</code>
