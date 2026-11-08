@@ -17,8 +17,9 @@ from gpu_fault.device_plugin_liveness import (
     NODE_DEVICE_RESOURCE_METRICS,
     PLUGIN_UNRESPONSIVE_PARAMETER,
 )
+from gpu_fault.handoff_hold import record_held_nodes
 from gpu_fault.host_diagnostics import HOST_DIAGNOSTIC_PROBE, diagnostic_probe
-from gpu_fault.host_health import NodeHealthFinding
+from gpu_fault.host_health import NodeHealthFinding, event_id_component
 from gpu_fault.hung_task_summary import hung_task_summary
 from gpu_fault.models import (
     BlockedKind,
@@ -34,6 +35,7 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.orchestration.escalation import escalation_origin
 from gpu_fault.orchestration.families.incident_labels import NODE_HEALTH_EVENT_TYPE
 from gpu_fault.orchestration.reboot_window import RebootOwner, absorb_finding
 from gpu_fault.orchestration.workflow_builder import containment_handoff_reason
@@ -43,6 +45,7 @@ from gpu_fault.store import NotFoundError
 from gpu_fault.workflow_quarantine import (
     TERMINAL_QUARANTINE_NODES,
     inherit_terminal_quarantine,
+    terminal_quarantine_nodes,
 )
 from gpu_fault.workload_container_scope import (
     WORKLOAD_CONTAINER_IDS,
@@ -130,6 +133,54 @@ def host_resource_signal_event(identifier: str, metric_name: str, rule_id: str) 
     if not identifier.endswith(suffix):
         return False
     return f"-{metric_name}-" in identifier[: -len(suffix)]
+
+
+#: Workflow statuses that still execute on their own; a hand-off that holds a
+#: node has ended.
+_EXECUTABLE_WORKFLOW_STATUSES = frozenset(
+    {WorkflowStatus.PENDING, WorkflowStatus.RUNNING, WorkflowStatus.SAFETY_PENDING}
+)
+#: Bound on the escalation walk from a hand-off to the incident its chain began
+#: with (``escalation_descends_from`` walks as far).
+_ESCALATION_ROOT_WALK_LIMIT = 16
+
+
+def metric_signal_tail(finding: NodeHealthFinding) -> str | None:
+    """``-<metric_name>-<device|node>``: the end of a metric finding's event
+    id that names its signal, or ``None`` for a finding of another shape.
+
+    Every metric rule mints ``<batch>-<metric_name>-<device|node>``
+    (``NodeHealthPolicy.evaluate_metrics``, the device reduced by
+    ``event_id_component``), so the findings one signal raises on one node in
+    different batches share this tail and nothing else does: a sustained
+    host-resource finding ends with its rule id, a log finding is keyed by its
+    line.
+    """
+
+    if not finding.metric_name:
+        return None
+    tail = f"-{finding.metric_name}-{event_id_component(finding.device or 'node')}"
+    return tail if finding.event_id.endswith(tail) else None
+
+
+def handoff_holds_node(workflow: WorkflowRequest, node_id: str) -> bool:
+    """Whether ended hand-off ``workflow`` keeps ``node_id`` cordoned and
+    quarantined: its plan quarantines the node and never readmits it, and its
+    own records leave the node held (``handoff_hold.record_held_nodes``).
+
+    That hold is what the node's isolation guard keeps from any other
+    incident (``node_operations.isolation_ownership``: a terminal quarantine
+    passes only to a workflow that preserves it), so a further incident on the
+    node could not contain it.
+    """
+
+    if workflow.status in _EXECUTABLE_WORKFLOW_STATUSES:
+        return False
+    try:
+        quarantined = terminal_quarantine_nodes(workflow)
+    except ValueError:
+        return False
+    return node_id in quarantined and node_id in record_held_nodes(workflow)
 
 
 @dataclass(frozen=True)
@@ -1082,6 +1133,9 @@ class NodeHealthIngestionService:
         )
         if absorbed is not None:
             return absorbed
+        handed_over = self._absorb_into_open_handoff(finding, persist=persist)
+        if handed_over is not None:
+            return handed_over
         covered = self.callbacks.active_workflow_covers_inventory_finding(finding)
         if covered is not None:
             incident, workflow = covered
@@ -1213,6 +1267,112 @@ class NodeHealthIngestionService:
             incident.state.value,
         )
         return updated, workflow
+
+    def _absorb_into_open_handoff(
+        self,
+        finding: NodeHealthFinding,
+        *,
+        persist: bool,
+    ) -> tuple[FaultIncident, WorkflowRequest | None] | None:
+        """Record a re-armed signal on the operator hand-off that holds its
+        node for that same signal, instead of minting another incident.
+
+        A signal re-arms while its fault persists: the node's inventory
+        verdict needs consecutive samples counted in the collector's memory,
+        so the collector restart of the chain's own TRIGGER_HEALTH_SNAPSHOT
+        reads 0 on its first tick -- a clear to the health signal -- and 1 on
+        the next, a new episode with a new event id. Within a live chain the
+        re-arm is absorbed (the reboot window, a running reboot that covers
+        the inventory); once the chain has ended in a hand-off nothing did:
+        live 2026-11-08 (HyperPod, GF-GENERAL-LIVE-013
+        post_repair_isolation_lifted) the reboot rung was refused for want of
+        isolation and handed over in under a second, the re-arm came 15 s
+        after the snapshot, and it minted a second incident whose
+        MARK_UNSCHEDULABLE the hand-off's quarantine refused, so its
+        ``containment_refused`` successor opened a second support ticket for
+        the one fault. Now a metric finding (:func:`metric_signal_tail`) is
+        linked, with one bounded reason, to an ESCALATED incident (an
+        operator owns the close) on its node whose ended workflow holds the
+        node quarantined (:func:`handoff_holds_node`) and whose escalation
+        chain began with an incident of the same cluster, node, policy
+        source, signal and reason. Nothing is scheduled; the hand-off keeps
+        the node isolated. A different signal, reason or node, a hand-off
+        that no longer holds the node, or one the operator closed, opens anew.
+        """
+
+        tail = metric_signal_tail(finding)
+        if tail is None:
+            return None
+        for candidate in self.store.list_incidents_by_state(
+            finding.cluster_id,
+            {IncidentState.ESCALATED},
+            node_ids={finding.node_id},
+        ):
+            if not candidate.workflow_request_id:
+                continue
+            workflow = self._workflow_if_present(candidate.workflow_request_id)
+            if workflow is None or not handoff_holds_node(workflow, finding.node_id):
+                continue
+            root = self._escalation_root(candidate)
+            if (
+                root is None
+                or root.cluster_id != finding.cluster_id
+                or finding.node_id not in root.node_ids
+                or root.policy_source != finding.policy_source
+                or not root.event_id.endswith(tail)
+                or finding.reason not in root.reasons
+            ):
+                continue
+            if not persist:
+                return candidate, workflow
+            reason = (
+                f"absorbed {finding.metric_name} finding {finding.event_id} on "
+                f"{finding.device or 'node'}: recorded only, the operator "
+                f"hand-off holds the node for this signal"
+            )
+            updated = candidate.model_copy(
+                update={
+                    "reasons": bounded_reasons([*candidate.reasons, reason]),
+                    "updated_at": datetime.now(timezone.utc),
+                }
+            )
+            # Compare-and-set on the copy read above (ARCH-D1), like the
+            # host-resource absorption.
+            self.store.save_incident(
+                updated, expected=candidate, extra_event_ids=[finding.event_id]
+            )
+            LOGGER.info(
+                "absorbed %s finding %s on %s/%s into hand-off %s (chain of %s)",
+                finding.metric_name,
+                finding.event_id,
+                finding.node_id,
+                finding.device or "node",
+                candidate.incident_id,
+                root.incident_id,
+            )
+            return updated, workflow
+        return None
+
+    def _escalation_root(self, incident: FaultIncident) -> FaultIncident | None:
+        """The incident ``incident``'s escalation chain began with: itself
+        unless its event id names a ``<rung>-after-<workflow>`` source
+        (``escalation_origin``); ``None`` when a record on the way is gone."""
+
+        current = incident
+        seen = {incident.incident_id}
+        for _ in range(_ESCALATION_ROOT_WALK_LIMIT):
+            origin = escalation_origin(current.event_id)
+            if origin is None:
+                return current
+            try:
+                source = self.store.get_workflow(origin[1])
+                current = self.store.get_incident(source.incident_id)
+            except (NotFoundError, KeyError, TypeError):
+                return None
+            if current.incident_id in seen:
+                return None
+            seen.add(current.incident_id)
+        return None
 
     def _finalize(
         self,
