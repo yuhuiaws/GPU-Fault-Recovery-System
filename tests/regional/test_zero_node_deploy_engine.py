@@ -14,6 +14,12 @@ in parallel, the CPU stage and its heartbeat barrier, both clusters' rollout
 when the post-rollout verification fails, the automatic rollback -- and its
 resume after an interruption.
 
+A FULL release that moves ``gpu-a``'s own Runtime Profile (BOOT-020's FULL
+stage) runs the same way, with the real state checkpoints, the registry
+Secret staged and restored, and both CPU stages of its rollback up to the
+role-split apply: the rollback puts every per-cluster pin back, and the next
+release's capture of the rolled-back site records the previous release's.
+
 Only what leaves the process is scripted: every kubectl/aws read answers
 from ``EngineRunner``, the reconciler script and the in-Pod probes are
 recorded and answered, and the mutations the plan owns outside the GPU
@@ -22,10 +28,12 @@ rollout (upload, schema, CPU apply, endpoint, observability) are recorded.
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import threading
 import traceback
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -38,12 +46,19 @@ from gpu_fault_release import regional_release_agent_set as AGENT_SET
 from gpu_fault_release import regional_release_fleet_rollout as FLEET
 from gpu_fault_release import regional_release_node_runtime_rollout as RUNTIME
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
+from gpu_fault_release import regional_release_registry as REGISTRY
+from gpu_fault_release import regional_release_rollback_context as ROLLBACK_CONTEXT
 from gpu_fault_release import regional_release_rollback_target as ROLLBACK_TARGET
 from gpu_fault_release import regional_release_state as STATE
 from gpu_fault_release import regional_release_validation as VALIDATION
 from gpu_fault_release import rollout as ROLLOUT
 from gpu_fault_release.regional_admin_commands import run_resume
-from gpu_fault_release.regional_release_diff import ReleaseChangeKind, ReleaseDiff
+from gpu_fault_release.regional_release_diff import (
+    ReleaseChangeKind,
+    ReleaseComponent,
+    ReleaseDiff,
+    ReleaseExecutionPlan,
+)
 from gpu_fault_release.regional_release_probes import probe_label
 from gpu_fault_release.regional_release_rollback_context import (
     rollback_controller_config_for,
@@ -56,6 +71,7 @@ from tests.regional._release_orchestrator_support import (
     config_file,
     ingress_pod_list_json,
 )
+from tests.regional._resource_probe_fakes import resource_probe_result
 
 SITE = "us-east-1-site-0123abcd"
 PREVIOUS_IMAGE = "registry.example/runtime@sha256:" + "0" * 64
@@ -112,7 +128,8 @@ class EngineRunner:
     ``hyperpod`` says (``HYPERPOD_GROUPS``), ``gpu-eks`` parked; every command
     is recorded. A context in ``interrupt`` fails its next rollback
     Reconciler deploy once (``CONTROLLER_STAGE``: the rollback's controller
-    stage)."""
+    stage). ``registry`` is the regional cluster registry Secret's data once
+    a test seeds it (``create --dry-run`` renders, ``apply`` persists)."""
 
     dry_run = False
 
@@ -122,13 +139,52 @@ class EngineRunner:
         self.scripts: list[dict[str, str]] = []
         self.probes: list[str] = []
         self.barriers: list[dict[str, Any]] = []
+        self.transitions: list[dict[str, Any]] = []
         self.configmaps: dict[str, dict[str, str]] = {}
+        self.registry: dict[str, str] | None = None
         self.interrupt: set[str] = set()
         self.lock = threading.Lock()
 
+    def registry_payload(self, key: str) -> list[dict[str, Any]] | None:
+        encoded = (self.registry or {}).get(key)
+        return None if encoded is None else json.loads(base64.b64decode(encoded))
+
+    def _registry_command(self, arguments: list[str], input_text: Any) -> str | None:
+        """The registry Secret's render and apply; ``None`` for anything else."""
+
+        if "create" in arguments and REGISTRY.REGISTRY_SECRET in arguments:
+            data = {
+                key: base64.b64encode(Path(path).read_bytes()).decode()
+                for key, path in (
+                    item.removeprefix("--from-file=").split("=", 1)
+                    for item in arguments
+                    if item.startswith("--from-file=")
+                )
+            }
+            return json.dumps(
+                {
+                    "kind": "Secret",
+                    "metadata": {"name": REGISTRY.REGISTRY_SECRET},
+                    "data": data,
+                }
+            )
+        if "apply" in arguments and isinstance(input_text, str):
+            document = json.loads(input_text)
+            if document.get("metadata", {}).get("name") == REGISTRY.REGISTRY_SECRET:
+                with self.lock:
+                    self.registry = dict(document["data"])
+                return ""
+        return None
+
     def answer_probe(self, name: str, input_text: str | None) -> str:
         """The control plane's in-Pod answers: one ACTIVE Agent on gpu-a's
-        node when it has one, none on gpu-eks; every barrier passes."""
+        node when it has one, none on gpu-eks; every barrier passes; no
+        workflow or workload holds a Runtime Profile the release leaves."""
+
+        if name == "runtime_profile_transition":
+            with self.lock:
+                self.transitions.append(json.loads(input_text or "{}"))
+            return json.dumps({"workflow_count": 0, "workload_count": 0})
 
         if name == "active_agent_identities":
             if self.hyperpod != "nodes":
@@ -177,6 +233,9 @@ class EngineRunner:
             return self.answer_probe(name, kwargs.get("input_text"))
         if arguments[0] == "python3" and arguments[1].endswith(".py"):
             return ""  # the read-only verifiers pass
+        registry = self._registry_command(arguments, kwargs.get("input_text"))
+        if registry is not None:
+            return registry
         context = self._context(arguments)
         if (
             arguments[0] == "kubectl"
@@ -266,6 +325,13 @@ class EngineRunner:
             with self.lock:
                 self.commands.append([str(item) for item in arguments])
             return 1, "", 'error: the server doesn\'t have a resource type "nodepools"'
+        if "secret" in arguments and REGISTRY.REGISTRY_SECRET in arguments:
+            with self.lock:
+                data = None if self.registry is None else dict(self.registry)
+            if data is None:
+                return 0, "", ""
+            code, raw, error = resource_probe_result(list(arguments))
+            return code, json.dumps({**json.loads(raw), "data": data}), error
         try:
             return 0, self.run(list(arguments)), ""
         except AssertionError:
@@ -397,26 +463,106 @@ class Deploy:
             self.calls.append((name, value))
 
 
-def _bind(
-    release: Any,
-    runner: EngineRunner,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    store: dict[str, Any] | None = None,
-) -> Deploy:
-    deploy = Deploy(store)
+def _checkpoints(
+    release: Any, deploy: Deploy, monkeypatch: pytest.MonkeyPatch, *, state_writer: bool
+) -> Callable[..., None]:
+    """The release's ``_save_state``: each checkpoint lands in ``deploy``.
+
+    ``state_writer`` checkpoints through the real ``save_state`` -- every
+    field it stamps from the running release; only the ConfigMap write and
+    the history entry stay in the process.
+    """
+
+    def record(phase: str) -> None:
+        with deploy.lock:
+            deploy.phases.append(phase)
+            deploy.store.clear()
+            deploy.store.update(json.loads(json.dumps(release.state, default=str)))
 
     def save_state(phase: str, **updates: Any) -> None:
+        # The state's own lock first, as a phase checkpointing from inside a
+        # state transaction holds them.
+        with STATE.state_transaction(release):
+            STATE.save_state(release, phase, **updates)
+            record(phase)
+
+    def update_state(phase: str, **updates: Any) -> None:
         with deploy.lock:
             release.state.update({"phase": phase, **updates})
             deploy.phases.append(phase)
             deploy.store.clear()
             deploy.store.update(json.loads(json.dumps(release.state, default=str)))
 
+    if not state_writer:
+        return update_state
+    monkeypatch.setattr(
+        STATE,
+        "persist_state",
+        lambda target: json.dumps(target.state, default=str, sort_keys=True),
+    )
+    monkeypatch.setattr(STATE, "record_release_history", lambda *_a, **_k: None)
+    return save_state
+
+
+def _bind_cpu_rollback(
+    release: Any, deploy: Deploy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Run the rollback's two CPU stages for real -- the restart plan, the
+    registry restore, the controller patch -- up to the role-split render and
+    apply, recorded with the environment and container env snapshot they were
+    handed; the role ConfigMap restore and the registry publish are
+    recorded."""
+
+    def apply_cpu(_release: Any, environment: dict[str, str]) -> None:
+        container_env = environment.get(ROLLBACK_CONTEXT.CONTAINER_ENV_FILE_VARIABLE)
+        deploy.record(
+            "rollback-cpu-apply",
+            {
+                "environment": dict(environment),
+                "container_env": (
+                    json.loads(Path(container_env).read_text(encoding="utf-8"))
+                    if container_env
+                    else None
+                ),
+            },
+        )
+
     def method(name: str, value: Any) -> None:
         monkeypatch.setattr(release, name, value)
 
-    method("_save_state", save_state)
+    monkeypatch.setattr(ORCHESTRATION, "_apply_rollback_cpu_environment", apply_cpu)
+    method(
+        "_restore_cpu_role_config_maps",
+        lambda snapshots: deploy.record("rollback-role-config-maps", snapshots)
+        or bool(snapshots),
+    )
+    method("_config_map_sha", lambda *_a, **_k: "4" * 64)
+    method(
+        "_publish_restored_registry", lambda: deploy.record("publish-restored-registry")
+    )
+
+
+def _bind(
+    release: Any,
+    runner: EngineRunner,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    store: dict[str, Any] | None = None,
+    state_writer: bool = False,
+    cpu_rollback: bool = False,
+) -> Deploy:
+    """Bind ``release`` to the scripted site (``state_writer``: see
+    ``_checkpoints``; ``cpu_rollback``: see ``_bind_cpu_rollback``)."""
+
+    deploy = Deploy(store)
+
+    def method(name: str, value: Any) -> None:
+        monkeypatch.setattr(release, name, value)
+
+    method(
+        "_save_state",
+        _checkpoints(release, deploy, monkeypatch, state_writer=state_writer),
+    )
     # Every report snapshot opened while the deploy runs, by whom: a snapshot
     # is release-wide state, so only a single-threaded step that owns the whole
     # release may open one -- never a per-cluster step.
@@ -455,7 +601,11 @@ def _bind(
         "_verify_gpu_control_plane_endpoint",
     ):
         method(name, lambda *args, _name=name, **kwargs: deploy.record(_name, args))
-    method("_stage_registry", lambda: False)
+    # A seeded registry Secret is staged as the release stages it.
+    method(
+        "_stage_registry",
+        lambda: runner.registry is not None and REGISTRY.stage_registry(release),
+    )
     method("_remote_commands_are_idle", lambda: True)
     method("_require_no_inflight_installs", lambda **_k: None)
     method("_capture_previous", lambda plan=None: _capture(release, deploy))
@@ -475,7 +625,9 @@ def _bind(
     )
     method(
         "_apply_gpu_deployments",
-        lambda target, *_a, **_k: deploy.record("deployments", target.cluster_id),
+        lambda target, *_a, **kwargs: deploy.record(
+            "deployments", (target.cluster_id, kwargs.get("runtime_profile_version"))
+        ),
     )
     method(
         "_apply_gpu_dcgm_exporter",
@@ -540,16 +692,21 @@ def _bind(
             raise ROLLOUT.ReleaseError("the deploy host was interrupted")
         return {}
 
-    monkeypatch.setattr(ORCHESTRATION, "_stage_rollback_controller", stage_controller)
+    if cpu_rollback:
+        _bind_cpu_rollback(release, deploy, monkeypatch)
+    else:
+        monkeypatch.setattr(
+            ORCHESTRATION, "_stage_rollback_controller", stage_controller
+        )
+        monkeypatch.setattr(
+            ORCHESTRATION,
+            "_restore_rollback_cpu",
+            lambda *_a, **_k: deploy.record("rollback-cpu"),
+        )
     monkeypatch.setattr(
         ORCHESTRATION,
         "_restore_regional_singletons",
         lambda *_a, **_k: deploy.record("rollback-singletons"),
-    )
-    monkeypatch.setattr(
-        ORCHESTRATION,
-        "_restore_rollback_cpu",
-        lambda *_a, **_k: deploy.record("rollback-cpu"),
     )
     # The previous installer template's bytes against its captured pin: judged
     # the same for every cluster, outside what this harness proves.
@@ -577,10 +734,11 @@ def _config_core_pins(release: Any) -> dict[str, str]:
     }
 
 
-def _capture(release: Any, deploy: Deploy) -> dict[str, Any]:
+def _capture(release: Any, deploy: Deploy, **recorded: Any) -> dict[str, Any]:
     """The previous state the deploy starts from: the real report snapshot and
     the real Agent-set capture (a zero-node entry for a cluster without nodes),
-    the rest as a committed release recorded it."""
+    the rest as a committed release recorded it; ``recorded`` replaces fields
+    of that record (a previous release other than the candidate's own pins)."""
 
     with STATE.read_snapshot(release):
         identities = AGENT_SET.capture_agent_identities_matching_nodes(release)
@@ -625,25 +783,33 @@ def _capture(release: Any, deploy: Deploy) -> dict[str, Any]:
             }
             for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
         },
+        **recorded,
     }
     deploy.previous = previous
     return previous
 
 
 def _fail_verification(
-    release: Any, runner: EngineRunner, deploy: Deploy, monkeypatch: pytest.MonkeyPatch
+    release: Any,
+    runner: EngineRunner,
+    deploy: Deploy,
+    monkeypatch: pytest.MonkeyPatch,
+    **recorded: Any,
 ) -> None:
     """The post-rollout verification fails; the release metadata the
     rollback's verification reads back is the previous release's, as the
-    restore leaves it."""
+    restore leaves it. ``recorded`` is handed to ``_capture``."""
 
     def verify(_plan: Any) -> None:
+        with runner.lock:
+            forward = len(runner.scripts)
+        deploy.record("forward-scripts", forward)
         raise ROLLOUT.ReleaseError("forced verification failure")
 
     monkeypatch.setattr(release, "_validate_release_quick", verify)
 
     def capture(plan: Any = None) -> dict[str, Any]:
-        previous = _capture(release, deploy)
+        previous = _capture(release, deploy, **recorded)
         runner.configmaps["gpu-fault-release-metadata"] = dict(previous["metadata"])
         runner.configmaps["gpu-fault-api-ha-config-core"] = {
             "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": str(
@@ -893,3 +1059,349 @@ def test_an_interrupted_rollback_with_every_cluster_parked_resumes_to_rolled_bac
         HYPERPOD: "rollback",
     }
     assert again.snapshot_openers == [], "a rollback opens no report snapshot"
+
+
+# --- a FULL release that moves a cluster's own Runtime Profile -------------------
+#
+# BOOT-020's FULL stage as the live site ran it (2026-11-08): gpu-eks parked on
+# the site profile, gpu-a on its own profile with its node and Agent. The
+# candidate suffixes both -- the site eks-v1 -> eks-v1-boot020, gpu-a's own
+# hyperpod-v1 -> hyperpod-v1-boot020, each with a new Agent config digest --
+# and its verification fails: the automatic rollback has to leave every pin as
+# the previous release left it, and so does the record the next release starts
+# from.
+
+REPOSITORY = Path(__file__).resolve().parents[2]
+SITE_PROFILE = "eks-v1"
+SITE_DIGEST = "5" * 64
+#: What gpu-a's Agent and node report (``EngineRunner``, ``_node``).
+OWN_PROFILE = "hyperpod-v1"
+OWN_DIGEST = "a" * 64
+CANDIDATE_SITE_PROFILE = "eks-v1-boot020"
+CANDIDATE_SITE_DIGEST = "6" * 64
+CANDIDATE_OWN_PROFILE = "hyperpod-v1-boot020"
+CANDIDATE_OWN_DIGEST = "7" * 64
+CANDIDATE_PINS = (
+    CANDIDATE_SITE_PROFILE,
+    CANDIDATE_SITE_DIGEST,
+    CANDIDATE_OWN_PROFILE,
+    CANDIDATE_OWN_DIGEST,
+)
+#: The previous release's record of the clusters on their own profile.
+PREVIOUS_CLUSTER_PROFILES = {
+    HYPERPOD: {
+        "version": OWN_PROFILE,
+        "agent_config_digest": OWN_DIGEST,
+        "policy_sha256": "0" * 64,
+    }
+}
+PROFILE_ENV = "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"
+FULL_DIFF = ReleaseDiff(
+    kind=ReleaseChangeKind.FULL,
+    changed=frozenset(
+        {
+            "agent_config",
+            "cluster_runtime_profiles",
+            "runtime_profile_version",
+            "executor_wheel",
+            "node_runtime_wheel",
+            "node_bundle",
+        }
+    ),
+)
+FULL_SITES = [
+    pytest.param("nodes", id="gpu-a-with-its-agent"),
+    pytest.param("parked", id="gpu-a-parked-too"),
+]
+
+
+def _registry_data(entries: list[dict[str, Any]]) -> dict[str, str]:
+    return {
+        REGISTRY.REGISTRY_CURRENT_KEY: base64.b64encode(
+            json.dumps(entries).encode()
+        ).decode()
+    }
+
+
+def _previous_registry(config: Any) -> list[dict[str, Any]]:
+    """The registry Secret as the previous release left it: gpu-a registered
+    with its own previous profile, gpu-eks on the site profile (no pins)."""
+
+    entries = []
+    for target in config.clusters:
+        entry = REGISTRY.registry_entry(target)
+        entry.pop("runtime_profile_version", None)
+        entry.pop("agent_config_digest", None)
+        if target.cluster_id == HYPERPOD:
+            entry.update(
+                runtime_profile_version=OWN_PROFILE, agent_config_digest=OWN_DIGEST
+            )
+        entries.append(entry)
+    return sorted(entries, key=lambda item: str(item["cluster_id"]))
+
+
+def _full_engine(tmp_path: Path, *, hyperpod: str) -> tuple[Any, EngineRunner]:
+    """The FULL candidate's release over a site the previous release left."""
+
+    clusters = _clusters()
+    for cluster in clusters:
+        token = tmp_path / f"{cluster['cluster_id']}.token"
+        token.write_text("t" * 32, encoding="utf-8")
+        cluster["token_file"] = str(token)
+    clusters[0]["runtime_profile"] = {
+        "source": str(
+            REPOSITORY / "config/runtime-profile.regional-hyperpod-safe.example.yaml"
+        ),
+        "version": CANDIDATE_OWN_PROFILE,
+        "agent_config_digest": CANDIDATE_OWN_DIGEST,
+    }
+    path = config_file(
+        tmp_path, clusters=clusters, profile_version=CANDIDATE_SITE_PROFILE
+    )
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["runtime_profile"]["source"] = str(
+        REPOSITORY / "config/runtime-profile.regional-eks-safe.example.yaml"
+    )
+    value["runtime_profile"]["registration_cluster_id"] = EKS
+    value["release"]["agent_config_digest"] = CANDIDATE_SITE_DIGEST
+    path.write_text(json.dumps(value), encoding="utf-8")
+    config = ROLLOUT.ReleaseConfig.load(path)
+    runner = EngineRunner(hyperpod=hyperpod)
+    runner.registry = _registry_data(_previous_registry(config))
+    return ROLLOUT.RegionalRelease(config, runner), runner  # type: ignore[arg-type]
+
+
+def _previous_release() -> dict[str, Any]:
+    """What the release the candidate replaces recorded: the site on eks-v1,
+    gpu-a on its own hyperpod-v1, each with its Agent config digest; every
+    CPU role's ``-config-core`` and container env as they ran."""
+
+    return {
+        "metadata": {
+            "required-agent-artifact-sha256": "1" * 64,
+            "required-agent-compatibility-digest": "1" * 64,
+            "required-agent-protocol-version": "3",
+            "required-agent-config-digest": SITE_DIGEST,
+            "required-regional-executor-artifact-sha256": "2" * 64,
+            "required-regional-executor-compatibility-digest": "2" * 64,
+            "required-regional-executor-protocol-version": "2",
+            "required-node-action-key-version": "2",
+        },
+        "runtime_profile_version": SITE_PROFILE,
+        "cluster_runtime_profiles": json.loads(json.dumps(PREVIOUS_CLUSTER_PROFILES)),
+        "cpu_role_config_maps": {
+            f"{deployment}-config-core": {
+                "GPU_FAULT_PROCESSOR_WORKERS": "24",
+                "GPU_FAULT_REQUIRED_AGENT_VERSION": "0.10.0",
+                "GPU_FAULT_REQUIRED_POLICY_VERSION": "policy-v1",
+                PROFILE_ENV: SITE_PROFILE,
+            }
+            for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
+        },
+        "cpu_role_container_env": {
+            deployment: {
+                "app": {
+                    "env": [{"name": "GPU_FAULT_ROLE_NAME", "value": deployment}],
+                    "envFrom": [
+                        {"configMapRef": {"name": f"{deployment}-config-core"}}
+                    ],
+                }
+            }
+            for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS
+        },
+    }
+
+
+def _full_rollback_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, hyperpod: str
+) -> tuple[Any, EngineRunner, Deploy]:
+    release, runner = _full_engine(tmp_path, hyperpod=hyperpod)
+    deploy = _bind(release, runner, monkeypatch, state_writer=True, cpu_rollback=True)
+    _fail_verification(release, runner, deploy, monkeypatch, **_previous_release())
+    monkeypatch.setattr(
+        ORCHESTRATION,
+        "ensure_runtime_profile",
+        lambda target, **_k: deploy.record("runtime-profiles-registered"),
+    )
+    return release, runner, deploy
+
+
+def _pins(scripts: list[dict[str, str]], context: str) -> set[tuple[str, str]]:
+    """The (Runtime Profile, Agent config digest) each Reconciler run on
+    ``context`` installs."""
+
+    return {
+        (env["GPU_FAULT_RUNTIME_PROFILE"], env["GPU_FAULT_INSTALLER_CONFIG_DIGEST"])
+        for env in scripts
+        if env.get("GPU_FAULT_KUBECTL_CONTEXT") == context
+    }
+
+
+def _recorded(deploy: Deploy, name: str) -> list[Any]:
+    return [value for recorded, value in deploy.calls if recorded == name]
+
+
+def _next_release_snapshot(
+    release: Any, deploy: Deploy, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Any]:
+    """What the next transaction records as its previous release over the
+    rolled-back site: the real capture of the persisted state, scoped to the
+    record (a plan with no GPU or CPU component reads nothing else)."""
+
+    monkeypatch.setattr(release, "_remote_command_stats", lambda: {}, raising=False)
+    monkeypatch.setattr(release, "_deployment_snapshot_enabled", False)
+    release.state = json.loads(json.dumps(deploy.store))
+    return STATE.capture_previous(
+        release, ReleaseExecutionPlan(nodes=(ReleaseComponent.VERIFY,))
+    )
+
+
+def _assert_restored_to_the_previous_release(
+    release: Any,
+    runner: EngineRunner,
+    deploys: tuple[Deploy, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``deploys``: every deploy-host process the rollback ran in, in order."""
+
+    # The control plane's per-cluster pins: the registry backup is back.
+    assert runner.registry_payload(REGISTRY.REGISTRY_CURRENT_KEY) == (
+        _previous_registry(release.config)
+    ), "gpu-a's registry entry carries its own previous profile and digest again"
+    assert runner.registry_payload(REGISTRY.REGISTRY_BACKUP_KEY) is None
+    # The site pins every CPU role hot-loads or starts from: the controller
+    # patch, both CPU stages' render environment, the role ConfigMaps and the
+    # container env -- the previous release's, never a candidate pin.
+    patches = [
+        json.loads(command[command.index("-p") + 1])["data"]
+        for command in runner.commands
+        if "patch" in command and any(item.endswith("-config-core") for item in command)
+    ]
+    assert patches and all(patch[PROFILE_ENV] == SITE_PROFILE for patch in patches)
+    applies = [
+        value for deploy in deploys for value in _recorded(deploy, "rollback-cpu-apply")
+    ]
+    assert len(applies) == 2, "the controller stage and the CPU restore render"
+    for apply in applies:
+        environment = apply["environment"]
+        assert environment[PROFILE_ENV] == SITE_PROFILE
+        assert environment["GPU_FAULT_REQUIRED_AGENT_CONFIG_DIGEST"] == SITE_DIGEST
+        assert environment["GPU_FAULT_WHEEL_CONFIGMAP"] == "previous-cpu-wheel"
+        leaked = sorted(
+            name
+            for name, value in environment.items()
+            if os.environ.get(name) != value
+            and any(pin in value for pin in CANDIDATE_PINS)
+        )
+        assert not leaked, f"candidate pins reach the CPU templates: {leaked}"
+    previous = _previous_release()
+    assert applies[-1]["environment"]["GPU_FAULT_RUNTIME_IMAGE"] == PREVIOUS_IMAGE
+    assert applies[-1]["container_env"] == previous["cpu_role_container_env"], (
+        "the CPU restore renders the previous container env verbatim"
+    )
+    restored_maps = [
+        value
+        for deploy in deploys
+        for value in _recorded(deploy, "rollback-role-config-maps")
+    ]
+    assert restored_maps == [previous["cpu_role_config_maps"]]
+    # The rolled-back state still names the failed candidate (the retry needs
+    # it) and keeps the previous release's own record beside it ...
+    deploy = deploys[-1]
+    stored = deploy.store
+    assert (stored["phase"], stored["rollback_result"]["status"]) == (
+        "rolled-back",
+        "PASSED",
+    )
+    assert stored["cluster_runtime_profiles"][HYPERPOD]["version"] == (
+        CANDIDATE_OWN_PROFILE
+    )
+    assert stored["previous"]["cluster_runtime_profiles"] == PREVIOUS_CLUSTER_PROFILES
+    # ... and the next release, starting over this site, records what runs: a
+    # rollback of that release restores gpu-a to hyperpod-v1, not the failed
+    # candidate's hyperpod-v1-boot020 (live 2026-11-08, BOOT-020 FULL).
+    snapshot = _next_release_snapshot(release, deploy, monkeypatch)
+    assert snapshot["cluster_runtime_profiles"] == PREVIOUS_CLUSTER_PROFILES
+    assert snapshot["runtime_profile_version"] == SITE_PROFILE
+
+
+@pytest.mark.parametrize("hyperpod", FULL_SITES)
+def test_a_full_rollback_restores_a_clusters_own_runtime_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hyperpod: str
+) -> None:
+    release, runner, deploy = _full_rollback_site(
+        tmp_path, monkeypatch, hyperpod=hyperpod
+    )
+
+    with pytest.raises(ROLLOUT.ReleaseError, match="forced verification failure"):
+        release.upgrade(diff=FULL_DIFF)
+
+    assert deploy.phases[-2:] == ["rolled-back", "rolled-back"], deploy.phases
+    assert "profile-ready" in deploy.phases
+    # The forward judged the transition of each cluster from the profile it
+    # ran: gpu-a's own, gpu-eks the site's.
+    assert {(item["previous"], item["desired"]) for item in runner.transitions} == {
+        (SITE_PROFILE, CANDIDATE_SITE_PROFILE),
+        (OWN_PROFILE, CANDIDATE_OWN_PROFILE),
+    }
+    (forward_runs,) = _recorded(deploy, "forward-scripts")
+    forward, rollback = runner.scripts[:forward_runs], runner.scripts[forward_runs:]
+    assert _pins(forward, "gpu-a-context") == {
+        (CANDIDATE_OWN_PROFILE, CANDIDATE_OWN_DIGEST)
+    }
+    assert _pins(forward, "gpu-eks-context") == {
+        (CANDIDATE_SITE_PROFILE, CANDIDATE_SITE_DIGEST)
+    }
+    # gpu-a's Agents (or, parked, its Reconciler alone) go back to its own
+    # previous profile and digest; gpu-eks's Reconciler to the site's.
+    assert _pins(rollback, "gpu-a-context") == {(OWN_PROFILE, OWN_DIGEST)}
+    assert _pins(rollback, "gpu-eks-context") == {(SITE_PROFILE, SITE_DIGEST)}
+    assert sorted(
+        value for value in _recorded(deploy, "deployments") if value[1] is not None
+    ) == [(HYPERPOD, OWN_PROFILE), (EKS, SITE_PROFILE)], (
+        "the Executor, Watcher and Collector of each cluster render its previous "
+        "profile"
+    )
+    _assert_restored_to_the_previous_release(release, runner, (deploy,), monkeypatch)
+
+
+def test_a_resumed_full_rollback_restores_a_clusters_own_runtime_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The automatic rollback stops in gpu-a's data restore; a new deploy-host
+    process resumes it from the persisted state alone and still puts gpu-a's
+    own previous profile back, its record included."""
+
+    release, runner, deploy = _full_rollback_site(
+        tmp_path, monkeypatch, hyperpod="nodes"
+    )
+    runner.interrupt.add("gpu-a-context")
+
+    with pytest.raises(ROLLOUT.ReleaseError, match="automatic rollback also failed"):
+        release.upgrade(diff=FULL_DIFF)
+    assert deploy.phases[-1] == "rollback-failed", deploy.phases
+    assert not runner.interrupt, "the interruption happened"
+
+    resumed = ROLLOUT.RegionalRelease(release.config, runner)  # type: ignore[arg-type]
+    again = _bind(
+        resumed,
+        runner,
+        monkeypatch,
+        store=deploy.store,
+        state_writer=True,
+        cpu_rollback=True,
+    )
+    before = len(runner.scripts)
+
+    run_resume(resumed)
+
+    assert (again.phases[0], again.phases[-1]) == (
+        "rollback-data-restoring",
+        "rolled-back",
+    ), again.phases
+    assert _pins(runner.scripts[before:], "gpu-a-context") == {
+        (OWN_PROFILE, OWN_DIGEST)
+    }, "the resumed restore rolls gpu-a back to its own previous pins"
+    _assert_restored_to_the_previous_release(
+        resumed, runner, (deploy, again), monkeypatch
+    )

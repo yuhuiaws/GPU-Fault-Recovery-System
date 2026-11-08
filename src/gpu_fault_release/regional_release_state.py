@@ -824,7 +824,10 @@ def _map_clusters(
 # retry path needs exactly that), while everything actually running is the
 # `previous` snapshot. A snapshot taken from such a state must read these from
 # `previous`, or the next upgrade's rollback target would carry the candidate's
-# manifest, delivery and rendering digests (live 2026-09-07, BOOT-020 stage 2).
+# manifest, delivery and rendering digests (live 2026-09-07, BOOT-020 stage 2),
+# or the candidate's own Runtime Profile of each cluster that runs one: the
+# rollback put the previous version and Agent config digest back on its
+# registry entry, Agents and Reconciler (live 2026-11-08, BOOT-020 FULL).
 _ROLLED_BACK_TRUTH_KEYS = (
     "release_id",
     "component_digests",
@@ -837,6 +840,7 @@ _ROLLED_BACK_TRUTH_KEYS = (
     "executor_image",
     "node_dependencies",
     "aurora_refresh_manifest_sha256",
+    "cluster_runtime_profiles",
 )
 
 
