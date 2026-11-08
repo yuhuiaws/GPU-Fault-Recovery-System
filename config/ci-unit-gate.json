@@ -194,7 +194,9 @@
       "tests/test_public_release.py",
       "tests/test_release_*.py",
       "tests/test_restore_ci_candidate.py",
-      "tests/test_staging_deploy*.py"
+      "tests/test_signing_transparency.py",
+      "tests/test_staging_deploy*.py",
+      "tests/test_unlogged_release_*.py"
     ],
     "shared_files": [
       "tests/__init__.py",
