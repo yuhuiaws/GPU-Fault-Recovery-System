@@ -308,7 +308,30 @@ def committed_cluster_ids(
 
 
 def live_cluster_profile_pins(live_state: Mapping[str, Any]) -> dict[str, str] | None:
-    pins = live_state.get("cluster_runtime_profiles")
+    """``{cluster_id: runtime profile version}`` of the release that runs.
+
+    A rolled-back state whose rollback PASSED still names the failed candidate
+    at its top level -- its per-cluster profiles included (the retry path needs
+    them); what runs is its ``previous`` snapshot, whose
+    ``cluster_runtime_profiles`` the rollback put back on each cluster's
+    registry entry, Agents and Reconciler. A snapshot without that record
+    belongs to a transaction that could only roll back when it moved no
+    profile, so the top level names the restored pins then. ``None`` when the
+    state records none.
+    """
+
+    source = live_state
+    previous = live_state.get("previous")
+    rollback_result = live_state.get("rollback_result")
+    if (
+        str(live_state.get("phase") or "") == "rolled-back"
+        and isinstance(rollback_result, Mapping)
+        and rollback_result.get("status") == "PASSED"
+        and isinstance(previous, Mapping)
+        and isinstance(previous.get("cluster_runtime_profiles"), Mapping)
+    ):
+        source = previous
+    pins = source.get("cluster_runtime_profiles")
     if not isinstance(pins, Mapping):
         return None
     return {

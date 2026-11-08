@@ -20,6 +20,7 @@ from gpu_fault.admin.rollback_alignment import (
     reconcile_rollback_management,
     rollback_management_document,
 )
+from gpu_fault.admin.rollback_baseline import live_cluster_profile_pins
 from gpu_fault.admin.site import SiteConfigError
 
 
@@ -841,6 +842,51 @@ def test_rollback_restores_a_baseline_whose_membership_is_the_committed_one(
         evidence["baseline_sha256"] == hashlib.sha256(baseline.read_bytes()).hexdigest()
     )
     assert evidence["source"] == "rollback:test"
+
+
+def test_the_live_pins_recorded_are_the_restored_release_s(tmp_path: Path) -> None:
+    """A rolled-back state's top level still names the failed candidate's
+    per-cluster profile; the record says what runs: the restored ``previous``
+    release's (a rollback that did not pass, or a committed state, keeps the
+    top level)."""
+
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    live_state["cluster_ids"] = ["gpu-a", "hp-cluster-b"]
+    live_state["cluster_runtime_profiles"] = {
+        "hp-cluster-b": {
+            "version": "hyperpod-v1-boot020",
+            "agent_config_digest": "7" * 64,
+        }
+    }
+    live_state["previous"]["cluster_runtime_profiles"] = {
+        "hp-cluster-b": {"version": "hyperpod-v1", "agent_config_digest": "e" * 64}
+    }
+    baseline = _baseline_with_clusters(tmp_path, site, ["gpu-a", "hp-cluster-b"])
+    document = yaml.safe_load(baseline.read_text(encoding="utf-8"))
+    document["spec"]["clusters"][1]["runtimeProfile"] = {"version": "hyperpod-v1"}
+    baseline.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    reconcile_rollback_management(
+        site, live_state, site_before=baseline, source="rollback:test"
+    )
+
+    evidence = json.loads(
+        (
+            tmp_path
+            / "rollback-management"
+            / "old-release"
+            / "membership-baseline.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert evidence["live_cluster_profile_pins"] == {"hp-cluster-b": "hyperpod-v1"}
+    assert evidence["baseline_cluster_profile_pins"] == {"hp-cluster-b": "hyperpod-v1"}
+    for state in (
+        {**live_state, "rollback_result": {"status": "FAILED"}},
+        {**live_state, "phase": "complete"},
+    ):
+        assert live_cluster_profile_pins(state) == {
+            "hp-cluster-b": "hyperpod-v1-boot020"
+        }, state["phase"]
 
 
 def test_status_baseline_without_a_recorded_baseline_still_reads_the_site(
