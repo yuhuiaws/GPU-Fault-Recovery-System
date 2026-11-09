@@ -8370,6 +8370,25 @@ incident 与 finding 同集群、同节点、同 policy
 source、同信号、同原因，则只把事件链接到该交接 incident
 并追加一条有界原因，不规划任何动作，节点仍由交接隔离。其他信号、原因或节点，已放行节点或
 已被运维关闭的交接，仍照常新开 incident。</p>
+<p>被交接吸收的 finding
+也不再单独发信（b277，<code>app/ingest/node_health.py</code>，判定为
+<code>families/health.py</code>
+<code>absorbed_by_handoff</code>）。此前摄取对每条清单 finding 都发
+<code>hardware-inventory-mismatch-zh-v1</code>，不论它落到哪个
+incident；该模板按 event ID 去重，而每次重新激活都是新 event
+id，所以每次重新激活都多一封邮件（live，R28 同一用例）：邮件指向交接
+incident 与其
+<code>FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUARANTINE → ESCALATE_SUPPORT</code>
+计划，写的是交接工单已持有的同一故障，
+写的策略动作不会执行，运维无事可做。现在这条通告并入交接
+incident：不发信（同样不发 EFA/RDMA 事件或 operator-review
+通告），交接记录上的事件链接、该 finding 的 marker 与上述有界原因（以该
+event id 指回这次重新激活， 由 <code>handoff_absorption_reason</code>
+统一生成）就是回指；工单与链起点 finding
+的通告已经告知运维。其他信号、原因或节点的
+新故障，以及交接已放行节点或已被运维关闭后的重新激活，都新开自己的
+incident，照常发信
+（<code>tests/orchestration/test_handoff_absorbed_advisory.py</code>）。</p>
 <p>仅记录型吸收（<code>ABSORB_RECORD_ONLY</code>：聚合窗口关闭后，一条只读
 finding 落在某 RUNNING workflow 正在变更的
 范围内——节点级变更步骤或待执行的 <code>RESTART_WORKLOAD</code>
@@ -12095,7 +12114,11 @@ reset/reboot 之间的串行化由节点独占性判定，不由 job
 <code>hardware-inventory-mismatch-zh-v1</code> 模板发信。正文包含
 instance type、expected、
 ACTIVE、discovered、missing/excess、连续异常次数、受影响 workload 和
-workflow steps，不调用大模型。模板按 event ID 和模板版本去重。</p>
+workflow steps，不调用大模型。模板按 event ID
+和模板版本去重。同一信号在运维交接仍隔离该节点时的重新激活由交接吸收
+（2.9，<code>_absorb_into_open_handoff</code>），不新建
+incident/workflow，也不发这封邮件（b277）：它只记录在交接 incident
+上，工单与链起点 finding 的这封邮件已经告知运维。</p>
 <p>PCI缺失时的恢复 workflow 为：</p>
 <pre class="text"><code>FREEZE_EVIDENCE
 MARK_UNSCHEDULABLE

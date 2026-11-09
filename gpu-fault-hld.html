@@ -6171,7 +6171,8 @@ GPU/EFA 期望值，否则节点安装失败。</p>
 <code>gpu_inventory_mismatch</code> 或
 <code>efa_inventory_mismatch</code>。控制面创建 CRITICAL
 finding，发送固定 <code>hardware-inventory-mismatch-zh-v1</code>
-通知。GPU 掉卡与 EFA PCI 设备缺失
+通知（运维交接仍隔离该节点时同一信号的重新激活只记录在交接 incident 上，
+不另发）。GPU 掉卡与 EFA PCI 设备缺失
 （<code>failure_mode=PCI_DEVICE_MISSING</code>）执行节点重启链：</p>
 <pre class="text"><code>FREEZE_EVIDENCE -&gt; MARK_UNSCHEDULABLE -&gt; QUARANTINE
 -&gt; [STOP_WORKLOADS] -&gt; RESTART_NODE -&gt; VALIDATE_GPU -&gt; VALIDATE_HOST
